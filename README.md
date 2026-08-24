@@ -1,8 +1,10 @@
 # ESP32 ADS-B
 
+[Install the firmware directly over USB](https://2e0lxy.github.io/ESP32-ADS-B/) · Chrome or Edge on desktop · no local flashing tools required
+
 Firmware for the **Waveshare ESP32-S3 Touch-LCD-4 Rev 4.0, 480 × 480, non-touch panel**. It retrieves nearby ADS-B and MLAT aircraft, plots them on an OpenStreetMap base map on the LCD, and provides a password-protected web administration interface on the local network.
 
-Current firmware: **v2.2.0**
+Current firmware: **v2.3.0**
 
 ![Boot screen](assets/boot-screen-preview.png)
 
@@ -19,7 +21,9 @@ Current firmware: **v2.2.0**
 - Wi-Fi network scanning and connection management
 - Local firmware upload plus automatic update checks from GitHub Releases
 - Password-protected administration with a change-password page
-- BOOT-button map/table switching for the non-touch screen
+- Persistent Map, Radar, and Table display modes selectable from the web interface or BOOT button
+- Animated aircraft radar with four saved-radius range rings and red out-of-range rim targets
+- First-time USB flashing from the GitHub Pages Web Serial installer
 - Boot screen displays the management IP address after Wi-Fi connects
 
 ## First login
@@ -59,7 +63,7 @@ Searchable live table containing operator badge/name, ICAO address, callsign, re
 
 ### Display
 
-Select the physical map or table page, set brightness, enable or disable the zero-mile alert, and request an immediate refresh.
+Select the physical Map, Radar, or Table page, set brightness, enable or disable the zero-mile alert, and request an immediate refresh. Radar mode uses the saved receiver position and radius, draws a moving sweep, and marks out-of-range aircraft in red at the rim. The selected page remains active after reboot.
 
 ![Display page](docs/screenshots/display.png)
 
@@ -124,6 +128,12 @@ The OTA image is generated at:
 
 ## USB installation
 
+For a new board or recovery install, open the [online USB firmware installer](https://2e0lxy.github.io/ESP32-ADS-B/) in desktop Chrome or Edge. It uses Web Serial to identify the ESP32-S3 and writes the complete factory image. A factory install clears saved Wi-Fi, API credentials, location, zoom, display mode, and admin password.
+
+For later updates, use the device administration interface's Firmware page or flashing GitHub update button; those OTA paths preserve settings.
+
+### PlatformIO alternative
+
 Connect the board by USB, then run:
 
 ```powershell
@@ -140,7 +150,7 @@ If the board does not enter download mode, hold **BOOT**, tap **RESET**, begin t
 
 ## Physical display behaviour
 
-- Short BOOT-button press: toggles the LCD between the map and nearest-aircraft table
+- Short BOOT-button press: cycles the LCD through Map, Radar, and Table and saves the selection
 - Aircraft data refresh: every 30 seconds or on demand
 - ADS-B aircraft: cyan/operator-coloured symbol
 - MLAT aircraft: violet/red symbol

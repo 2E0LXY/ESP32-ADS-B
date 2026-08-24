@@ -1,0 +1,10 @@
+{
+  "name": "ESP32 ADS-B",
+  "version": "2.3.0",
+  "new_install_prompt_erase": true,
+  "builds": [{
+    "chipFamily": "ESP32-S3",
+    "improv": false,
+    "parts": [{"path": "firmware/ESP32-ADSB-factory.bin", "offset": 0}]
+  }]
+}

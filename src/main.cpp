@@ -48,7 +48,7 @@ constexpr int MAX_AIRCRAFT = 80;
 constexpr int ROUTE_CACHE_SIZE = 48;
 constexpr int MAX_ROUTE_LOOKUPS_PER_REFRESH = 4;
 constexpr uint32_t ROUTE_CACHE_MS = 6UL * 60UL * 60UL * 1000UL;
-constexpr char FIRMWARE_VERSION[] = "2.2.0";
+constexpr char FIRMWARE_VERSION[] = "2.3.0";
 constexpr char DEVICE_HOSTNAME[] = "adsb-map";
 constexpr char WEB_USERNAME[] = "admin";
 constexpr char GITHUB_OWNER[] = "2E0LXY";
@@ -106,7 +106,10 @@ int lastMlat = 0;
 long creditsRemaining = -1;
 RouteCacheEntry routeCache[ROUTE_CACHE_SIZE];
 AircraftDisplay latestAircraft[MAX_AIRCRAFT];
-bool tablePage = false;
+enum class DisplayPage : uint8_t { Map = 0, Table = 1, Radar = 2 };
+DisplayPage displayPage = DisplayPage::Map;
+float radarSweepDegrees = 0.0f;
+uint32_t nextRadarFrameAt = 0;
 bool touchReady = false;
 uint8_t touchAddress = 0;
 uint32_t lastTouchAt = 0;
@@ -317,6 +320,18 @@ float distanceMilesFromHome(float lat, float lon) {
   float dLon = radians(lon - homeLongitude);
   float a = sinf(dLat/2)*sinf(dLat/2) + cosf(radians(homeLatitude))*cosf(radians(lat))*sinf(dLon/2)*sinf(dLon/2);
   return 3958.761f * 2.0f * atan2f(sqrtf(a), sqrtf(1.0f-a));
+}
+
+float bearingFromHome(float lat, float lon) {
+  const float latitude1 = radians(homeLatitude);
+  const float latitude2 = radians(lat);
+  const float deltaLongitude = radians(lon - homeLongitude);
+  const float y = sinf(deltaLongitude) * cosf(latitude2);
+  const float x = cosf(latitude1) * sinf(latitude2) -
+                  sinf(latitude1) * cosf(latitude2) * cosf(deltaLongitude);
+  float bearing = degrees(atan2f(y, x));
+  if (bearing < 0.0f) bearing += 360.0f;
+  return bearing;
 }
 
 int drawPngLine(PNGDRAW *draw) {
@@ -716,8 +731,95 @@ void renderTablePage() {
   present();
 }
 
+void radarRing(int centreX, int centreY, int radius, uint16_t colour) {
+  for (int degreesValue = 0; degreesValue < 360; ++degreesValue) {
+    const float angle = radians(static_cast<float>(degreesValue));
+    pixel(centreX + lroundf(cosf(angle) * radius),
+          centreY + lroundf(sinf(angle) * radius), colour);
+  }
+}
+
+void renderRadarPage() {
+  constexpr int centreX = W / 2;
+  constexpr int centreY = 250;
+  constexpr int outerRadius = 205;
+  const uint16_t background = rgb(1, 12, 16);
+  const uint16_t grid = rgb(22, 93, 84);
+  const uint16_t gridBright = rgb(42, 145, 119);
+  const uint16_t sweep = rgb(45, 225, 155);
+  filledRect(0, 0, W, H, background);
+  text5(12, 9, "LIVE AIRCRAFT RADAR", rgb(90, 235, 185), 2);
+  char rangeLabel[22];
+  snprintf(rangeLabel, sizeof(rangeLabel), "RANGE %u NM", queryRadiusNm);
+  text5(345, 13, rangeLabel, rgb(175, 205, 195));
+
+  for (int ring = 1; ring <= 4; ++ring) {
+    radarRing(centreX, centreY, outerRadius * ring / 4,
+              ring == 4 ? gridBright : grid);
+    char ringLabel[10];
+    snprintf(ringLabel, sizeof(ringLabel), "%u", queryRadiusNm * ring / 4);
+    text5(centreX + 4, centreY - outerRadius * ring / 4 + 3,
+          ringLabel, gridBright);
+  }
+  line(centreX - outerRadius, centreY, centreX + outerRadius, centreY, grid);
+  line(centreX, centreY - outerRadius, centreX, centreY + outerRadius, grid);
+  text5(centreX - 3, centreY - outerRadius - 15, "N", rgb(210, 240, 226));
+  text5(centreX - 3, centreY + outerRadius + 8, "S", rgb(210, 240, 226));
+  text5(centreX + outerRadius + 8, centreY - 3, "E", rgb(210, 240, 226));
+  text5(centreX - outerRadius - 14, centreY - 3, "W", rgb(210, 240, 226));
+
+  // A short phosphor-style trail keeps the sweep readable without hiding targets.
+  for (int trail = 3; trail >= 0; --trail) {
+    const float angle = radians(radarSweepDegrees - trail * 3.0f - 90.0f);
+    const int endX = centreX + lroundf(cosf(angle) * outerRadius);
+    const int endY = centreY + lroundf(sinf(angle) * outerRadius);
+    const uint16_t colour = trail == 0 ? sweep : rgb(12 + trail * 4, 65 + trail * 18, 54 + trail * 12);
+    line(centreX, centreY, endX, endY, colour);
+  }
+
+  int plotted = 0;
+  for (int i = 0; i < lastCount; ++i) {
+    AircraftDisplay &aircraft = latestAircraft[i];
+    if (!isfinite(aircraft.latitude) || !isfinite(aircraft.longitude)) continue;
+    const float distanceNm = aircraft.distanceMiles / 1.15077945f;
+    const bool outside = distanceNm > queryRadiusNm;
+    const float radius = min(1.0f, distanceNm / max(1.0f, static_cast<float>(queryRadiusNm))) * outerRadius;
+    const float bearing = radians(bearingFromHome(aircraft.latitude, aircraft.longitude) - 90.0f);
+    const int x = centreX + lroundf(cosf(bearing) * radius);
+    const int y = centreY + lroundf(sinf(bearing) * radius);
+    if (outside) {
+      disc(x, y, 3, rgb(255, 65, 65));
+    } else if (aircraft.positionSource == 2) {
+      drawMlatPlane(x, y, aircraft.track);
+    } else {
+      drawAdsbLogo(x, y, aircraft.track, aircraft.flight, aircraft.hex);
+    }
+    if (!outside && plotted < 10) {
+      const char *identity = aircraft.flight[0] ? aircraft.flight : aircraft.hex;
+      const int labelX = constrain(x + 12, 2, W - static_cast<int>(strlen(identity)) * 6 - 2);
+      const int labelY = constrain(y - 3, 37, H - 12);
+      text5(labelX, labelY, identity,
+            aircraft.positionSource == 2 ? rgb(255, 75, 75) : rgb(220, 250, 235));
+    }
+    ++plotted;
+  }
+  disc(centreX, centreY, 5, rgb(255, 220, 80));
+  text5(7, H - 12, "RED RIM TARGETS ARE OUTSIDE RANGE", rgb(170, 195, 188));
+  char countLabel[18];
+  snprintf(countLabel, sizeof(countLabel), "%d TRACKED", plotted);
+  text5(394, H - 12, countLabel, rgb(90, 235, 185));
+  present();
+}
+
+const char *displayPageName() {
+  if (displayPage == DisplayPage::Table) return "table";
+  if (displayPage == DisplayPage::Radar) return "radar";
+  return "map";
+}
+
 void renderCurrentPage() {
-  if (tablePage) renderTablePage();
+  if (displayPage == DisplayPage::Table) renderTablePage();
+  else if (displayPage == DisplayPage::Radar) renderRadarPage();
   else renderMapPage();
 }
 
@@ -1159,7 +1261,7 @@ void handleStatusApi() {
   doc["updateSpace"] = ESP.getFreeSketchSpace();
   doc["brightness"] = brightnessPercent;
   doc["sound"] = soundAlerts;
-  doc["page"] = tablePage ? "table" : "map";
+  doc["page"] = displayPageName();
   doc["latitude"] = homeLatitude;
   doc["longitude"] = homeLongitude;
   doc["radiusNm"] = queryRadiusNm;
@@ -1267,13 +1369,17 @@ void handleWifiConnect() {
 void handlePageControl() {
   if (!requireWebAuthentication()) return;
   const String page = webServer.arg("page");
-  if (page != "map" && page != "table") {
-    sendMessage(400, "Page must be map or table");
+  if (page != "map" && page != "table" && page != "radar") {
+    sendMessage(400, "Page must be map, radar or table");
     return;
   }
-  tablePage = page == "table";
+  displayPage = page == "table" ? DisplayPage::Table :
+                page == "radar" ? DisplayPage::Radar : DisplayPage::Map;
+  settingsStore.putUChar("display-page", static_cast<uint8_t>(displayPage));
   renderCurrentPage();
-  sendMessage(200, tablePage ? "Table page selected" : "Map page selected");
+  if (displayPage == DisplayPage::Table) sendMessage(200, "Table page selected");
+  else if (displayPage == DisplayPage::Radar) sendMessage(200, "Radar page selected");
+  else sendMessage(200, "Map page selected");
 }
 
 void handleDisplaySettings() {
@@ -1507,6 +1613,7 @@ void setup() {
   if (!isfinite(homeLatitude) || homeLatitude < -85.0f || homeLatitude > 85.0f) homeLatitude = DEFAULT_HOME_LAT;
   if (!isfinite(homeLongitude) || homeLongitude < -180.0f || homeLongitude > 180.0f) homeLongitude = DEFAULT_HOME_LON;
   physicalMapZoom = constrain(settingsStore.getUChar("map-zoom", zoomForRadius()), 3, 16);
+  displayPage = static_cast<DisplayPage>(constrain(settingsStore.getUChar("display-page", 0), 0, 2));
   soundAlerts = settingsStore.getBool("sound", true);
   brightnessPercent = settingsStore.getUChar("brightness", 100);
   brightnessPercent = constrain(brightnessPercent, 10, 100);
@@ -1617,9 +1724,16 @@ void loop() {
     ESP.restart();
   }
   if (touchTapped() || bootButtonTapped()) {
-    tablePage = !tablePage;
+    displayPage = static_cast<DisplayPage>((static_cast<uint8_t>(displayPage) + 1) % 3);
+    settingsStore.putUChar("display-page", static_cast<uint8_t>(displayPage));
     renderCurrentPage();
-    Serial.println(tablePage ? "Page: nearest-aircraft table" : "Page: map");
+    Serial.printf("Page: %s\n", displayPageName());
+  }
+  if (displayPage == DisplayPage::Radar && static_cast<int32_t>(millis() - nextRadarFrameAt) >= 0) {
+    radarSweepDegrees += 6.0f;
+    if (radarSweepDegrees >= 360.0f) radarSweepDegrees -= 360.0f;
+    renderRadarPage();
+    nextRadarFrameAt = millis() + 160;
   }
   if (static_cast<int32_t>(millis()-nextFetchAt) >= 0) {
     fetchAircraft();
