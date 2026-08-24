@@ -2,7 +2,7 @@
 
 Firmware for the **Waveshare ESP32-S3 Touch-LCD-4 Rev 4.0, 480 × 480, non-touch panel**. It retrieves nearby ADS-B and MLAT aircraft, plots them on an OpenStreetMap base map on the LCD, and provides a password-protected web administration interface on the local network.
 
-Current firmware: **v2.1.0**
+Current firmware: **v2.1.1**
 
 ![Boot screen](assets/boot-screen-preview.png)
 

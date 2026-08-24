@@ -19,6 +19,9 @@
 #include "opensky_secrets.h"
 #include "web_ui.h"
 
+// HTTPS handshakes and ArduinoJson parsing exceed the default 8 KB loop stack.
+SET_LOOP_TASK_STACK_SIZE(16 * 1024);
+
 Arduino_DataBus *bus = new Arduino_SWSPI(
     GFX_NOT_DEFINED, 42, 2, 1, GFX_NOT_DEFINED);
 Arduino_ESP32RGBPanel *rgbpanel = new Arduino_ESP32RGBPanel(
@@ -45,7 +48,7 @@ constexpr int MAX_AIRCRAFT = 80;
 constexpr int ROUTE_CACHE_SIZE = 48;
 constexpr int MAX_ROUTE_LOOKUPS_PER_REFRESH = 4;
 constexpr uint32_t ROUTE_CACHE_MS = 6UL * 60UL * 60UL * 1000UL;
-constexpr char FIRMWARE_VERSION[] = "2.1.0";
+constexpr char FIRMWARE_VERSION[] = "2.1.1";
 constexpr char DEVICE_HOSTNAME[] = "adsb-map";
 constexpr char WEB_USERNAME[] = "admin";
 constexpr char GITHUB_OWNER[] = "2E0LXY";
@@ -834,6 +837,10 @@ void fetchAircraft(bool retriedAuth = false) {
   }
   const bool useOpenSkyAuthentication = openSkyClientId.length() && openSkyClientSecret.length();
   if (useOpenSkyAuthentication && !ensureAccessToken()) { status("AUTH", rgb(245,30,35)); present(); return; }
+  bool aircraftAtZeroMiles = false;
+  // Release the large OpenSky response and JSON allocation before starting
+  // the optional per-callsign HTTPS route lookups.
+  {
   WiFiClientSecure client; client.setInsecure();
   HTTPClient http; http.setTimeout(7000);
   const float latDelta = queryRadiusNm / 60.0f;
@@ -872,7 +879,6 @@ void fetchAircraft(bool retriedAuth = false) {
   DeserializationError error=deserializeJson(doc,payload);
   if (error) { Serial.printf("JSON %s\n",error.c_str()); status("JSON",rgb(245,30,35)); present(); return; }
   lastCount=0; lastMlat=0;
-  bool aircraftAtZeroMiles = false;
   for (JsonVariant item : doc["states"].as<JsonArray>()) {
     JsonArray state = item.as<JsonArray>();
     if (lastCount >= MAX_AIRCRAFT || state[5].isNull() || state[6].isNull()) continue;
@@ -906,6 +912,7 @@ void fetchAircraft(bool retriedAuth = false) {
   }
   doc.clear();
   payload = "";
+  }
   int routeLookups = 0;
   for (int i=0; i<lastCount; ++i) {
     AircraftDisplay &display = latestAircraft[i];
