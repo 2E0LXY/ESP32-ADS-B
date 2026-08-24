@@ -1,10 +1,21 @@
 # ESP32 ADS-B
 
+[![Build and release](https://github.com/2E0LXY/ESP32-ADS-B/actions/workflows/release.yml/badge.svg)](https://github.com/2E0LXY/ESP32-ADS-B/actions/workflows/release.yml)
+[![USB installer](https://github.com/2E0LXY/ESP32-ADS-B/actions/workflows/pages.yml/badge.svg)](https://2e0lxy.github.io/ESP32-ADS-B/)
+
 [Install the firmware directly over USB](https://2e0lxy.github.io/ESP32-ADS-B/) · Chrome or Edge on desktop · no local flashing tools required
 
 Firmware for the **Waveshare ESP32-S3 Touch-LCD-4 Rev 4.0, 480 × 480, non-touch panel**. It retrieves nearby ADS-B and MLAT aircraft, plots them on an OpenStreetMap base map on the LCD, and provides a password-protected web administration interface on the local network.
 
 Current firmware: **v2.4.0**
+
+## Quick start
+
+1. Open the [online USB installer](https://2e0lxy.github.io/ESP32-ADS-B/) in desktop Chrome or Edge and connect the ESP32-S3 by USB.
+2. Install the factory image, restart the receiver, and connect to the `ADSBMAP` setup network if no saved Wi-Fi is available.
+3. Choose a 2.4 GHz Wi-Fi network. The LCD waits for Wi-Fi and then displays the receiver's LAN address.
+4. Open that address, sign in with `admin` / `aircraft`, and immediately set a new password in **Device**.
+5. Set the receiver latitude, longitude, radius, and zoom in **Map**, then choose an aircraft feed in **Data API**.
 
 ![Boot screen](assets/boot-screen-preview.png)
 
@@ -45,9 +56,20 @@ Change the management password in **Device** after installation. The replacement
 
 Each sidebar entry opens a separate page. The footer on every page shows `Firmware (c) 2E0LXY D.Loxley 2026`, the installed version, and the GitHub update control.
 
+| Page | Live information | Main controls | Saved after reboot |
+| --- | --- | --- | --- |
+| Overview | Receiver health, traffic totals, provider, Wi-Fi, uptime, and full aircraft table | Refresh traffic, open Map/Radar, check updates | — |
+| Map | Receiver position, range, zoom, OpenStreetMap tiles, and aircraft | Position, radius, centre, zoom | Yes |
+| Aircraft | Every available aircraft field, operator badge, source, age, signal, and emergency | Search and source filter | — |
+| Display | Active LCD page, brightness, alert state, and map-tile rebuild state | Map/Radar/Table, brightness, range presets, zero-mile alert, refresh | Yes |
+| Wi-Fi | SSID, signal quality, IP, gateway, DNS, and scan results | Scan, copy address, connect to a different network | Wi-Fi credentials |
+| Data API | Selected provider, request health, aircraft count, latency, and credential state | Select feed, edit/clear credentials, refresh test | Yes |
+| Firmware | Installed/latest version, update availability, and release status | GitHub OTA, local `.bin` upload, installer/release recovery links | Firmware only |
+| Device | Identity, runtime, memory, network, display, and feed diagnostics | Password, diagnostic JSON, setup portal, reboot | Password |
+
 ### Overview
 
-Connection, aircraft, provider, display, and firmware status at a glance, followed by the complete horizontally scrollable live-aircraft table.
+Connection, aircraft, provider, display, and firmware status at a glance, followed by the complete horizontally scrollable live-aircraft table. Quick actions refresh the feed, open the browser map, switch the LCD to Radar, or check GitHub for an update.
 
 ![Overview page](docs/screenshots/overview.png)
 
@@ -65,31 +87,31 @@ Searchable live table containing operator badge/name, ICAO address, callsign, re
 
 ### Display
 
-Select the physical Map, Radar, or Table page, set brightness, enable or disable the zero-mile alert, and request an immediate refresh. Radar mode uses the saved receiver position and radius, draws a moving sweep, and marks out-of-range aircraft in red at the rim. The selected page remains active after reboot.
+Select the physical Map, Radar, or Table page, set brightness, enable or disable the zero-mile alert, and request an immediate refresh. One-click range presets set 10, 25, 50, or 100 nautical miles. Radar mode uses the saved receiver position and radius, draws a moving sweep, and marks out-of-range aircraft in red at the rim. The page also reports LCD tile-cache rebuild progress after a position, range, or zoom change. The selected page remains active after reboot.
 
 ![Display page](docs/screenshots/display.png)
 
 ### Wi-Fi
 
-View the active connection, scan nearby networks, and move the receiver to a different 2.4 GHz Wi-Fi network.
+View the active connection, signal quality, LAN address, gateway, and DNS server; copy the management address; scan nearby networks; and move the receiver to a different 2.4 GHz Wi-Fi network.
 
 ![Wi-Fi page](docs/screenshots/wifi.png)
 
 ### Data API
 
-Select an aircraft provider and replace or clear the credentials required by that provider.
+Select an aircraft provider and replace or clear the credentials required by that provider. Live feed health shows the last result, HTTP status, request time, aircraft count, and credential state, with a manual refresh test for troubleshooting.
 
 ![Data API page](docs/screenshots/api.png)
 
 ### Firmware
 
-Install a local `.bin` image, check GitHub for a new release, or install the latest release directly. The green update button pulses when a newer semantic version is available.
+Install a local `.bin` image, check GitHub for a new release, or install the latest release directly. The green update button pulses when a newer semantic version is available. Recovery shortcuts open the online USB installer and the current GitHub release.
 
 ![Firmware page](docs/screenshots/firmware.png)
 
 ### Device
 
-Change the management password, reopen the Wi-Fi setup portal, or reboot the ESP32.
+Review device identity, uptime, memory, network, display, and feed status; download a privacy-safe diagnostic JSON file; change the management password; reopen the Wi-Fi setup portal; or reboot the ESP32. The diagnostic export deliberately excludes Wi-Fi passwords, API secrets, and the management password.
 
 ![Device page](docs/screenshots/device.png)
 
@@ -112,7 +134,13 @@ The firmware checks the latest release from `2E0LXY/ESP32-ADS-B` at startup and 
 
 Do not remove power while an update is being installed. The `default_16MB.csv` partition layout supplies two application slots for OTA updates.
 
-Creating and pushing a tag such as `v2.1.1` runs `.github/workflows/release.yml`, builds both upgrade and factory images, generates SHA-256 checksums, and attaches them to a GitHub Release.
+Creating and pushing a tag such as `v2.4.1` runs `.github/workflows/release.yml`, builds both upgrade and factory images, generates SHA-256 checksums, and attaches them to a GitHub Release. A successful release then triggers `.github/workflows/pages.yml`, which publishes the same factory asset to the online USB installer.
+
+| Release asset | Use |
+| --- | --- |
+| `ESP32-ADSB-firmware.bin` | Normal OTA or local web update; preserves settings |
+| `ESP32-ADSB-factory.bin` | First installation or full recovery; clears saved settings |
+| `SHA256SUMS.txt` | Integrity hashes for the published firmware files |
 
 ## Build
 
@@ -131,6 +159,8 @@ The OTA image is generated at:
 ## USB installation
 
 For a new board or recovery install, open the [online USB firmware installer](https://2e0lxy.github.io/ESP32-ADS-B/) in desktop Chrome or Edge. It uses Web Serial to identify the ESP32-S3 and writes the complete factory image. A factory install clears saved Wi-Fi, API credentials, location, zoom, display mode, and admin password.
+
+![Online USB installer](docs/screenshots/installer.png)
 
 For later updates, use the device administration interface's Firmware page or flashing GitHub update button; those OTA paths preserve settings.
 
@@ -170,6 +200,28 @@ Map data is © OpenStreetMap contributors. The browser and LCD show attribution.
 - Change the initial password before placing the receiver on a shared network.
 - The admin interface is intended for a trusted local network and does not provide TLS.
 - Wi-Fi and provider credentials remain in ESP32 NVS and are excluded from Git.
+
+## Diagnostics and troubleshooting
+
+- If the boot screen says **Wi-Fi connecting**, wait for the LAN address before opening the admin interface. `192.168.4.1` is only the temporary setup portal address.
+- If Wi-Fi fails, connect to the `ADSBMAP` access point and open `http://192.168.4.1/`.
+- If the LCD says **Rebuilding LCD map**, leave the receiver powered while it downloads and caches tiles for the newly saved position, range, or zoom.
+- If aircraft stop updating, open **Data API**, run **Refresh / test feed**, and check the returned HTTP status and latency.
+- For support, download the JSON file from **Device → Download diagnostics**. It contains useful runtime state without passwords or API secrets.
+- For recovery, use the online USB installer. A factory flash erases configuration, while normal OTA firmware preserves it.
+
+## Refreshing the documentation screenshots
+
+With the receiver online, install Playwright, set `NODE_PATH` if required by the local Node installation, and run:
+
+```powershell
+$env:ADSB_SCREENSHOT_URL = "http://receiver-ip/"
+$env:ADSB_SCREENSHOT_USERNAME = "admin"
+$env:ADSB_SCREENSHOT_PASSWORD = "your-password"
+node scripts\capture_admin_screenshots.cjs
+```
+
+The script captures every current admin section plus the public USB installer into `docs/screenshots/`. It waits for live receiver data and map tiles, reports browser errors, and replaces the visible SSID with `Home Wi-Fi` before saving documentation images.
 
 ## Copyright
 
