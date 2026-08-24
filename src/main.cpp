@@ -48,7 +48,7 @@ constexpr int MAX_AIRCRAFT = 80;
 constexpr int ROUTE_CACHE_SIZE = 48;
 constexpr int MAX_ROUTE_LOOKUPS_PER_REFRESH = 4;
 constexpr uint32_t ROUTE_CACHE_MS = 6UL * 60UL * 60UL * 1000UL;
-constexpr char FIRMWARE_VERSION[] = "2.1.1";
+constexpr char FIRMWARE_VERSION[] = "2.2.0";
 constexpr char DEVICE_HOSTNAME[] = "adsb-map";
 constexpr char WEB_USERNAME[] = "admin";
 constexpr char GITHUB_OWNER[] = "2E0LXY";
@@ -75,8 +75,22 @@ struct AircraftDisplay {
   int positionSource;
   float distanceMiles;
   int altitudeFt;
+  int geometricAltitudeFt;
+  float speedKnots;
+  float verticalRateFpm;
+  float ageSeconds;
+  float signalDb;
+  uint32_t messages;
+  bool onGround;
   char flight[9];
   char hex[8];
+  char registration[12];
+  char aircraftType[12];
+  char squawk[8];
+  char category[8];
+  char operatorName[36];
+  char country[28];
+  char emergency[16];
 };
 
 uint16_t *framebuffer = nullptr;
@@ -381,7 +395,6 @@ void drawLocationFallback() {
 
 bool refreshPhysicalBaseMap() {
   if (!framebuffer || !baseMap) return false;
-  physicalMapZoom = zoomForRadius();
   drawLocationFallback();
   const double centerX = osmWorldX(homeLongitude, physicalMapZoom);
   const double centerY = osmWorldY(homeLatitude, physicalMapZoom);
@@ -628,7 +641,7 @@ void status(const char *label, uint16_t colour) {
 
 void present() { gfx->draw16bitRGBBitmap(0,0,framebuffer,W,H); }
 
-void renderBootScreen(const String &networkLine = "") {
+void renderBootScreen(const String &networkLine = "", uint16_t networkColour = RGB565_CYAN) {
   gfx->draw16bitRGBBitmap(0, 0, const_cast<uint16_t *>(BOOT_IMAGE), W, H);
   gfx->setTextWrap(false);
   gfx->setTextSize(2);
@@ -637,7 +650,7 @@ void renderBootScreen(const String &networkLine = "") {
   gfx->setCursor(max(4, (W - static_cast<int>(credit.length()) * 12) / 2), 414);
   gfx->print(credit);
   if (networkLine.length()) {
-    gfx->setTextColor(rgb(53,169,244));
+    gfx->setTextColor(networkColour);
     const int width = networkLine.length() * 12;
     gfx->setCursor(max(8, (W - width) / 2), 448);
     gfx->print(networkLine);
@@ -785,6 +798,11 @@ void fetchAdsbV2Aircraft() {
     const float latitude = aircraft["lat"].as<float>();
     const float longitude = aircraft["lon"].as<float>();
     AircraftDisplay &display = latestAircraft[lastCount];
+    display = AircraftDisplay{};
+    display.altitudeFt = -1;
+    display.geometricAltitudeFt = -1;
+    display.ageSeconds = -1;
+    display.signalDb = -999;
     mapPoint(latitude, longitude, display.x, display.y);
     display.latitude = latitude;
     display.longitude = longitude;
@@ -796,12 +814,26 @@ void fetchAdsbV2Aircraft() {
     JsonVariant altitude = aircraft["alt_baro"];
     if (altitude.is<int>() || altitude.is<float>() || altitude.is<double>()) display.altitudeFt = lroundf(altitude.as<float>());
     else if (!aircraft["alt_geom"].isNull()) display.altitudeFt = lroundf(aircraft["alt_geom"].as<float>());
-    else display.altitudeFt = -1;
+    if (!aircraft["alt_geom"].isNull()) display.geometricAltitudeFt = lroundf(aircraft["alt_geom"].as<float>());
+    display.onGround = altitude.is<const char *>() && !strcmp(altitude.as<const char *>(), "ground");
+    display.speedKnots = aircraft["gs"] | 0.0f;
+    if (!aircraft["baro_rate"].isNull()) display.verticalRateFpm = aircraft["baro_rate"].as<float>();
+    else display.verticalRateFpm = aircraft["geom_rate"] | 0.0f;
+    display.ageSeconds = aircraft["seen"] | -1.0f;
+    display.signalDb = aircraft["rssi"] | -999.0f;
+    display.messages = aircraft["messages"] | 0U;
     const char *flight = aircraft["flight"] | "";
     const char *hex = aircraft["hex"] | "???";
     normalizeCallsign(flight, display.flight);
     strncpy(display.hex, hex, sizeof(display.hex) - 1);
     display.hex[sizeof(display.hex) - 1] = 0;
+    strncpy(display.registration, aircraft["r"] | "", sizeof(display.registration) - 1);
+    strncpy(display.aircraftType, aircraft["t"] | "", sizeof(display.aircraftType) - 1);
+    strncpy(display.squawk, aircraft["squawk"] | "", sizeof(display.squawk) - 1);
+    strncpy(display.category, aircraft["category"] | "", sizeof(display.category) - 1);
+    strncpy(display.operatorName, aircraft["ownOp"] | "", sizeof(display.operatorName) - 1);
+    strncpy(display.country, aircraft["cou"] | "", sizeof(display.country) - 1);
+    strncpy(display.emergency, aircraft["emergency"] | "none", sizeof(display.emergency) - 1);
     JsonArray mlatFields = aircraft["mlat"].as<JsonArray>();
     display.positionSource = !mlatFields.isNull() && mlatFields.size() ? 2 : 0;
     ++lastCount;
@@ -885,6 +917,11 @@ void fetchAircraft(bool retriedAuth = false) {
     const float latitude = state[6].as<float>();
     const float longitude = state[5].as<float>();
     AircraftDisplay &display = latestAircraft[lastCount];
+    display = AircraftDisplay{};
+    display.altitudeFt = -1;
+    display.geometricAltitudeFt = -1;
+    display.ageSeconds = -1;
+    display.signalDb = -999;
     mapPoint(latitude,longitude,display.x,display.y);
     display.latitude = latitude;
     display.longitude = longitude;
@@ -893,12 +930,25 @@ void fetchAircraft(bool retriedAuth = false) {
     if (lroundf(display.distanceMiles) == 0) aircraftAtZeroMiles = true;
     if (!state[7].isNull()) display.altitudeFt=lroundf(state[7].as<float>() * 3.28084f);
     else if (!state[13].isNull()) display.altitudeFt=lroundf(state[13].as<float>() * 3.28084f);
-    else display.altitudeFt=-1;
+    if (!state[13].isNull()) display.geometricAltitudeFt=lroundf(state[13].as<float>() * 3.28084f);
+    display.onGround = state[8] | false;
+    display.speedKnots = state[9].isNull() ? 0.0f : state[9].as<float>() * 1.943844f;
+    display.verticalRateFpm = state[11].isNull() ? 0.0f : state[11].as<float>() * 196.8504f;
+    const uint64_t serverTime = doc["time"] | 0ULL;
+    const uint64_t lastContact = state[4] | 0ULL;
+    if (serverTime && lastContact) display.ageSeconds = max(0.0, static_cast<double>(serverTime) - static_cast<double>(lastContact));
     const char *flight=state[1] | ""; const char *hex=state[0] | "???";
     display.positionSource=state[16] | -1;
     normalizeCallsign(flight, display.flight);
     strncpy(display.hex, hex, sizeof(display.hex)-1);
     display.hex[sizeof(display.hex)-1] = 0;
+    strncpy(display.country, state[2] | "", sizeof(display.country) - 1);
+    if (!state[14].isNull()) {
+      const char *squawk = state[14] | "";
+      strncpy(display.squawk, squawk, sizeof(display.squawk) - 1);
+    }
+    if (!state[17].isNull()) snprintf(display.category, sizeof(display.category), "C%d", state[17].as<int>());
+    strcpy(display.emergency, "none");
     ++lastCount;
   }
   for (int i=1; i<lastCount; ++i) {
@@ -1136,9 +1186,23 @@ void handleAircraftApi() {
     item["longitude"] = display.longitude;
     item["distance"] = roundf(display.distanceMiles * 10.0f) / 10.0f;
     item["altitude"] = display.altitudeFt;
+    item["geometricAltitude"] = display.geometricAltitudeFt;
+    item["speed"] = roundf(display.speedKnots * 10.0f) / 10.0f;
+    item["verticalRate"] = lroundf(display.verticalRateFpm);
     item["heading"] = roundf(display.track * 10.0f) / 10.0f;
     item["direction"] = compassDirection(display.track);
     item["source"] = display.positionSource == 2 ? "MLAT" : "ADSB";
+    item["registration"] = display.registration;
+    item["aircraftType"] = display.aircraftType;
+    item["squawk"] = display.squawk;
+    item["category"] = display.category;
+    item["operator"] = display.operatorName;
+    item["country"] = display.country;
+    item["emergency"] = display.emergency;
+    item["onGround"] = display.onGround;
+    item["age"] = display.ageSeconds < 0 ? -1 : roundf(display.ageSeconds * 10.0f) / 10.0f;
+    item["messages"] = display.messages;
+    item["signal"] = display.signalDb;
     RouteCacheEntry *route = cachedRoute(display.flight);
     if (route && route->hasRoute) item["route"] = String(route->origin) + ">" + route->destination;
     else item["route"] = "";
@@ -1245,10 +1309,12 @@ void handleLocationSettings() {
   homeLatitude = latitude;
   homeLongitude = longitude;
   queryRadiusNm = radius;
-  physicalMapZoom = zoomForRadius();
+  const int requestedZoom = webServer.hasArg("zoom") ? webServer.arg("zoom").toInt() : zoomForRadius();
+  physicalMapZoom = constrain(requestedZoom, 3, 16);
   settingsStore.putFloat("home-lat", homeLatitude);
   settingsStore.putFloat("home-lon", homeLongitude);
   settingsStore.putUShort("radius-nm", queryRadiusNm);
+  settingsStore.putUChar("map-zoom", physicalMapZoom);
   physicalMapReady = false;
   physicalMapRefreshPending = true;
   nextFetchAt = 0;
@@ -1440,7 +1506,7 @@ void setup() {
   queryRadiusNm = constrain(settingsStore.getUShort("radius-nm", DEFAULT_RADIUS_NM), 5, 250);
   if (!isfinite(homeLatitude) || homeLatitude < -85.0f || homeLatitude > 85.0f) homeLatitude = DEFAULT_HOME_LAT;
   if (!isfinite(homeLongitude) || homeLongitude < -180.0f || homeLongitude > 180.0f) homeLongitude = DEFAULT_HOME_LON;
-  physicalMapZoom = zoomForRadius();
+  physicalMapZoom = constrain(settingsStore.getUChar("map-zoom", zoomForRadius()), 3, 16);
   soundAlerts = settingsStore.getBool("sound", true);
   brightnessPercent = settingsStore.getUChar("brightness", 100);
   brightnessPercent = constrain(brightnessPercent, 10, 100);
@@ -1484,12 +1550,17 @@ void setup() {
   WiFiManager wm;
   wm.setWiFiAPChannel(6);
   wm.setConfigPortalTimeout(900);
-  renderBootScreen("Setup: ADSBMAP at 192.168.4.1");
+  wm.setAPCallback([](WiFiManager *) {
+    renderBootScreen("AP access: 192.168.4.1", rgb(245, 180, 35));
+  });
+  renderBootScreen("Wi-Fi connecting - please wait", rgb(53,169,244));
   if (!wm.autoConnect("ADSBMAP", "aircraft")) {
+    renderBootScreen("Wi-Fi failed - setup required", rgb(255,65,65));
+    delay(5000);
     restoreMap(); status("WIFI",rgb(245,30,35)); present();
   }
   if (WiFi.status() == WL_CONNECTED) {
-    renderBootScreen("Web: " + WiFi.localIP().toString());
+    renderBootScreen("Wi-Fi connected: " + WiFi.localIP().toString(), rgb(55,215,110));
     delay(5000);
     refreshPhysicalBaseMap();
     restoreMap();

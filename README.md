@@ -2,7 +2,7 @@
 
 Firmware for the **Waveshare ESP32-S3 Touch-LCD-4 Rev 4.0, 480 × 480, non-touch panel**. It retrieves nearby ADS-B and MLAT aircraft, plots them on an OpenStreetMap base map on the LCD, and provides a password-protected web administration interface on the local network.
 
-Current firmware: **v2.1.1**
+Current firmware: **v2.2.0**
 
 ![Boot screen](assets/boot-screen-preview.png)
 
@@ -13,6 +13,8 @@ Current firmware: **v2.1.1**
 - ADS-B and MLAT aircraft shown with distinct colours and heading markers
 - Receiver latitude, longitude, and radius configurable from the web interface
 - Receiver changes applied to the browser map, LCD map, API query area, and distance calculations
+- Browser zoom saved to NVS and reused by the physical LCD map after reboot
+- Full Overview aircraft table with operator badges and all common provider fields
 - Selectable aircraft-data providers with editable API credentials
 - Wi-Fi network scanning and connection management
 - Local firmware upload plus automatic update checks from GitHub Releases
@@ -39,19 +41,19 @@ Each sidebar entry opens a separate page. The footer on every page shows `Firmwa
 
 ### Overview
 
-Connection, aircraft, provider, display, and firmware status at a glance.
+Connection, aircraft, provider, display, and firmware status at a glance, followed by the complete horizontally scrollable live-aircraft table.
 
 ![Overview page](docs/screenshots/overview.png)
 
 ### Map
 
-Live OpenStreetMap view of the received aircraft. Save a new receiver position or radius here; the same values immediately control the LCD map, provider query bounds, and aircraft-distance calculations.
+Live OpenStreetMap view of the received aircraft. Save a new receiver position, radius, and current browser zoom here; the same values immediately control the LCD map, provider query bounds, and aircraft-distance calculations and remain stored after reboot.
 
 ![Map page](docs/screenshots/map.png)
 
 ### Aircraft
 
-Searchable live table containing ICAO address, callsign, registration, altitude, speed, heading, coordinates, source, distance, and data age.
+Searchable live table containing operator badge/name, ICAO address, callsign, registration, aircraft type, distance, coordinates, barometric/geometric altitude, speed, vertical rate, heading, squawk, category, ground state, data age, messages, signal, country, route, source, and emergency state.
 
 ![Aircraft page](docs/screenshots/aircraft.png)
 
