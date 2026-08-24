@@ -1,0 +1,1551 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <WiFiManager.h>
+#include <ArduinoJson.h>
+#include <Arduino_GFX_Library.h>
+#include <WebServer.h>
+#include <Update.h>
+#include <Preferences.h>
+#include <ESPmDNS.h>
+#include <LittleFS.h>
+#include <PNGdec.h>
+#include <math.h>
+
+#include "WS_CH32_IO.h"
+#include "boot_asset.h"
+#include "map_asset.h"
+#include "opensky_secrets.h"
+#include "web_ui.h"
+
+Arduino_DataBus *bus = new Arduino_SWSPI(
+    GFX_NOT_DEFINED, 42, 2, 1, GFX_NOT_DEFINED);
+Arduino_ESP32RGBPanel *rgbpanel = new Arduino_ESP32RGBPanel(
+    40, 39, 38, 41,
+    46, 3, 8, 18, 17,
+    14, 13, 12, 11, 10, 9,
+    5, 45, 48, 47, 21,
+    1, 10, 8, 50,
+    1, 10, 8, 20);
+Arduino_RGB_Display *gfx = new Arduino_RGB_Display(
+    480, 480, rgbpanel, 2, true,
+    bus, GFX_NOT_DEFINED, st7701_type1_init_operations,
+    sizeof(st7701_type1_init_operations));
+
+namespace {
+constexpr int W = 480;
+constexpr int H = 480;
+constexpr float DEFAULT_HOME_LAT = 53.73f;
+constexpr float DEFAULT_HOME_LON = -1.57f;
+constexpr uint16_t DEFAULT_RADIUS_NM = 60;
+constexpr char TOKEN_URL[] = "https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token";
+constexpr uint32_t REFRESH_MS = 30000;
+constexpr int MAX_AIRCRAFT = 80;
+constexpr int ROUTE_CACHE_SIZE = 48;
+constexpr int MAX_ROUTE_LOOKUPS_PER_REFRESH = 4;
+constexpr uint32_t ROUTE_CACHE_MS = 6UL * 60UL * 60UL * 1000UL;
+constexpr char FIRMWARE_VERSION[] = "2.1.0";
+constexpr char DEVICE_HOSTNAME[] = "adsb-map";
+constexpr char WEB_USERNAME[] = "admin";
+constexpr char GITHUB_OWNER[] = "2E0LXY";
+constexpr char GITHUB_REPOSITORY[] = "ESP32-ADS-B";
+constexpr char GITHUB_RELEASE_API[] = "https://api.github.com/repos/2E0LXY/ESP32-ADS-B/releases/latest";
+constexpr uint32_t UPDATE_CHECK_MS = 6UL * 60UL * 60UL * 1000UL;
+
+struct RouteCacheEntry {
+  char callsign[9] = {};
+  char origin[5] = {};
+  char destination[5] = {};
+  uint32_t resolvedAt = 0;
+  uint32_t lastUsed = 0;
+  bool occupied = false;
+  bool hasRoute = false;
+};
+
+struct AircraftDisplay {
+  int x;
+  int y;
+  float latitude;
+  float longitude;
+  float track;
+  int positionSource;
+  float distanceMiles;
+  int altitudeFt;
+  char flight[9];
+  char hex[8];
+};
+
+uint16_t *framebuffer = nullptr;
+uint16_t *baseMap = nullptr;
+PNG pngDecoder;
+int pngTileScreenX = 0;
+int pngTileScreenY = 0;
+uint32_t nextFetchAt = 0;
+uint32_t tokenExpiresAt = 0;
+String bearerToken;
+int lastCount = 0;
+int lastMlat = 0;
+long creditsRemaining = -1;
+RouteCacheEntry routeCache[ROUTE_CACHE_SIZE];
+AircraftDisplay latestAircraft[MAX_AIRCRAFT];
+bool tablePage = false;
+bool touchReady = false;
+uint8_t touchAddress = 0;
+uint32_t lastTouchAt = 0;
+volatile bool bootButtonPending = false;
+WebServer webServer(80);
+Preferences settingsStore;
+String managementPassword;
+String firmwareUploadError;
+String apiProvider = "opensky";
+String openSkyClientId;
+String openSkyClientSecret;
+String rapidApiKey;
+bool soundAlerts = true;
+uint8_t brightnessPercent = 100;
+bool webServerReady = false;
+bool restartPending = false;
+bool setupPortalPending = false;
+uint32_t restartAt = 0;
+uint32_t lastFetchCompletedAt = 0;
+float homeLatitude = DEFAULT_HOME_LAT;
+float homeLongitude = DEFAULT_HOME_LON;
+uint16_t queryRadiusNm = DEFAULT_RADIUS_NM;
+uint8_t physicalMapZoom = 7;
+bool physicalMapReady = false;
+bool physicalMapRefreshPending = false;
+bool githubCheckPending = false;
+bool githubInstallPending = false;
+bool githubUpdateAvailable = false;
+String githubLatestVersion;
+String githubFirmwareUrl;
+String githubUpdateStatus = "Not checked";
+uint32_t nextGithubCheckAt = 0;
+
+void IRAM_ATTR onBootButtonFalling() {
+  bootButtonPending = true;
+}
+
+bool touchReadRegister(uint16_t reg, uint8_t *data, size_t length) {
+  if (!touchAddress || !data || !length) return false;
+  Wire.beginTransmission(touchAddress);
+  Wire.write(static_cast<uint8_t>(reg >> 8));
+  Wire.write(static_cast<uint8_t>(reg));
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom(static_cast<int>(touchAddress), static_cast<int>(length)) != length) return false;
+  for (size_t i = 0; i < length; ++i) data[i] = Wire.read();
+  return true;
+}
+
+bool touchWriteRegister(uint16_t reg, uint8_t value) {
+  if (!touchAddress) return false;
+  Wire.beginTransmission(touchAddress);
+  Wire.write(static_cast<uint8_t>(reg >> 8));
+  Wire.write(static_cast<uint8_t>(reg));
+  Wire.write(value);
+  return Wire.endTransmission() == 0;
+}
+
+bool beginTouch() {
+  // Give GT911 a dedicated reset pulse after panel power has stabilised.
+  WS_CH32_IO::writeRegister(Wire, WS_CH32_IO::REG_OUTPUT,
+                            WS_CH32_IO::PIN_SYS_EN | WS_CH32_IO::PIN_LCD_RST);
+  delay(80);
+  WS_CH32_IO::writeRegister(Wire, WS_CH32_IO::REG_OUTPUT,
+                            WS_CH32_IO::OUT_DISPLAY_ON);
+  delay(300);
+  // Waveshare's Rev4 touch example reopens the shared bus after LCD init.
+  Wire.begin(WS_CH32_IO::DEFAULT_I2C_SDA, WS_CH32_IO::DEFAULT_I2C_SCL);
+  Wire.setClock(WS_CH32_IO::DEFAULT_I2C_FREQ);
+  delay(100);
+  Serial.print("I2C devices:");
+  for (uint8_t address = 1; address < 127; ++address) {
+    Wire.beginTransmission(address);
+    if (Wire.endTransmission() == 0) Serial.printf(" 0x%02X", address);
+  }
+  Serial.println();
+  const uint8_t candidates[] = {0x5D, 0x14};
+  for (uint8_t address : candidates) {
+    Wire.beginTransmission(address);
+    if (Wire.endTransmission() != 0) continue;
+    touchAddress = address;
+    uint8_t product[4] = {};
+    if (touchReadRegister(0x8140, product, sizeof(product))) {
+      Serial.printf("GT911 touch ready at 0x%02X, product %.4s\n", address, product);
+      touchWriteRegister(0x814E, 0);
+      return true;
+    }
+    touchAddress = 0;
+  }
+  Serial.println("GT911 touch controller not found");
+  return false;
+}
+
+bool touchTapped() {
+  if (!touchReady) return false;
+  uint8_t statusByte = 0;
+  if (!touchReadRegister(0x814E, &statusByte, 1)) return false;
+  if ((statusByte & 0x80) == 0) return false;
+  const bool hasPoint = (statusByte & 0x0F) > 0;
+  touchWriteRegister(0x814E, 0);
+  if (!hasPoint || millis() - lastTouchAt < 350) return false;
+  lastTouchAt = millis();
+  return true;
+}
+
+bool bootButtonTapped() {
+  static uint32_t lastPressAt = 0;
+  noInterrupts();
+  const bool pending = bootButtonPending;
+  bootButtonPending = false;
+  interrupts();
+  if (!pending || millis() - lastPressAt < 350) return false;
+  lastPressAt = millis();
+  return true;
+}
+
+uint16_t rgb(uint8_t r, uint8_t g, uint8_t b) {
+  return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+}
+
+void pixel(int x, int y, uint16_t c) {
+  if ((unsigned)x < W && (unsigned)y < H) framebuffer[y * W + x] = c;
+}
+
+void line(int x0, int y0, int x1, int y1, uint16_t c) {
+  int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+  int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+  int err = dx + dy;
+  while (true) {
+    pixel(x0, y0, c);
+    if (x0 == x1 && y0 == y1) break;
+    int e2 = 2 * err;
+    if (e2 >= dy) { err += dy; x0 += sx; }
+    if (e2 <= dx) { err += dx; y0 += sy; }
+  }
+}
+
+void disc(int cx, int cy, int r, uint16_t c) {
+  for (int y = -r; y <= r; ++y)
+    for (int x = -r; x <= r; ++x)
+      if (x*x + y*y <= r*r) pixel(cx+x, cy+y, c);
+}
+
+void filledRect(int x, int y, int width, int height, uint16_t c) {
+  for (int yy = y; yy < y + height; ++yy)
+    for (int xx = x; xx < x + width; ++xx) pixel(xx, yy, c);
+}
+
+const uint8_t *glyph(char ch) {
+  static const uint8_t chars[][5] = {
+    {0x3E,0x51,0x49,0x45,0x3E},{0x00,0x42,0x7F,0x40,0x00},{0x42,0x61,0x51,0x49,0x46},{0x21,0x41,0x45,0x4B,0x31},{0x18,0x14,0x12,0x7F,0x10},{0x27,0x45,0x45,0x45,0x39},{0x3C,0x4A,0x49,0x49,0x30},{0x01,0x71,0x09,0x05,0x03},{0x36,0x49,0x49,0x49,0x36},{0x06,0x49,0x49,0x29,0x1E},
+    {0x7E,0x11,0x11,0x11,0x7E},{0x7F,0x49,0x49,0x49,0x36},{0x3E,0x41,0x41,0x41,0x22},{0x7F,0x41,0x41,0x22,0x1C},{0x7F,0x49,0x49,0x49,0x41},{0x7F,0x09,0x09,0x09,0x01},{0x3E,0x41,0x49,0x49,0x7A},{0x7F,0x08,0x08,0x08,0x7F},{0x00,0x41,0x7F,0x41,0x00},{0x20,0x40,0x41,0x3F,0x01},{0x7F,0x08,0x14,0x22,0x41},{0x7F,0x40,0x40,0x40,0x40},{0x7F,0x02,0x0C,0x02,0x7F},{0x7F,0x04,0x08,0x10,0x7F},{0x3E,0x41,0x41,0x41,0x3E},{0x7F,0x09,0x09,0x09,0x06},{0x3E,0x41,0x51,0x21,0x5E},{0x7F,0x09,0x19,0x29,0x46},{0x46,0x49,0x49,0x49,0x31},{0x01,0x01,0x7F,0x01,0x01},{0x3F,0x40,0x40,0x40,0x3F},{0x1F,0x20,0x40,0x20,0x1F},{0x3F,0x40,0x38,0x40,0x3F},{0x63,0x14,0x08,0x14,0x63},{0x07,0x08,0x70,0x08,0x07},{0x61,0x51,0x49,0x45,0x43}
+  };
+  static const uint8_t blank[5] = {};
+  static const uint8_t greater[5] = {0x41,0x22,0x14,0x08,0x00};
+  static const uint8_t dash[5] = {0x08,0x08,0x08,0x08,0x08};
+  if (ch >= '0' && ch <= '9') return chars[ch-'0'];
+  if (ch >= 'A' && ch <= 'Z') return chars[10+ch-'A'];
+  if (ch == '>') return greater;
+  if (ch == '-') return dash;
+  return blank;
+}
+
+void text5(int x, int y, const char *s, uint16_t c, int scale=1) {
+  while (*s) {
+    const uint8_t *g = glyph(toupper(*s++));
+    for (int col=0; col<5; ++col) for (int row=0; row<7; ++row)
+      if (g[col] & (1 << row)) for(int yy=0;yy<scale;++yy) for(int xx=0;xx<scale;++xx)
+        pixel(x+col*scale+xx, y+row*scale+yy, c);
+    x += 6*scale;
+  }
+}
+
+void restoreMap() {
+  if (physicalMapReady && baseMap) memcpy(framebuffer, baseMap, W * H * sizeof(uint16_t));
+  else memcpy_P(framebuffer, MAP_IMAGE, W * H * sizeof(uint16_t));
+}
+
+double osmWorldX(double longitude, uint8_t zoom) {
+  const double size = 256.0 * (1UL << zoom);
+  return (longitude + 180.0) / 360.0 * size;
+}
+
+double osmWorldY(double latitude, uint8_t zoom) {
+  const double clamped = constrain(latitude, -85.05112878, 85.05112878);
+  const double radiansLatitude = radians(clamped);
+  const double size = 256.0 * (1UL << zoom);
+  return (1.0 - log(tan(radiansLatitude) + 1.0 / cos(radiansLatitude)) / PI) * 0.5 * size;
+}
+
+uint8_t zoomForRadius() {
+  const double diameterMeters = max(1.0, static_cast<double>(queryRadiusNm) * 1852.0 * 2.2);
+  const double ratio = 156543.03392 * cos(radians(homeLatitude)) * W / diameterMeters;
+  return constrain(static_cast<int>(floor(log(ratio) / log(2.0))), 3, 15);
+}
+
+bool mapPoint(float lat, float lon, int &x, int &y) {
+  const double size = 256.0 * (1UL << physicalMapZoom);
+  double dx = osmWorldX(lon, physicalMapZoom) - osmWorldX(homeLongitude, physicalMapZoom);
+  if (dx > size / 2) dx -= size;
+  if (dx < -size / 2) dx += size;
+  x = lround(dx + W / 2.0);
+  y = lround(osmWorldY(lat, physicalMapZoom) - osmWorldY(homeLatitude, physicalMapZoom) + H / 2.0);
+  return x >= 0 && x < W && y >= 0 && y < H;
+}
+
+float distanceMilesFromHome(float lat, float lon) {
+  float dLat = radians(lat - homeLatitude);
+  float dLon = radians(lon - homeLongitude);
+  float a = sinf(dLat/2)*sinf(dLat/2) + cosf(radians(homeLatitude))*cosf(radians(lat))*sinf(dLon/2)*sinf(dLon/2);
+  return 3958.761f * 2.0f * atan2f(sqrtf(a), sqrtf(1.0f-a));
+}
+
+int drawPngLine(PNGDRAW *draw) {
+  uint16_t pixels[256];
+  pngDecoder.getLineAsRGB565(draw, pixels, PNG_RGB565_LITTLE_ENDIAN, 0xffffffff);
+  const int destinationY = pngTileScreenY + draw->y;
+  if (destinationY < 0 || destinationY >= H) return 1;
+  const int sourceX = max(0, -pngTileScreenX);
+  const int destinationX = max(0, pngTileScreenX);
+  const int count = min(draw->iWidth - sourceX, W - destinationX);
+  if (count > 0) memcpy(framebuffer + destinationY * W + destinationX,
+                        pixels + sourceX, count * sizeof(uint16_t));
+  return 1;
+}
+
+String osmTilePath(uint8_t zoom, int tileX, int tileY) {
+  return "/osm_" + String(zoom) + "_" + String(tileX) + "_" + String(tileY) + ".png";
+}
+
+bool cacheOsmTile(uint8_t zoom, int tileX, int tileY, const String &path) {
+  if (LittleFS.exists(path)) return true;
+  if (WiFi.status() != WL_CONNECTED) return false;
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setTimeout(12000);
+  const String url = "https://tile.openstreetmap.org/" + String(zoom) + "/" + String(tileX) + "/" + String(tileY) + ".png";
+  if (!http.begin(client, url)) return false;
+  http.addHeader("User-Agent", "2E0LXY-ADSB-Map/2.1 (ESP32-S3 personal display)");
+  const int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    Serial.printf("OSM tile %d/%d/%d HTTP %d\n", zoom, tileX, tileY, code);
+    http.end();
+    return false;
+  }
+  File file = LittleFS.open(path, FILE_WRITE);
+  const int written = file ? http.writeToStream(&file) : -1;
+  if (file) file.close();
+  http.end();
+  if (written <= 0) {
+    LittleFS.remove(path);
+    return false;
+  }
+  return true;
+}
+
+bool drawCachedOsmTile(const String &path, int screenX, int screenY) {
+  File file = LittleFS.open(path, FILE_READ);
+  if (!file) return false;
+  const size_t size = file.size();
+  uint8_t *data = static_cast<uint8_t *>(heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (!data) { file.close(); return false; }
+  const size_t read = file.read(data, size);
+  file.close();
+  if (read != size) { free(data); return false; }
+  pngTileScreenX = screenX;
+  pngTileScreenY = screenY;
+  const int opened = pngDecoder.openRAM(data, size, drawPngLine);
+  const bool success = opened == PNG_SUCCESS && pngDecoder.decode(nullptr, 0) == PNG_SUCCESS;
+  if (opened == PNG_SUCCESS) pngDecoder.close();
+  free(data);
+  return success;
+}
+
+void drawLocationFallback() {
+  filledRect(0, 0, W, H, rgb(5, 20, 31));
+  for (int radius = 70; radius <= 210; radius += 70) {
+    for (int degrees = 0; degrees < 360; ++degrees) {
+      const float angle = radians(degrees);
+      pixel(240 + lroundf(cosf(angle) * radius), 240 + lroundf(sinf(angle) * radius), rgb(25, 75, 96));
+    }
+  }
+  line(0, 240, W - 1, 240, rgb(25, 75, 96));
+  line(240, 0, 240, H - 1, rgb(25, 75, 96));
+}
+
+bool refreshPhysicalBaseMap() {
+  if (!framebuffer || !baseMap) return false;
+  physicalMapZoom = zoomForRadius();
+  drawLocationFallback();
+  const double centerX = osmWorldX(homeLongitude, physicalMapZoom);
+  const double centerY = osmWorldY(homeLatitude, physicalMapZoom);
+  const int left = lround(centerX - W / 2.0);
+  const int top = lround(centerY - H / 2.0);
+  const int firstTileX = static_cast<int>(floor(left / 256.0));
+  const int firstTileY = static_cast<int>(floor(top / 256.0));
+  const int lastTileX = static_cast<int>(floor((left + W - 1) / 256.0));
+  const int lastTileY = static_cast<int>(floor((top + H - 1) / 256.0));
+  const int tilesPerAxis = 1 << physicalMapZoom;
+  bool drewTile = false;
+  for (int tileY = firstTileY; tileY <= lastTileY; ++tileY) {
+    if (tileY < 0 || tileY >= tilesPerAxis) continue;
+    for (int tileX = firstTileX; tileX <= lastTileX; ++tileX) {
+      const int wrappedX = (tileX % tilesPerAxis + tilesPerAxis) % tilesPerAxis;
+      const String path = osmTilePath(physicalMapZoom, wrappedX, tileY);
+      if (!cacheOsmTile(physicalMapZoom, wrappedX, tileY, path)) continue;
+      drewTile |= drawCachedOsmTile(path, tileX * 256 - left, tileY * 256 - top);
+    }
+  }
+  filledRect(0, H - 15, 142, 15, rgb(0, 0, 0));
+  text5(3, H - 12, "(C) OPENSTREETMAP", rgb(255, 255, 255));
+  memcpy(baseMap, framebuffer, W * H * sizeof(uint16_t));
+  physicalMapReady = true;
+  Serial.printf("Physical map %s at %.5f, %.5f radius %u nm zoom %u\n",
+                drewTile ? "ready" : "using radar fallback", homeLatitude,
+                homeLongitude, queryRadiusNm, physicalMapZoom);
+  return drewTile;
+}
+
+void beepAlert() {
+  if (!soundAlerts) return;
+  WS_CH32_IO::writeRegister(Wire, WS_CH32_IO::REG_OUTPUT,
+                            WS_CH32_IO::OUT_DISPLAY_ON | WS_CH32_IO::PIN_BEE_EN);
+  delay(200);
+  WS_CH32_IO::writeRegister(Wire, WS_CH32_IO::REG_OUTPUT,
+                            WS_CH32_IO::OUT_DISPLAY_ON);
+}
+
+const char *compassDirection(float track) {
+  static const char *directions[] = {"N","NE","E","SE","S","SW","W","NW"};
+  int index = static_cast<int>((track + 22.5f) / 45.0f) & 7;
+  return directions[index];
+}
+
+String urlEncode(const char *value) {
+  String encoded;
+  const char hex[] = "0123456789ABCDEF";
+  while (*value) {
+    uint8_t c = static_cast<uint8_t>(*value++);
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+        (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~') {
+      encoded += static_cast<char>(c);
+    } else {
+      encoded += '%'; encoded += hex[c >> 4]; encoded += hex[c & 0x0F];
+    }
+  }
+  return encoded;
+}
+
+bool requestAccessToken() {
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setTimeout(8000);
+  if (!http.begin(client, TOKEN_URL)) return false;
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+  String body = "grant_type=client_credentials&client_id=" + urlEncode(openSkyClientId.c_str()) +
+                "&client_secret=" + urlEncode(openSkyClientSecret.c_str());
+  int code = http.POST(body);
+  if (code != HTTP_CODE_OK) {
+    Serial.printf("OpenSky token HTTP %d\n", code);
+    http.end();
+    return false;
+  }
+  JsonDocument tokenDoc;
+  DeserializationError error = deserializeJson(tokenDoc, http.getStream());
+  http.end();
+  if (error || tokenDoc["access_token"].isNull()) {
+    Serial.printf("OpenSky token JSON %s\n", error.c_str());
+    return false;
+  }
+  bearerToken = tokenDoc["access_token"].as<String>();
+  uint32_t expiresIn = tokenDoc["expires_in"] | 1800;
+  uint32_t safeLifetime = expiresIn > 60 ? expiresIn - 60 : expiresIn;
+  tokenExpiresAt = millis() + safeLifetime * 1000UL;
+  Serial.printf("OpenSky token renewed; expires in %lu seconds\n", static_cast<unsigned long>(expiresIn));
+  return true;
+}
+
+bool ensureAccessToken() {
+  if (bearerToken.length() && static_cast<int32_t>(tokenExpiresAt - millis()) > 0) return true;
+  bearerToken = "";
+  return requestAccessToken();
+}
+
+void normalizeCallsign(const char *input, char output[9]) {
+  int n = 0;
+  if (input) {
+    while (*input && n < 8) {
+      if (*input != ' ') output[n++] = toupper(*input);
+      ++input;
+    }
+  }
+  output[n] = 0;
+}
+
+void airportCode(JsonObject airport, char output[5]) {
+  const char *iata = airport["iata_code"] | "";
+  const char *icao = airport["icao_code"] | "";
+  const char *chosen = strlen(iata) == 3 ? iata : icao;
+  strncpy(output, chosen, 4);
+  output[4] = 0;
+}
+
+RouteCacheEntry *routeForCallsign(const char *rawCallsign, int &lookupsUsed) {
+  char callsign[9];
+  normalizeCallsign(rawCallsign, callsign);
+  if (strlen(callsign) < 3) return nullptr;
+
+  RouteCacheEntry *slot = nullptr;
+  for (auto &entry : routeCache) {
+    if (entry.occupied && !strcmp(entry.callsign, callsign)) {
+      entry.lastUsed = millis();
+      if (millis() - entry.resolvedAt < ROUTE_CACHE_MS) return &entry;
+      slot = &entry;
+      break;
+    }
+  }
+  if (!slot) {
+    for (auto &entry : routeCache) if (!entry.occupied) { slot = &entry; break; }
+  }
+  if (!slot) {
+    slot = &routeCache[0];
+    for (auto &entry : routeCache) if (entry.lastUsed < slot->lastUsed) slot = &entry;
+  }
+  if (lookupsUsed >= MAX_ROUTE_LOOKUPS_PER_REFRESH) return nullptr;
+  ++lookupsUsed;
+
+  memset(slot, 0, sizeof(*slot));
+  strncpy(slot->callsign, callsign, sizeof(slot->callsign) - 1);
+  slot->occupied = true;
+  slot->resolvedAt = slot->lastUsed = millis();
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setTimeout(6000);
+  String url = "https://api.adsbdb.com/v0/callsign/" + String(callsign);
+  if (!http.begin(client, url)) return slot;
+  http.addHeader("Accept-Encoding", "identity");
+  http.addHeader("User-Agent", "Waveshare-OpenSky-Map/1.0");
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    Serial.printf("Route %s HTTP %d\n", callsign, code);
+    http.end();
+    return slot;
+  }
+  String payload = http.getString();
+  http.end();
+  JsonDocument routeDoc;
+  if (deserializeJson(routeDoc, payload)) return slot;
+  JsonObject route = routeDoc["response"]["flightroute"].as<JsonObject>();
+  if (route.isNull()) return slot;
+  airportCode(route["origin"].as<JsonObject>(), slot->origin);
+  airportCode(route["destination"].as<JsonObject>(), slot->destination);
+  slot->hasRoute = slot->origin[0] && slot->destination[0];
+  if (slot->hasRoute) Serial.printf("Route %s %s>%s\n", callsign, slot->origin, slot->destination);
+  return slot;
+}
+
+RouteCacheEntry *cachedRoute(const char *rawCallsign) {
+  char callsign[9];
+  normalizeCallsign(rawCallsign, callsign);
+  for (auto &entry : routeCache) {
+    if (entry.occupied && !strcmp(entry.callsign, callsign)) return &entry;
+  }
+  return nullptr;
+}
+
+uint16_t operatorColour(const char *code) {
+  if (!strncmp(code,"BAW",3)) return rgb(20,45,125);
+  if (!strncmp(code,"EZY",3)) return rgb(255,85,0);
+  if (!strncmp(code,"RYR",3)) return rgb(15,40,125);
+  if (!strncmp(code,"EXS",3)) return rgb(210,25,45);
+  if (!strncmp(code,"TOM",3)) return rgb(50,160,205);
+  if (!strncmp(code,"VIR",3)) return rgb(205,20,45);
+  if (!strncmp(code,"LOG",3)) return rgb(35,95,145);
+  if (!strncmp(code,"DHK",3) || !strncmp(code,"BCS",3)) return rgb(245,205,20);
+  return rgb(0,185,210);
+}
+
+void drawMlatPlane(int x, int y, float heading) {
+  float a = radians(heading - 90.0f), cs=cosf(a), sn=sinf(a);
+  auto tx=[&](float px,float py){return x+lroundf(px*cs-py*sn);};
+  auto ty=[&](float px,float py){return y+lroundf(px*sn+py*cs);};
+  uint16_t red=rgb(245,30,35), white=rgb(255,255,255);
+  disc(x,y,2,red);
+  line(tx(12,0),ty(12,0),tx(-9,-5),ty(-9,-5),red);
+  line(tx(12,0),ty(12,0),tx(-9,5),ty(-9,5),red);
+  line(tx(-9,-5),ty(-9,-5),tx(-5,0),ty(-5,0),red);
+  line(tx(-5,0),ty(-5,0),tx(-9,5),ty(-9,5),red);
+  pixel(x,y,white);
+}
+
+void drawAdsbLogo(int x, int y, float heading, const char *flight, const char *hex) {
+  char code[4] = {'?','?','?',0};
+  const char *src = (flight && strlen(flight)>=3) ? flight : hex;
+  for (int i=0;i<3 && src && src[i];++i) code[i]=toupper(src[i]);
+  uint16_t brand=operatorColour(code), white=rgb(255,255,255), dark=rgb(5,15,20);
+  disc(x,y,10,dark); disc(x,y,8,brand);
+  text5(x-7,y-3,code,white,1);
+  float a=radians(heading-90.0f);
+  int nx=x+lroundf(cosf(a)*15), ny=y+lroundf(sinf(a)*15);
+  line(x,y,nx,ny,white);
+  disc(nx,ny,2,white);
+}
+
+void drawOperatorBadge(int x, int y, const char *flight, const char *hex) {
+  char code[4] = {'?','?','?',0};
+  const char *src = (flight && strlen(flight)>=3) ? flight : hex;
+  for (int i=0; i<3 && src && src[i]; ++i) code[i]=toupper(src[i]);
+  disc(x,y,10,rgb(5,15,20));
+  disc(x,y,8,operatorColour(code));
+  text5(x-7,y-3,code,rgb(255,255,255));
+}
+
+void drawRouteLabel(int x, int y, const RouteCacheEntry *route) {
+  if (!route || !route->hasRoute) return;
+  char label[11];
+  snprintf(label, sizeof(label), "%s>%s", route->origin, route->destination);
+  int width = strlen(label) * 6;
+  int labelX = constrain(x - width / 2, 2, W - width - 2);
+  int labelY = constrain(y + 13, 2, H - 11);
+  filledRect(labelX - 2, labelY - 2, width + 4, 11, rgb(0,0,0));
+  text5(labelX, labelY, label, rgb(255,255,255));
+}
+
+void status(const char *label, uint16_t colour) {
+  disc(240,18,12,rgb(0,0,0)); disc(240,18,8,colour);
+  int width=strlen(label)*6;
+  text5(240-width/2,32,label,rgb(255,255,255));
+}
+
+void present() { gfx->draw16bitRGBBitmap(0,0,framebuffer,W,H); }
+
+void renderBootScreen(const String &networkLine = "") {
+  gfx->draw16bitRGBBitmap(0, 0, const_cast<uint16_t *>(BOOT_IMAGE), W, H);
+  gfx->setTextWrap(false);
+  gfx->setTextSize(2);
+  gfx->setTextColor(RGB565_WHITE);
+  const String credit = "Firmware (c) 2E0LXY D.Loxley 2026";
+  gfx->setCursor(max(4, (W - static_cast<int>(credit.length()) * 12) / 2), 414);
+  gfx->print(credit);
+  if (networkLine.length()) {
+    gfx->setTextColor(rgb(53,169,244));
+    const int width = networkLine.length() * 12;
+    gfx->setCursor(max(8, (W - width) / 2), 448);
+    gfx->print(networkLine);
+  }
+}
+
+void renderMapPage() {
+  restoreMap();
+  for (int i=0; i<lastCount; ++i) {
+    AircraftDisplay &display = latestAircraft[i];
+    if (display.x < 0 || display.x >= W || display.y < 0 || display.y >= H) continue;
+    if (display.positionSource == 2) {
+      drawMlatPlane(display.x,display.y,display.track);
+    } else {
+      drawAdsbLogo(display.x,display.y,display.track,display.flight,display.hex);
+      drawRouteLabel(display.x,display.y,cachedRoute(display.flight));
+    }
+  }
+  char count[20];
+  if (creditsRemaining >= 0) snprintf(count,sizeof(count),"%d C%ld",lastCount,creditsRemaining);
+  else snprintf(count,sizeof(count),"%d",lastCount);
+  status(count,rgb(35,210,80));
+  present();
+}
+
+void renderTablePage() {
+  filledRect(0,0,W,H,rgb(2,10,18));
+  text5(144,7,"NEAREST AIRCRAFT",rgb(80,220,255),2);
+  text5(2,31,"LOGO",rgb(170,190,205));
+  text5(34,31,"CALLSIGN",rgb(170,190,205));
+  text5(132,31,"MILES",rgb(170,190,205));
+  text5(184,31,"SOURCE",rgb(170,190,205));
+  text5(244,31,"DIR",rgb(170,190,205));
+  text5(280,31,"ALT FT",rgb(170,190,205));
+  text5(354,31,"FROM TO",rgb(170,190,205));
+  line(3,41,476,41,rgb(55,85,105));
+
+  int rows = min(lastCount, 10);
+  for (int i=0; i<rows; ++i) {
+    AircraftDisplay &display = latestAircraft[i];
+    int y=49+i*40;
+    char distance[6], altitude[7], routeLabel[11];
+    snprintf(distance,sizeof(distance),"%d",static_cast<int>(lroundf(display.distanceMiles)));
+    if (display.altitudeFt >= 0) snprintf(altitude,sizeof(altitude),"%d",display.altitudeFt);
+    else strcpy(altitude,"--");
+    RouteCacheEntry *route=cachedRoute(display.flight);
+    if (route && route->hasRoute) snprintf(routeLabel,sizeof(routeLabel),"%s>%s",route->origin,route->destination);
+    else strcpy(routeLabel,"---");
+    const char *identity=display.flight[0] ? display.flight : display.hex;
+    if (display.positionSource == 2) drawMlatPlane(16,y+7,display.track);
+    else drawOperatorBadge(16,y+7,display.flight,display.hex);
+    text5(34,y,identity,rgb(255,255,255),2);
+    text5(132,y,distance,rgb(255,220,80),2);
+    text5(184,y,display.positionSource==2 ? "MLAT" : "ADSB",display.positionSource==2 ? rgb(255,65,65) : rgb(60,220,130),2);
+    text5(244,y,compassDirection(display.track),rgb(255,255,255),2);
+    text5(280,y,altitude,rgb(255,255,255),2);
+    text5(354,y,routeLabel,rgb(130,210,255),2);
+    line(3,y+25,476,y+25,rgb(25,45,60));
+  }
+  char footer[24];
+  snprintf(footer,sizeof(footer),"%d AIRCRAFT  C%ld",lastCount,creditsRemaining);
+  text5(170,459,footer,rgb(130,160,180));
+  present();
+}
+
+void renderCurrentPage() {
+  if (tablePage) renderTablePage();
+  else renderMapPage();
+}
+
+void fetchAdsbV2Aircraft() {
+  String url;
+  const String latitude = String(homeLatitude, 5);
+  const String longitude = String(homeLongitude, 5);
+  const String radius = String(queryRadiusNm);
+  if (apiProvider == "adsbfi") {
+    url = "https://opendata.adsb.fi/api/v3/lat/" + latitude + "/lon/" + longitude + "/dist/" + radius;
+  } else if (apiProvider == "airplaneslive") {
+    url = "https://api.airplanes.live/v2/point/" + latitude + "/" + longitude + "/" + radius;
+  } else if (apiProvider == "adsblol") {
+    url = "https://api.adsb.lol/v2/point/" + latitude + "/" + longitude + "/" + radius;
+  } else if (apiProvider == "adsbone") {
+    url = "https://api.adsb.one/v2/point/" + latitude + "/" + longitude + "/" + radius;
+  } else if (apiProvider == "adsbx") {
+    if (!rapidApiKey.length()) {
+      status("KEY", rgb(245,30,35));
+      present();
+      return;
+    }
+    url = "https://adsbexchange-com1.p.rapidapi.com/v2/lat/" + latitude + "/lon/" + longitude + "/dist/" + radius + "/";
+  } else {
+    status("FEED", rgb(245,30,35));
+    present();
+    return;
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setTimeout(9000);
+  if (!http.begin(client, url)) {
+    status("API", rgb(245,30,35));
+    present();
+    return;
+  }
+  http.addHeader("Accept-Encoding", "identity");
+  http.addHeader("User-Agent", "ADSB-Map-Control/2.0 (ESP32-S3; personal display)");
+  if (apiProvider == "adsbx") {
+    http.addHeader("X-RapidAPI-Key", rapidApiKey);
+    http.addHeader("X-RapidAPI-Host", "adsbexchange-com1.p.rapidapi.com");
+  }
+  const int code = http.GET();
+  if (code == HTTP_CODE_TOO_MANY_REQUESTS) {
+    nextFetchAt = millis() + 60000UL;
+    http.end();
+    status("RATE", rgb(245,30,35));
+    present();
+    return;
+  }
+  if (code != HTTP_CODE_OK) {
+    Serial.printf("%s HTTP %d\n", apiProvider.c_str(), code);
+    http.end();
+    status("API", rgb(245,30,35));
+    present();
+    return;
+  }
+
+  String payload = http.getString();
+  http.end();
+  JsonDocument doc;
+  const DeserializationError error = deserializeJson(doc, payload);
+  if (error || !doc["ac"].is<JsonArray>()) {
+    Serial.printf("%s JSON %s\n", apiProvider.c_str(), error.c_str());
+    status("JSON", rgb(245,30,35));
+    present();
+    return;
+  }
+
+  lastCount = 0;
+  lastMlat = 0;
+  creditsRemaining = -1;
+  bool aircraftAtZeroMiles = false;
+  for (JsonObject aircraft : doc["ac"].as<JsonArray>()) {
+    if (lastCount >= MAX_AIRCRAFT || aircraft["lat"].isNull() || aircraft["lon"].isNull()) continue;
+    const float latitude = aircraft["lat"].as<float>();
+    const float longitude = aircraft["lon"].as<float>();
+    AircraftDisplay &display = latestAircraft[lastCount];
+    mapPoint(latitude, longitude, display.x, display.y);
+    display.latitude = latitude;
+    display.longitude = longitude;
+    if (!aircraft["track"].isNull()) display.track = aircraft["track"].as<float>();
+    else if (!aircraft["true_heading"].isNull()) display.track = aircraft["true_heading"].as<float>();
+    else display.track = aircraft["mag_heading"] | 0.0f;
+    display.distanceMiles = distanceMilesFromHome(latitude, longitude);
+    if (lroundf(display.distanceMiles) == 0) aircraftAtZeroMiles = true;
+    JsonVariant altitude = aircraft["alt_baro"];
+    if (altitude.is<int>() || altitude.is<float>() || altitude.is<double>()) display.altitudeFt = lroundf(altitude.as<float>());
+    else if (!aircraft["alt_geom"].isNull()) display.altitudeFt = lroundf(aircraft["alt_geom"].as<float>());
+    else display.altitudeFt = -1;
+    const char *flight = aircraft["flight"] | "";
+    const char *hex = aircraft["hex"] | "???";
+    normalizeCallsign(flight, display.flight);
+    strncpy(display.hex, hex, sizeof(display.hex) - 1);
+    display.hex[sizeof(display.hex) - 1] = 0;
+    JsonArray mlatFields = aircraft["mlat"].as<JsonArray>();
+    display.positionSource = !mlatFields.isNull() && mlatFields.size() ? 2 : 0;
+    ++lastCount;
+  }
+  for (int i = 1; i < lastCount; ++i) {
+    AircraftDisplay key = latestAircraft[i];
+    int j = i - 1;
+    while (j >= 0 && latestAircraft[j].distanceMiles > key.distanceMiles) {
+      latestAircraft[j + 1] = latestAircraft[j];
+      --j;
+    }
+    latestAircraft[j + 1] = key;
+  }
+  doc.clear();
+  payload = "";
+  int routeLookups = 0;
+  for (int i = 0; i < lastCount; ++i) {
+    AircraftDisplay &display = latestAircraft[i];
+    if (display.positionSource == 2) ++lastMlat;
+    else routeForCallsign(display.flight, routeLookups);
+  }
+  if (aircraftAtZeroMiles) beepAlert();
+  lastFetchCompletedAt = millis();
+  renderCurrentPage();
+  Serial.printf("Displayed %d aircraft (%d MLAT) from %s\n", lastCount, lastMlat, apiProvider.c_str());
+}
+
+void fetchAircraft(bool retriedAuth = false) {
+  if (WiFi.status() != WL_CONNECTED) { status("WIFI", rgb(245,150,0)); present(); return; }
+  if (apiProvider != "opensky") {
+    fetchAdsbV2Aircraft();
+    return;
+  }
+  const bool useOpenSkyAuthentication = openSkyClientId.length() && openSkyClientSecret.length();
+  if (useOpenSkyAuthentication && !ensureAccessToken()) { status("AUTH", rgb(245,30,35)); present(); return; }
+  WiFiClientSecure client; client.setInsecure();
+  HTTPClient http; http.setTimeout(7000);
+  const float latDelta = queryRadiusNm / 60.0f;
+  const float lonDelta = queryRadiusNm / max(1.0f, 60.0f * cosf(radians(homeLatitude)));
+  const String statesUrl = "https://opensky-network.org/api/states/all?lamin=" +
+      String(max(-85.0f, homeLatitude - latDelta), 5) + "&lomin=" +
+      String(max(-180.0f, homeLongitude - lonDelta), 5) + "&lamax=" +
+      String(min(85.0f, homeLatitude + latDelta), 5) + "&lomax=" +
+      String(min(180.0f, homeLongitude + lonDelta), 5);
+  if (!http.begin(client, statesUrl)) { status("API", rgb(245,30,35)); present(); return; }
+  const char *trackedHeaders[] = {"X-Rate-Limit-Remaining", "X-Rate-Limit-Retry-After-Seconds"};
+  http.collectHeaders(trackedHeaders, 2);
+  if (useOpenSkyAuthentication) http.addHeader("Authorization", "Bearer " + bearerToken);
+  http.addHeader("User-Agent", "Waveshare-OpenSky-Map/1.0");
+  http.addHeader("Accept-Encoding", "identity");
+  int code=http.GET();
+  if (useOpenSkyAuthentication && code == HTTP_CODE_UNAUTHORIZED && !retriedAuth) {
+    http.end(); bearerToken = "";
+    if (requestAccessToken()) fetchAircraft(true);
+    else { status("AUTH", rgb(245,30,35)); present(); }
+    return;
+  }
+  if (code == HTTP_CODE_TOO_MANY_REQUESTS) {
+    long retrySeconds = http.header("X-Rate-Limit-Retry-After-Seconds").toInt();
+    if (retrySeconds < 60) retrySeconds = 3600;
+    nextFetchAt = millis() + static_cast<uint32_t>(retrySeconds) * 1000UL;
+    Serial.printf("OpenSky rate limit; retry in %ld seconds\n", retrySeconds);
+    http.end(); status("RATE",rgb(245,30,35)); present(); return;
+  }
+  if (code != HTTP_CODE_OK) { Serial.printf("OpenSky HTTP %d\n",code); http.end(); status("API",rgb(245,30,35)); present(); return; }
+  String remainingHeader = http.header("X-Rate-Limit-Remaining");
+  if (remainingHeader.length()) creditsRemaining = remainingHeader.toInt();
+  String payload = http.getString();
+  http.end();
+  JsonDocument doc;
+  DeserializationError error=deserializeJson(doc,payload);
+  if (error) { Serial.printf("JSON %s\n",error.c_str()); status("JSON",rgb(245,30,35)); present(); return; }
+  lastCount=0; lastMlat=0;
+  bool aircraftAtZeroMiles = false;
+  for (JsonVariant item : doc["states"].as<JsonArray>()) {
+    JsonArray state = item.as<JsonArray>();
+    if (lastCount >= MAX_AIRCRAFT || state[5].isNull() || state[6].isNull()) continue;
+    const float latitude = state[6].as<float>();
+    const float longitude = state[5].as<float>();
+    AircraftDisplay &display = latestAircraft[lastCount];
+    mapPoint(latitude,longitude,display.x,display.y);
+    display.latitude = latitude;
+    display.longitude = longitude;
+    display.track=state[10] | 0.0f;
+    display.distanceMiles=distanceMilesFromHome(latitude,longitude);
+    if (lroundf(display.distanceMiles) == 0) aircraftAtZeroMiles = true;
+    if (!state[7].isNull()) display.altitudeFt=lroundf(state[7].as<float>() * 3.28084f);
+    else if (!state[13].isNull()) display.altitudeFt=lroundf(state[13].as<float>() * 3.28084f);
+    else display.altitudeFt=-1;
+    const char *flight=state[1] | ""; const char *hex=state[0] | "???";
+    display.positionSource=state[16] | -1;
+    normalizeCallsign(flight, display.flight);
+    strncpy(display.hex, hex, sizeof(display.hex)-1);
+    display.hex[sizeof(display.hex)-1] = 0;
+    ++lastCount;
+  }
+  for (int i=1; i<lastCount; ++i) {
+    AircraftDisplay key = latestAircraft[i];
+    int j=i-1;
+    while (j >= 0 && latestAircraft[j].distanceMiles > key.distanceMiles) {
+      latestAircraft[j+1] = latestAircraft[j];
+      --j;
+    }
+    latestAircraft[j+1] = key;
+  }
+  doc.clear();
+  payload = "";
+  int routeLookups = 0;
+  for (int i=0; i<lastCount; ++i) {
+    AircraftDisplay &display = latestAircraft[i];
+    if (display.positionSource == 2) {
+      ++lastMlat;
+    } else {
+      routeForCallsign(display.flight, routeLookups);
+    }
+  }
+  if (aircraftAtZeroMiles) beepAlert();
+  lastFetchCompletedAt = millis();
+  renderCurrentPage();
+  Serial.printf("Displayed %d aircraft (%d MLAT), OpenSky credits remaining: %ld\n",lastCount,lastMlat,creditsRemaining);
+}
+
+int compareVersions(const String &leftValue, const String &rightValue) {
+  String left = leftValue;
+  String right = rightValue;
+  if (left.startsWith("v") || left.startsWith("V")) left.remove(0, 1);
+  if (right.startsWith("v") || right.startsWith("V")) right.remove(0, 1);
+  for (int part = 0; part < 3; ++part) {
+    const int leftDot = left.indexOf('.');
+    const int rightDot = right.indexOf('.');
+    const int leftPart = (leftDot < 0 ? left : left.substring(0, leftDot)).toInt();
+    const int rightPart = (rightDot < 0 ? right : right.substring(0, rightDot)).toInt();
+    if (leftPart != rightPart) return leftPart < rightPart ? -1 : 1;
+    left = leftDot < 0 ? "" : left.substring(leftDot + 1);
+    right = rightDot < 0 ? "" : right.substring(rightDot + 1);
+  }
+  return 0;
+}
+
+bool checkGithubUpdate() {
+  githubUpdateStatus = "Checking GitHub";
+  githubUpdateAvailable = false;
+  githubFirmwareUrl = "";
+  if (WiFi.status() != WL_CONNECTED) {
+    githubUpdateStatus = "Wi-Fi unavailable";
+    return false;
+  }
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setTimeout(12000);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  if (!http.begin(client, GITHUB_RELEASE_API)) {
+    githubUpdateStatus = "GitHub connection failed";
+    return false;
+  }
+  http.addHeader("Accept", "application/vnd.github+json");
+  http.addHeader("X-GitHub-Api-Version", "2022-11-28");
+  http.addHeader("User-Agent", "2E0LXY-ESP32-ADSB/" + String(FIRMWARE_VERSION));
+  const int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    githubUpdateStatus = "GitHub HTTP " + String(code);
+    http.end();
+    return false;
+  }
+  JsonDocument doc;
+  const DeserializationError error = deserializeJson(doc, http.getStream());
+  http.end();
+  if (error) {
+    githubUpdateStatus = "Invalid GitHub response";
+    return false;
+  }
+  githubLatestVersion = doc["tag_name"] | "";
+  for (JsonObject asset : doc["assets"].as<JsonArray>()) {
+    String name = asset["name"] | "";
+    name.toLowerCase();
+    if (name.endsWith(".bin") && (name.indexOf("firmware") >= 0 || name.indexOf("adsb-map") >= 0)) {
+      githubFirmwareUrl = asset["browser_download_url"] | "";
+      break;
+    }
+  }
+  if (!githubLatestVersion.length()) {
+    githubUpdateStatus = "Release has no version";
+    return false;
+  }
+  if (compareVersions(FIRMWARE_VERSION, githubLatestVersion) >= 0) {
+    githubUpdateStatus = "Firmware is current";
+    return true;
+  }
+  if (!githubFirmwareUrl.length()) {
+    githubUpdateStatus = "Release has no firmware binary";
+    return false;
+  }
+  githubUpdateAvailable = true;
+  githubUpdateStatus = "Version " + githubLatestVersion + " available";
+  Serial.printf("GitHub firmware update available: %s\n", githubLatestVersion.c_str());
+  return true;
+}
+
+bool installGithubUpdate() {
+  if (!githubUpdateAvailable || !githubFirmwareUrl.length()) {
+    githubUpdateStatus = "No update is ready";
+    return false;
+  }
+  githubUpdateStatus = "Downloading " + githubLatestVersion;
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setTimeout(15000);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  if (!http.begin(client, githubFirmwareUrl)) {
+    githubUpdateStatus = "Firmware download failed";
+    return false;
+  }
+  http.addHeader("User-Agent", "2E0LXY-ESP32-ADSB/" + String(FIRMWARE_VERSION));
+  const int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    githubUpdateStatus = "Firmware HTTP " + String(code);
+    http.end();
+    return false;
+  }
+  const int expected = http.getSize();
+  if (!Update.begin(expected > 0 ? expected : UPDATE_SIZE_UNKNOWN, U_FLASH)) {
+    githubUpdateStatus = Update.errorString();
+    http.end();
+    return false;
+  }
+  NetworkClient *stream = http.getStreamPtr();
+  uint8_t buffer[4096];
+  size_t total = 0;
+  uint32_t lastDataAt = millis();
+  bool validHeader = false;
+  while (http.connected() && (expected < 0 || total < static_cast<size_t>(expected))) {
+    const size_t available = stream->available();
+    if (available) {
+      const size_t count = stream->readBytes(buffer, min(available, sizeof(buffer)));
+      if (!count) continue;
+      if (total == 0) {
+        validHeader = buffer[0] == 0xE9;
+        if (!validHeader) break;
+      }
+      if (Update.write(buffer, count) != count) break;
+      total += count;
+      lastDataAt = millis();
+    } else {
+      if (millis() - lastDataAt > 15000) break;
+      delay(2);
+    }
+  }
+  http.end();
+  if (!validHeader || (expected > 0 && total != static_cast<size_t>(expected)) || !Update.end(true)) {
+    if (!Update.hasError()) Update.abort();
+    githubUpdateStatus = validHeader ? String(Update.errorString()) : "Downloaded file is not ESP32 firmware";
+    return false;
+  }
+  githubUpdateStatus = "Update installed; rebooting";
+  delay(300);
+  ESP.restart();
+  return true;
+}
+
+void sendJson(int statusCode, const String &payload) {
+  webServer.sendHeader("Cache-Control", "no-store");
+  webServer.send(statusCode, "application/json", payload);
+}
+
+bool requireWebAuthentication() {
+  if (webServer.authenticate(WEB_USERNAME, managementPassword.c_str())) return true;
+  webServer.requestAuthentication(BASIC_AUTH, "ADSB Map Control");
+  return false;
+}
+
+void sendMessage(int statusCode, const char *message) {
+  JsonDocument doc;
+  doc["message"] = message;
+  String payload;
+  serializeJson(doc, payload);
+  sendJson(statusCode, payload);
+}
+
+void handleStatusApi() {
+  if (!requireWebAuthentication()) return;
+  JsonDocument doc;
+  doc["aircraftTotal"] = lastCount;
+  doc["adsb"] = lastCount - lastMlat;
+  doc["mlat"] = lastMlat;
+  doc["credits"] = creditsRemaining;
+  doc["lastRefreshSeconds"] = lastFetchCompletedAt ?
+      static_cast<int32_t>((millis() - lastFetchCompletedAt) / 1000UL) : -1;
+  doc["rssi"] = WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0;
+  doc["uptimeSeconds"] = millis() / 1000UL;
+  doc["ssid"] = WiFi.status() == WL_CONNECTED ? WiFi.SSID() : "";
+  doc["ip"] = WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : "";
+  doc["hostname"] = DEVICE_HOSTNAME;
+  doc["provider"] = apiProvider;
+  doc["hasOpenSkyClientId"] = openSkyClientId.length() > 0;
+  doc["hasOpenSkyClientSecret"] = openSkyClientSecret.length() > 0;
+  doc["hasRapidApiKey"] = rapidApiKey.length() > 0;
+  doc["version"] = FIRMWARE_VERSION;
+  doc["build"] = String(__DATE__) + " " + __TIME__;
+  doc["updateSpace"] = ESP.getFreeSketchSpace();
+  doc["brightness"] = brightnessPercent;
+  doc["sound"] = soundAlerts;
+  doc["page"] = tablePage ? "table" : "map";
+  doc["latitude"] = homeLatitude;
+  doc["longitude"] = homeLongitude;
+  doc["radiusNm"] = queryRadiusNm;
+  doc["mapZoom"] = physicalMapZoom;
+  doc["updateAvailable"] = githubUpdateAvailable;
+  doc["latestVersion"] = githubLatestVersion;
+  doc["updateStatus"] = githubUpdateStatus;
+  doc["releaseRepository"] = String(GITHUB_OWNER) + "/" + GITHUB_REPOSITORY;
+  String payload;
+  serializeJson(doc, payload);
+  sendJson(200, payload);
+}
+
+void handleAircraftApi() {
+  if (!requireWebAuthentication()) return;
+  JsonDocument doc;
+  JsonArray aircraft = doc["aircraft"].to<JsonArray>();
+  for (int i = 0; i < lastCount; ++i) {
+    const AircraftDisplay &display = latestAircraft[i];
+    JsonObject item = aircraft.add<JsonObject>();
+    item["hex"] = display.hex;
+    item["callsign"] = display.flight;
+    item["latitude"] = display.latitude;
+    item["longitude"] = display.longitude;
+    item["distance"] = roundf(display.distanceMiles * 10.0f) / 10.0f;
+    item["altitude"] = display.altitudeFt;
+    item["heading"] = roundf(display.track * 10.0f) / 10.0f;
+    item["direction"] = compassDirection(display.track);
+    item["source"] = display.positionSource == 2 ? "MLAT" : "ADSB";
+    RouteCacheEntry *route = cachedRoute(display.flight);
+    if (route && route->hasRoute) item["route"] = String(route->origin) + ">" + route->destination;
+    else item["route"] = "";
+  }
+  String payload;
+  serializeJson(doc, payload);
+  sendJson(200, payload);
+}
+
+void handleWifiScanStart() {
+  if (!requireWebAuthentication()) return;
+  const int state = WiFi.scanComplete();
+  if (state == WIFI_SCAN_RUNNING) {
+    sendMessage(202, "Wi-Fi scan already running");
+    return;
+  }
+  WiFi.scanDelete();
+  if (WiFi.scanNetworks(true, true) == WIFI_SCAN_FAILED) {
+    sendMessage(500, "Unable to start Wi-Fi scan");
+    return;
+  }
+  sendMessage(202, "Wi-Fi scan started");
+}
+
+void handleWifiScanResults() {
+  if (!requireWebAuthentication()) return;
+  const int count = WiFi.scanComplete();
+  JsonDocument doc;
+  if (count == WIFI_SCAN_RUNNING) {
+    doc["complete"] = false;
+  } else {
+    doc["complete"] = true;
+    JsonArray networks = doc["networks"].to<JsonArray>();
+    if (count > 0) {
+      for (int i = 0; i < count; ++i) {
+        JsonObject network = networks.add<JsonObject>();
+        network["ssid"] = WiFi.SSID(i);
+        network["rssi"] = WiFi.RSSI(i);
+        network["secure"] = WiFi.encryptionType(i) != WIFI_AUTH_OPEN;
+      }
+    }
+    WiFi.scanDelete();
+  }
+  String payload;
+  serializeJson(doc, payload);
+  sendJson(200, payload);
+}
+
+void handleWifiConnect() {
+  if (!requireWebAuthentication()) return;
+  const String ssid = webServer.arg("ssid");
+  const String password = webServer.arg("password");
+  if (!ssid.length() || ssid.length() > 32 || password.length() > 63) {
+    sendMessage(400, "Invalid Wi-Fi network name or password");
+    return;
+  }
+  sendMessage(202, "Wi-Fi connection started; reconnect to the device at its new address");
+  delay(120);
+  WiFi.begin(ssid.c_str(), password.c_str());
+}
+
+void handlePageControl() {
+  if (!requireWebAuthentication()) return;
+  const String page = webServer.arg("page");
+  if (page != "map" && page != "table") {
+    sendMessage(400, "Page must be map or table");
+    return;
+  }
+  tablePage = page == "table";
+  renderCurrentPage();
+  sendMessage(200, tablePage ? "Table page selected" : "Map page selected");
+}
+
+void handleDisplaySettings() {
+  if (!requireWebAuthentication()) return;
+  if (webServer.hasArg("sound")) {
+    soundAlerts = webServer.arg("sound") == "1";
+    settingsStore.putBool("sound", soundAlerts);
+  }
+  if (webServer.hasArg("brightness")) {
+    brightnessPercent = constrain(webServer.arg("brightness").toInt(), 10, 100);
+    settingsStore.putUChar("brightness", brightnessPercent);
+    WS_CH32_IO::setPwm(Wire, brightnessPercent);
+  }
+  sendMessage(200, "Display settings saved");
+}
+
+void handleLocationSettings() {
+  if (!requireWebAuthentication()) return;
+  if (!webServer.hasArg("latitude") || !webServer.hasArg("longitude") ||
+      !webServer.hasArg("radius")) {
+    sendMessage(400, "Latitude, longitude and radius are required");
+    return;
+  }
+  const double latitude = webServer.arg("latitude").toDouble();
+  const double longitude = webServer.arg("longitude").toDouble();
+  const int radius = webServer.arg("radius").toInt();
+  if (!isfinite(latitude) || latitude < -85.0 || latitude > 85.0 ||
+      !isfinite(longitude) || longitude < -180.0 || longitude > 180.0 ||
+      radius < 5 || radius > 250) {
+    sendMessage(400, "Use latitude -85 to 85, longitude -180 to 180, and radius 5 to 250 nm");
+    return;
+  }
+  homeLatitude = latitude;
+  homeLongitude = longitude;
+  queryRadiusNm = radius;
+  physicalMapZoom = zoomForRadius();
+  settingsStore.putFloat("home-lat", homeLatitude);
+  settingsStore.putFloat("home-lon", homeLongitude);
+  settingsStore.putUShort("radius-nm", queryRadiusNm);
+  physicalMapReady = false;
+  physicalMapRefreshPending = true;
+  nextFetchAt = 0;
+  sendMessage(202, "Location saved; rebuilding both maps and refreshing aircraft");
+}
+
+void handleGithubUpdateCheck() {
+  if (!requireWebAuthentication()) return;
+  githubCheckPending = true;
+  sendMessage(202, "GitHub update check requested");
+}
+
+void handleGithubUpdateInstall() {
+  if (!requireWebAuthentication()) return;
+  if (!githubUpdateAvailable || !githubFirmwareUrl.length()) {
+    sendMessage(409, "No newer GitHub firmware release is ready");
+    return;
+  }
+  githubInstallPending = true;
+  sendMessage(202, "GitHub firmware download and installation started");
+}
+
+void handlePasswordChange() {
+  if (!requireWebAuthentication()) return;
+  const String password = webServer.arg("password");
+  if (password.length() < 8 || password.length() > 63) {
+    sendMessage(400, "Management password must be 8 to 63 characters");
+    return;
+  }
+  managementPassword = password;
+  settingsStore.putString("password", managementPassword);
+  sendMessage(200, "Management password changed");
+}
+
+void handleProviderSettings() {
+  if (!requireWebAuthentication()) return;
+  const String provider = webServer.arg("provider");
+  if (provider != "opensky" && provider != "adsbfi" &&
+      provider != "airplaneslive" && provider != "adsblol" &&
+      provider != "adsbone" && provider != "adsbx") {
+    sendMessage(400, "Unknown aircraft data provider");
+    return;
+  }
+  if (webServer.arg("clear") == "1") {
+    openSkyClientId = "";
+    openSkyClientSecret = "";
+    rapidApiKey = "";
+    settingsStore.putString("os-client", "");
+    settingsStore.putString("os-secret", "");
+    settingsStore.putString("rapid-key", "");
+  } else {
+    if (webServer.hasArg("clientId") && webServer.arg("clientId").length()) {
+      openSkyClientId = webServer.arg("clientId");
+      settingsStore.putString("os-client", openSkyClientId);
+    }
+    if (webServer.hasArg("clientSecret") && webServer.arg("clientSecret").length()) {
+      openSkyClientSecret = webServer.arg("clientSecret");
+      settingsStore.putString("os-secret", openSkyClientSecret);
+    }
+    if (webServer.hasArg("rapidApiKey") && webServer.arg("rapidApiKey").length()) {
+      rapidApiKey = webServer.arg("rapidApiKey");
+      settingsStore.putString("rapid-key", rapidApiKey);
+    }
+  }
+  apiProvider = provider;
+  settingsStore.putString("provider", apiProvider);
+  bearerToken = "";
+  tokenExpiresAt = 0;
+  nextFetchAt = 0;
+  sendMessage(200, "Aircraft data provider settings saved");
+}
+
+void handleFirmwareUpload() {
+  HTTPUpload &upload = webServer.upload();
+  if (!webServer.authenticate(WEB_USERNAME, managementPassword.c_str())) return;
+  if (upload.status == UPLOAD_FILE_START) {
+    firmwareUploadError = "";
+    String filename = upload.filename;
+    filename.toLowerCase();
+    if (!filename.endsWith(".bin")) {
+      firmwareUploadError = "Firmware filename must end in .bin";
+      return;
+    }
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) {
+      firmwareUploadError = Update.errorString();
+    }
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (firmwareUploadError.length()) return;
+    if (Update.progress() == 0 && (upload.currentSize == 0 || upload.buf[0] != 0xE9)) {
+      firmwareUploadError = "Selected file is not an ESP32 application image";
+      Update.abort();
+      return;
+    }
+    if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+      firmwareUploadError = Update.errorString();
+    }
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (!firmwareUploadError.length() && !Update.end(true)) {
+      firmwareUploadError = Update.errorString();
+    }
+  } else if (upload.status == UPLOAD_FILE_ABORTED) {
+    Update.abort();
+    firmwareUploadError = "Firmware upload was cancelled";
+  }
+}
+
+void handleFirmwareResult() {
+  if (!requireWebAuthentication()) return;
+  if (firmwareUploadError.length() || Update.hasError()) {
+    const String error = firmwareUploadError.length() ? firmwareUploadError : Update.errorString();
+    JsonDocument doc;
+    doc["message"] = error;
+    String payload;
+    serializeJson(doc, payload);
+    sendJson(400, payload);
+    return;
+  }
+  sendMessage(200, "Firmware validated; device is rebooting");
+  restartPending = true;
+  restartAt = millis() + 1500;
+}
+
+void beginWebControl() {
+  if (!webServerReady) {
+    webServer.on("/", HTTP_GET, []() {
+      if (!requireWebAuthentication()) return;
+      webServer.sendHeader("Cache-Control", "no-store");
+      webServer.send_P(200, "text/html", WEB_UI);
+    });
+    webServer.on("/api/status", HTTP_GET, handleStatusApi);
+    webServer.on("/api/aircraft", HTTP_GET, handleAircraftApi);
+    webServer.on("/api/page", HTTP_POST, handlePageControl);
+    webServer.on("/api/settings", HTTP_POST, handleDisplaySettings);
+    webServer.on("/api/location", HTTP_POST, handleLocationSettings);
+    webServer.on("/api/update/check", HTTP_POST, handleGithubUpdateCheck);
+    webServer.on("/api/update/github", HTTP_POST, handleGithubUpdateInstall);
+    webServer.on("/api/refresh", HTTP_POST, []() {
+      if (!requireWebAuthentication()) return;
+      nextFetchAt = 0;
+      sendMessage(202, "Aircraft refresh requested");
+    });
+    webServer.on("/api/wifi/scan", HTTP_POST, handleWifiScanStart);
+    webServer.on("/api/wifi/results", HTTP_GET, handleWifiScanResults);
+    webServer.on("/api/wifi/connect", HTTP_POST, handleWifiConnect);
+    webServer.on("/api/password", HTTP_POST, handlePasswordChange);
+    webServer.on("/api/provider", HTTP_POST, handleProviderSettings);
+    webServer.on("/api/firmware", HTTP_POST, handleFirmwareResult, handleFirmwareUpload);
+    webServer.on("/api/reboot", HTTP_POST, []() {
+      if (!requireWebAuthentication()) return;
+      sendMessage(202, "Device is rebooting");
+      restartPending = true;
+      restartAt = millis() + 800;
+    });
+    webServer.on("/api/portal", HTTP_POST, []() {
+      if (!requireWebAuthentication()) return;
+      sendMessage(202, "Setup portal will start as ADSBMAP");
+      setupPortalPending = true;
+    });
+    webServer.onNotFound([]() {
+      if (!requireWebAuthentication()) return;
+      sendMessage(404, "Not found");
+    });
+    webServerReady = true;
+  }
+  webServer.begin();
+  if (WiFi.status() == WL_CONNECTED) {
+    MDNS.end();
+    if (MDNS.begin(DEVICE_HOSTNAME)) MDNS.addService("http", "tcp", 80);
+  }
+  Serial.printf("Web control: http://%s/ or http://%s.local/\n",
+                WiFi.localIP().toString().c_str(), DEVICE_HOSTNAME);
+}
+}
+
+void setup() {
+  Serial.begin(115200);
+  if (!LittleFS.begin(true)) Serial.println("LittleFS map cache unavailable");
+  settingsStore.begin("adsb-web", false);
+  managementPassword = settingsStore.getString("password", "aircraft");
+  apiProvider = settingsStore.getString("provider", "opensky");
+  if (apiProvider != "opensky" && apiProvider != "adsbfi" &&
+      apiProvider != "airplaneslive" && apiProvider != "adsblol" &&
+      apiProvider != "adsbone" && apiProvider != "adsbx") apiProvider = "opensky";
+  openSkyClientId = settingsStore.getString("os-client", OPENSKY_CLIENT_ID);
+  openSkyClientSecret = settingsStore.getString("os-secret", OPENSKY_CLIENT_SECRET);
+  rapidApiKey = settingsStore.getString("rapid-key", "");
+  homeLatitude = settingsStore.getFloat("home-lat", DEFAULT_HOME_LAT);
+  homeLongitude = settingsStore.getFloat("home-lon", DEFAULT_HOME_LON);
+  queryRadiusNm = constrain(settingsStore.getUShort("radius-nm", DEFAULT_RADIUS_NM), 5, 250);
+  if (!isfinite(homeLatitude) || homeLatitude < -85.0f || homeLatitude > 85.0f) homeLatitude = DEFAULT_HOME_LAT;
+  if (!isfinite(homeLongitude) || homeLongitude < -180.0f || homeLongitude > 180.0f) homeLongitude = DEFAULT_HOME_LON;
+  physicalMapZoom = zoomForRadius();
+  soundAlerts = settingsStore.getBool("sound", true);
+  brightnessPercent = settingsStore.getUChar("brightness", 100);
+  brightnessPercent = constrain(brightnessPercent, 10, 100);
+  pinMode(0, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(0), onBootButtonFalling, FALLING);
+  delay(300);
+  if (!WS_CH32_IO::begin(Wire, WS_CH32_IO::DEFAULT_I2C_SDA,
+                         WS_CH32_IO::DEFAULT_I2C_SCL,
+                         WS_CH32_IO::DEFAULT_I2C_FREQ, &Serial)) {
+    Serial.println("Rev4 display helper unavailable");
+  }
+  if (brightnessPercent < 100) WS_CH32_IO::setPwm(Wire, brightnessPercent);
+  if (!gfx->begin()) {
+    Serial.println("Display initialization failed");
+    while (true) delay(1000);
+  }
+  touchReady = beginTouch();
+#if DISPLAY_DIAGNOSTIC
+  // Keep this test independent of PSRAM, Wi-Fi, the map and OpenSky.
+  gfx->fillScreen(RGB565_RED);
+  delay(1500);
+  gfx->fillScreen(RGB565_GREEN);
+  delay(1500);
+  gfx->fillScreen(RGB565_BLUE);
+  delay(1500);
+  gfx->fillScreen(RGB565_WHITE);
+  gfx->setCursor(55, 220);
+  gfx->setTextSize(4);
+  gfx->setTextColor(RGB565_BLACK);
+  gfx->println("DISPLAY OK");
+  return;
+#endif
+  renderBootScreen();
+  delay(2800);
+  framebuffer=(uint16_t*)heap_caps_malloc(W*H*sizeof(uint16_t),MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
+  baseMap=(uint16_t*)heap_caps_malloc(W*H*sizeof(uint16_t),MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
+  if (!framebuffer || !baseMap) { Serial.println("PSRAM map buffers unavailable"); while(true) delay(1000); }
+  restoreMap(); status("SETUP",rgb(245,150,0)); present();
+  WiFi.setHostname(DEVICE_HOSTNAME);
+  WiFi.mode(WIFI_STA);
+  WiFiManager wm;
+  wm.setWiFiAPChannel(6);
+  wm.setConfigPortalTimeout(900);
+  renderBootScreen("Setup: ADSBMAP at 192.168.4.1");
+  if (!wm.autoConnect("ADSBMAP", "aircraft")) {
+    restoreMap(); status("WIFI",rgb(245,30,35)); present();
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    renderBootScreen("Web: " + WiFi.localIP().toString());
+    delay(5000);
+    refreshPhysicalBaseMap();
+    restoreMap();
+    status("MAP", rgb(53,169,244));
+    present();
+  }
+  beginWebControl();
+  Serial.printf("Web login: %s / %s\n", WEB_USERNAME, managementPassword.c_str());
+  fetchAircraft();
+  nextFetchAt=millis()+REFRESH_MS;
+  nextGithubCheckAt=millis()+15000UL;
+}
+
+void loop() {
+#if DISPLAY_DIAGNOSTIC
+  static uint8_t colour = 0;
+  static uint32_t nextChange = 0;
+  if (millis() >= nextChange) {
+    const uint16_t colours[] = {RGB565_RED, RGB565_GREEN, RGB565_BLUE, RGB565_WHITE};
+    gfx->fillScreen(colours[colour++ & 3]);
+    nextChange = millis() + 2000;
+  }
+  delay(20);
+  return;
+#endif
+  webServer.handleClient();
+  if (githubInstallPending) {
+    githubInstallPending = false;
+    installGithubUpdate();
+  }
+  if (githubCheckPending || static_cast<int32_t>(millis() - nextGithubCheckAt) >= 0) {
+    githubCheckPending = false;
+    checkGithubUpdate();
+    nextGithubCheckAt = millis() + UPDATE_CHECK_MS;
+  }
+  if (physicalMapRefreshPending) {
+    physicalMapRefreshPending = false;
+    refreshPhysicalBaseMap();
+    renderCurrentPage();
+  }
+  if (setupPortalPending) {
+    setupPortalPending = false;
+    delay(250);
+    webServer.stop();
+    MDNS.end();
+    WiFiManager wm;
+    wm.setWiFiAPChannel(6);
+    wm.setConfigPortalTimeout(900);
+    wm.startConfigPortal("ADSBMAP", "aircraft");
+    beginWebControl();
+  }
+  if (restartPending && static_cast<int32_t>(millis() - restartAt) >= 0) {
+    delay(100);
+    ESP.restart();
+  }
+  if (touchTapped() || bootButtonTapped()) {
+    tablePage = !tablePage;
+    renderCurrentPage();
+    Serial.println(tablePage ? "Page: nearest-aircraft table" : "Page: map");
+  }
+  if (static_cast<int32_t>(millis()-nextFetchAt) >= 0) {
+    fetchAircraft();
+    if (static_cast<int32_t>(millis()-nextFetchAt) >= 0) nextFetchAt=millis()+REFRESH_MS;
+  }
+  delay(50);
+}

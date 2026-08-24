@@ -1,0 +1,5 @@
+.pio/
+credentials.json
+*.key
+*.pem
+release/*.bin
