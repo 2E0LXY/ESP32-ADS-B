@@ -90,6 +90,7 @@ public:
   }
 
   uint16_t *getFrameBuffer(int16_t w, int16_t h);
+  bool restartAtNextVsync();
 
 protected:
 private:

@@ -5,6 +5,7 @@ const { chromium } = require("playwright");
 const baseUrl = process.env.ADSB_SCREENSHOT_URL || "http://192.168.1.74/";
 const username = process.env.ADSB_SCREENSHOT_USERNAME || "admin";
 const password = process.env.ADSB_SCREENSHOT_PASSWORD || "aircraft";
+const installerUrl = process.env.ADSB_INSTALLER_URL || "https://2e0lxy.github.io/ESP32-ADS-B/";
 const outputDirectory = path.resolve(__dirname, "..", "docs", "screenshots");
 const views = ["overview", "mapview", "aircraft", "display", "wifi", "api", "firmware", "device"];
 
@@ -43,7 +44,7 @@ async function main() {
   }
 
   const installer = await context.newPage();
-  await installer.goto("https://2e0lxy.github.io/ESP32-ADS-B/", { waitUntil: "networkidle" });
+  await installer.goto(installerUrl, { waitUntil: "networkidle" });
   await installer.waitForSelector("esp-web-install-button", { timeout: 15000 });
   await installer.screenshot({ path: path.join(outputDirectory, "installer.png"), fullPage: true });
 

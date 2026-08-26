@@ -10,7 +10,12 @@
 #include <Preferences.h>
 #include <ESPmDNS.h>
 #include <LittleFS.h>
+#include <SD_MMC.h>
 #include <PNGdec.h>
+#include <esp_heap_caps.h>
+#include <esp_system.h>
+#include <mbedtls/sha256.h>
+#include <mbedtls/pk.h>
 #include <math.h>
 
 #include "WS_CH32_IO.h"
@@ -44,17 +49,47 @@ constexpr float DEFAULT_HOME_LON = -1.57f;
 constexpr uint16_t DEFAULT_RADIUS_NM = 60;
 constexpr char TOKEN_URL[] = "https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token";
 constexpr uint32_t REFRESH_MS = 30000;
-constexpr int MAX_AIRCRAFT = 80;
+constexpr int MAX_AIRCRAFT = 250;
 constexpr int ROUTE_CACHE_SIZE = 48;
 constexpr int MAX_ROUTE_LOOKUPS_PER_REFRESH = 4;
 constexpr uint32_t ROUTE_CACHE_MS = 6UL * 60UL * 60UL * 1000UL;
-constexpr char FIRMWARE_VERSION[] = "2.4.0";
+constexpr uint32_t ROUTE_RETRY_MS = 5UL * 60UL * 1000UL;
+constexpr char FIRMWARE_VERSION[] = "2.5.0";
 constexpr char DEVICE_HOSTNAME[] = "adsb-map";
 constexpr char WEB_USERNAME[] = "admin";
 constexpr char GITHUB_OWNER[] = "2E0LXY";
 constexpr char GITHUB_REPOSITORY[] = "ESP32-ADS-B";
 constexpr char GITHUB_RELEASE_API[] = "https://api.github.com/repos/2E0LXY/ESP32-ADS-B/releases/latest";
 constexpr uint32_t UPDATE_CHECK_MS = 6UL * 60UL * 60UL * 1000UL;
+constexpr int SD_CLK_PIN = 2;
+constexpr int SD_CMD_PIN = 1;
+constexpr int SD_D0_PIN = 4;
+constexpr char SD_UPDATE_DIR[] = "/adsb/update";
+constexpr char SD_UPDATE_PART[] = "/adsb/update/firmware.bin.part";
+constexpr char SD_UPDATE_FILE[] = "/adsb/update/firmware.bin";
+constexpr char FIRMWARE_PUBLIC_KEY[] = R"KEY(-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAzJLYuacEhXg2q+drT7MT
+OxZRXBbr5AXIAE6ZqPthjnZazlzzDf8ctP2dZ3aAeY9JNCFFF9PPeW2M5wAoXhYf
+nBRUW20KnO6SL1Yp09MfMh0bERxGKDbbzLl4iqHsNxwnlRcWVrNuCuNn6k0RJjra
+1mXIL0kf6xGdbQBwEyOpA1guiGWymvQashwVGQ1pPR9F80UrFBQUDXt7TJHLty05
+pAn/ixJRyZStSxPUF8J/W0/cCSS4lYCiRTaiZmuvdMtoR7fGV4iy9aS5lzUJ/qqD
+df0jLYhXW4NWQtsm+m22kaDPUMeIlNP+frudTx9qHHKRgTjo4le6xOBlgkcxH/PK
+rQIDAQAB
+-----END PUBLIC KEY-----
+)KEY";
+
+class PsramAllocator : public ArduinoJson::Allocator {
+ public:
+  void *allocate(size_t size) override {
+    return heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  }
+  void deallocate(void *pointer) override { heap_caps_free(pointer); }
+  void *reallocate(void *pointer, size_t size) override {
+    return heap_caps_realloc(pointer, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  }
+};
+
+PsramAllocator psramJsonAllocator;
 
 struct RouteCacheEntry {
   char callsign[9] = {};
@@ -105,7 +140,7 @@ int lastCount = 0;
 int lastMlat = 0;
 long creditsRemaining = -1;
 RouteCacheEntry routeCache[ROUTE_CACHE_SIZE];
-AircraftDisplay latestAircraft[MAX_AIRCRAFT];
+AircraftDisplay *latestAircraft = nullptr;
 enum class DisplayPage : uint8_t { Map = 0, Table = 1, Radar = 2 };
 DisplayPage displayPage = DisplayPage::Map;
 float radarSweepDegrees = 0.0f;
@@ -118,6 +153,9 @@ WebServer webServer(80);
 Preferences settingsStore;
 String managementPassword;
 String firmwareUploadError;
+bool firmwareUploadStarted = false;
+bool firmwareUploadComplete = false;
+size_t firmwareUploadBytes = 0;
 String apiProvider = "opensky";
 String openSkyClientId;
 String openSkyClientSecret;
@@ -129,6 +167,10 @@ bool restartPending = false;
 bool setupPortalPending = false;
 uint32_t restartAt = 0;
 uint32_t lastFetchCompletedAt = 0;
+uint32_t feedRequestStartedAt = 0;
+uint32_t feedRequestDurationMs = 0;
+int feedHttpCode = 0;
+String feedStatus = "Not fetched";
 float homeLatitude = DEFAULT_HOME_LAT;
 float homeLongitude = DEFAULT_HOME_LON;
 uint16_t queryRadiusNm = DEFAULT_RADIUS_NM;
@@ -140,8 +182,173 @@ bool githubInstallPending = false;
 bool githubUpdateAvailable = false;
 String githubLatestVersion;
 String githubFirmwareUrl;
+String githubSignatureUrl;
+String githubFirmwareSha256;
+size_t githubFirmwareSize = 0;
+uint8_t githubSignature[256] = {};
+size_t githubSignatureSize = 0;
 String githubUpdateStatus = "Not checked";
 uint32_t nextGithubCheckAt = 0;
+bool sdMounted = false;
+String sdStatus = "Not checked";
+String sdCardType = "None";
+uint64_t sdTotalBytes = 0;
+uint64_t sdUsedBytes = 0;
+bool stagedUpdateReady = false;
+String stagedUpdateVersion;
+String stagedUpdateSha256;
+
+String bytesToHex(const uint8_t *bytes, size_t length) {
+  static const char digits[] = "0123456789abcdef";
+  String result;
+  result.reserve(length * 2);
+  for (size_t i = 0; i < length; ++i) {
+    result += digits[bytes[i] >> 4];
+    result += digits[bytes[i] & 0x0f];
+  }
+  return result;
+}
+
+bool hexToBytes(const String &hex, uint8_t *output, size_t length) {
+  if (hex.length() != length * 2) return false;
+  for (size_t i = 0; i < length; ++i) {
+    char pair[3] = {hex[i * 2], hex[i * 2 + 1], 0};
+    char *end = nullptr;
+    const long value = strtol(pair, &end, 16);
+    if (end != pair + 2) return false;
+    output[i] = static_cast<uint8_t>(value);
+  }
+  return true;
+}
+
+bool verifyFirmwareSignature(const String &digest) {
+  if (githubSignatureSize != sizeof(githubSignature)) return false;
+  uint8_t hash[32];
+  if (!hexToBytes(digest, hash, sizeof(hash))) return false;
+  mbedtls_pk_context key;
+  mbedtls_pk_init(&key);
+  const int parsed = mbedtls_pk_parse_public_key(
+      &key, reinterpret_cast<const unsigned char *>(FIRMWARE_PUBLIC_KEY),
+      strlen(FIRMWARE_PUBLIC_KEY) + 1);
+  const int verified = parsed == 0 ? mbedtls_pk_verify(
+      &key, MBEDTLS_MD_SHA256, hash, sizeof(hash), githubSignature,
+      githubSignatureSize) : parsed;
+  mbedtls_pk_free(&key);
+  return verified == 0;
+}
+
+bool downloadFirmwareSignature() {
+  githubSignatureSize = 0;
+  if (!githubSignatureUrl.length()) return false;
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setTimeout(12000);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  if (!http.begin(client, githubSignatureUrl)) return false;
+  http.addHeader("User-Agent", "2E0LXY-ESP32-ADSB/" + String(FIRMWARE_VERSION));
+  const int code = http.GET();
+  if (code == HTTP_CODE_OK && http.getSize() == static_cast<int>(sizeof(githubSignature))) {
+    NetworkClient *stream = http.getStreamPtr();
+    githubSignatureSize = stream->readBytes(githubSignature, sizeof(githubSignature));
+  }
+  http.end();
+  return githubSignatureSize == sizeof(githubSignature);
+}
+
+const char *sdTypeName(sdcard_type_t type) {
+  switch (type) {
+    case CARD_MMC: return "MMC";
+    case CARD_SD: return "SDSC";
+    case CARD_SDHC: return "SDHC/SDXC";
+    default: return "None";
+  }
+}
+
+bool mountSdCard() {
+  SD_MMC.end();
+  sdMounted = false;
+  sdStatus = "No card detected";
+  sdCardType = "None";
+  sdTotalBytes = 0;
+  sdUsedBytes = 0;
+  stagedUpdateReady = false;
+  if (!SD_MMC.setPins(SD_CLK_PIN, SD_CMD_PIN, SD_D0_PIN) ||
+      !SD_MMC.begin("/sdcard", true, false, SDMMC_FREQ_DEFAULT, 5)) {
+    Serial.println("SD card not mounted; using PSRAM and LittleFS");
+    return false;
+  }
+  if (SD_MMC.cardType() == CARD_NONE) {
+    SD_MMC.end();
+    return false;
+  }
+  SD_MMC.mkdir("/adsb");
+  SD_MMC.mkdir(SD_UPDATE_DIR);
+  sdMounted = true;
+  sdStatus = "Ready";
+  sdCardType = sdTypeName(SD_MMC.cardType());
+  sdTotalBytes = SD_MMC.totalBytes();
+  sdUsedBytes = SD_MMC.usedBytes();
+  stagedUpdateReady = SD_MMC.exists(SD_UPDATE_FILE);
+  Serial.printf("SD card ready: %s, %.1f MB free\n", sdCardType.c_str(),
+                (sdTotalBytes - sdUsedBytes) / 1048576.0);
+  return true;
+}
+
+bool sha256File(fs::FS &filesystem, const char *path, String &digest) {
+  File file = filesystem.open(path, FILE_READ);
+  if (!file) return false;
+  mbedtls_sha256_context context;
+  mbedtls_sha256_init(&context);
+  bool ok = mbedtls_sha256_starts(&context, 0) == 0;
+  uint8_t buffer[4096];
+  while (ok && file.available()) {
+    const size_t count = file.read(buffer, sizeof(buffer));
+    if (!count) { ok = false; break; }
+    ok = mbedtls_sha256_update(&context, buffer, count) == 0;
+    delay(0);
+  }
+  uint8_t output[32];
+  if (ok) ok = mbedtls_sha256_finish(&context, output) == 0;
+  mbedtls_sha256_free(&context);
+  file.close();
+  if (ok) digest = bytesToHex(output, sizeof(output));
+  return ok;
+}
+
+void finishFeedAttempt(const char *statusText, int httpCode = 0) {
+  feedStatus = statusText;
+  feedHttpCode = httpCode;
+  feedRequestDurationMs = feedRequestStartedAt ? millis() - feedRequestStartedAt : 0;
+}
+
+bool parseStrictDouble(const String &rawValue, double &result) {
+  String value = rawValue;
+  value.trim();
+  if (!value.length()) return false;
+  char *end = nullptr;
+  result = strtod(value.c_str(), &end);
+  return end != value.c_str() && *end == '\0' && isfinite(result);
+}
+
+bool parseStrictLong(const String &rawValue, long &result) {
+  String value = rawValue;
+  value.trim();
+  if (!value.length()) return false;
+  char *end = nullptr;
+  result = strtol(value.c_str(), &end, 10);
+  return end != value.c_str() && *end == '\0';
+}
+
+bool validWifiPassword(const String &password) {
+  if (!password.length()) return true;
+  if (password.length() >= 8 && password.length() <= 63) return true;
+  if (password.length() != 64) return false;
+  for (size_t i = 0; i < password.length(); ++i) {
+    if (!isxdigit(static_cast<unsigned char>(password[i]))) return false;
+  }
+  return true;
+}
 
 void IRAM_ATTR onBootButtonFalling() {
   bootButtonPending = true;
@@ -348,11 +555,13 @@ int drawPngLine(PNGDRAW *draw) {
 }
 
 String osmTilePath(uint8_t zoom, int tileX, int tileY) {
-  return "/osm_" + String(zoom) + "_" + String(tileX) + "_" + String(tileY) + ".png";
+  return (sdMounted ? "/adsb/osm_" : "/osm_") + String(zoom) + "_" +
+         String(tileX) + "_" + String(tileY) + ".png";
 }
 
 bool cacheOsmTile(uint8_t zoom, int tileX, int tileY, const String &path) {
-  if (LittleFS.exists(path)) return true;
+  fs::FS &cache = sdMounted ? static_cast<fs::FS &>(SD_MMC) : static_cast<fs::FS &>(LittleFS);
+  if (cache.exists(path)) return true;
   if (WiFi.status() != WL_CONNECTED) return false;
   WiFiClientSecure client;
   client.setInsecure();
@@ -367,19 +576,20 @@ bool cacheOsmTile(uint8_t zoom, int tileX, int tileY, const String &path) {
     http.end();
     return false;
   }
-  File file = LittleFS.open(path, FILE_WRITE);
+  File file = cache.open(path, FILE_WRITE);
   const int written = file ? http.writeToStream(&file) : -1;
   if (file) file.close();
   http.end();
   if (written <= 0) {
-    LittleFS.remove(path);
+    cache.remove(path);
     return false;
   }
   return true;
 }
 
 bool drawCachedOsmTile(const String &path, int screenX, int screenY) {
-  File file = LittleFS.open(path, FILE_READ);
+  fs::FS &cache = sdMounted ? static_cast<fs::FS &>(SD_MMC) : static_cast<fs::FS &>(LittleFS);
+  File file = cache.open(path, FILE_READ);
   if (!file) return false;
   const size_t size = file.size();
   uint8_t *data = static_cast<uint8_t *>(heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
@@ -534,7 +744,8 @@ RouteCacheEntry *routeForCallsign(const char *rawCallsign, int &lookupsUsed) {
   for (auto &entry : routeCache) {
     if (entry.occupied && !strcmp(entry.callsign, callsign)) {
       entry.lastUsed = millis();
-      if (millis() - entry.resolvedAt < ROUTE_CACHE_MS) return &entry;
+      const uint32_t lifetime = entry.hasRoute ? ROUTE_CACHE_MS : ROUTE_RETRY_MS;
+      if (millis() - entry.resolvedAt < lifetime) return &entry;
       slot = &entry;
       break;
     }
@@ -654,7 +865,12 @@ void status(const char *label, uint16_t colour) {
   text5(240-width/2,32,label,rgb(255,255,255));
 }
 
-void present() { gfx->draw16bitRGBBitmap(0,0,framebuffer,W,H); }
+void present() {
+  gfx->draw16bitRGBBitmap(0, 0, framebuffer, W, H);
+  // Recover the RGB DMA at the next vertical blank if a bandwidth spike
+  // desynchronised its PSRAM scan position.
+  rgbpanel->restartAtNextVsync();
+}
 
 void renderBootScreen(const String &networkLine = "", uint16_t networkColour = RGB565_CYAN) {
   gfx->draw16bitRGBBitmap(0, 0, const_cast<uint16_t *>(BOOT_IMAGE), W, H);
@@ -741,8 +957,8 @@ void radarRing(int centreX, int centreY, int radius, uint16_t colour) {
 
 void renderRadarPage() {
   constexpr int centreX = W / 2;
-  constexpr int centreY = 250;
-  constexpr int outerRadius = 205;
+  constexpr int centreY = 245;
+  constexpr int outerRadius = 190;
   const uint16_t background = rgb(1, 12, 16);
   const uint16_t grid = rgb(22, 93, 84);
   const uint16_t gridBright = rgb(42, 145, 119);
@@ -838,22 +1054,30 @@ void fetchAdsbV2Aircraft() {
     url = "https://api.adsb.one/v2/point/" + latitude + "/" + longitude + "/" + radius;
   } else if (apiProvider == "adsbx") {
     if (!rapidApiKey.length()) {
+      finishFeedAttempt("API key required");
       status("KEY", rgb(245,30,35));
       present();
       return;
     }
     url = "https://adsbexchange-com1.p.rapidapi.com/v2/lat/" + latitude + "/lon/" + longitude + "/dist/" + radius + "/";
   } else {
+    finishFeedAttempt("Unknown provider");
     status("FEED", rgb(245,30,35));
     present();
     return;
   }
 
+  bool aircraftAtZeroMiles = false;
+  int responseCode = 0;
+  // Keep the large provider response scoped so its String and JSON allocations
+  // are released before the optional TLS route-enrichment requests.
+  {
   WiFiClientSecure client;
   client.setInsecure();
   HTTPClient http;
   http.setTimeout(9000);
   if (!http.begin(client, url)) {
+    finishFeedAttempt("Connection failed");
     status("API", rgb(245,30,35));
     present();
     return;
@@ -865,9 +1089,11 @@ void fetchAdsbV2Aircraft() {
     http.addHeader("X-RapidAPI-Host", "adsbexchange-com1.p.rapidapi.com");
   }
   const int code = http.GET();
+  responseCode = code;
   if (code == HTTP_CODE_TOO_MANY_REQUESTS) {
     nextFetchAt = millis() + 60000UL;
     http.end();
+    finishFeedAttempt("Rate limited", code);
     status("RATE", rgb(245,30,35));
     present();
     return;
@@ -875,17 +1101,26 @@ void fetchAdsbV2Aircraft() {
   if (code != HTTP_CODE_OK) {
     Serial.printf("%s HTTP %d\n", apiProvider.c_str(), code);
     http.end();
+    finishFeedAttempt("HTTP error", code);
     status("API", rgb(245,30,35));
     present();
     return;
   }
 
-  String payload = http.getString();
+  JsonDocument filter;
+  JsonObject aircraftFilter = filter["ac"][0].to<JsonObject>();
+  const char *fields[] = {"lat", "lon", "track", "true_heading", "mag_heading",
+                          "alt_baro", "alt_geom", "gs", "baro_rate", "geom_rate",
+                          "seen", "rssi", "messages", "flight", "hex", "r", "t",
+                          "squawk", "category", "ownOp", "cou", "emergency", "mlat"};
+  for (const char *field : fields) aircraftFilter[field] = true;
+  JsonDocument doc(&psramJsonAllocator);
+  const DeserializationError error = deserializeJson(
+      doc, http.getStream(), DeserializationOption::Filter(filter));
   http.end();
-  JsonDocument doc;
-  const DeserializationError error = deserializeJson(doc, payload);
   if (error || !doc["ac"].is<JsonArray>()) {
     Serial.printf("%s JSON %s\n", apiProvider.c_str(), error.c_str());
+    finishFeedAttempt("Invalid response", code);
     status("JSON", rgb(245,30,35));
     present();
     return;
@@ -894,7 +1129,6 @@ void fetchAdsbV2Aircraft() {
   lastCount = 0;
   lastMlat = 0;
   creditsRemaining = -1;
-  bool aircraftAtZeroMiles = false;
   for (JsonObject aircraft : doc["ac"].as<JsonArray>()) {
     if (lastCount >= MAX_AIRCRAFT || aircraft["lat"].isNull() || aircraft["lon"].isNull()) continue;
     const float latitude = aircraft["lat"].as<float>();
@@ -940,6 +1174,7 @@ void fetchAdsbV2Aircraft() {
     display.positionSource = !mlatFields.isNull() && mlatFields.size() ? 2 : 0;
     ++lastCount;
   }
+  }
   for (int i = 1; i < lastCount; ++i) {
     AircraftDisplay key = latestAircraft[i];
     int j = i - 1;
@@ -949,8 +1184,6 @@ void fetchAdsbV2Aircraft() {
     }
     latestAircraft[j + 1] = key;
   }
-  doc.clear();
-  payload = "";
   int routeLookups = 0;
   for (int i = 0; i < lastCount; ++i) {
     AircraftDisplay &display = latestAircraft[i];
@@ -959,18 +1192,28 @@ void fetchAdsbV2Aircraft() {
   }
   if (aircraftAtZeroMiles) beepAlert();
   lastFetchCompletedAt = millis();
+  finishFeedAttempt("OK", responseCode);
   renderCurrentPage();
   Serial.printf("Displayed %d aircraft (%d MLAT) from %s\n", lastCount, lastMlat, apiProvider.c_str());
 }
 
 void fetchAircraft(bool retriedAuth = false) {
-  if (WiFi.status() != WL_CONNECTED) { status("WIFI", rgb(245,150,0)); present(); return; }
+  feedRequestStartedAt = millis();
+  feedStatus = "Fetching";
+  feedHttpCode = 0;
+  if (WiFi.status() != WL_CONNECTED) {
+    finishFeedAttempt("Wi-Fi unavailable");
+    status("WIFI", rgb(245,150,0)); present(); return;
+  }
   if (apiProvider != "opensky") {
     fetchAdsbV2Aircraft();
     return;
   }
   const bool useOpenSkyAuthentication = openSkyClientId.length() && openSkyClientSecret.length();
-  if (useOpenSkyAuthentication && !ensureAccessToken()) { status("AUTH", rgb(245,30,35)); present(); return; }
+  if (useOpenSkyAuthentication && !ensureAccessToken()) {
+    finishFeedAttempt("Authentication failed");
+    status("AUTH", rgb(245,30,35)); present(); return;
+  }
   bool aircraftAtZeroMiles = false;
   // Release the large OpenSky response and JSON allocation before starting
   // the optional per-callsign HTTPS route lookups.
@@ -984,7 +1227,10 @@ void fetchAircraft(bool retriedAuth = false) {
       String(max(-180.0f, homeLongitude - lonDelta), 5) + "&lamax=" +
       String(min(85.0f, homeLatitude + latDelta), 5) + "&lomax=" +
       String(min(180.0f, homeLongitude + lonDelta), 5);
-  if (!http.begin(client, statesUrl)) { status("API", rgb(245,30,35)); present(); return; }
+  if (!http.begin(client, statesUrl)) {
+    finishFeedAttempt("Connection failed");
+    status("API", rgb(245,30,35)); present(); return;
+  }
   const char *trackedHeaders[] = {"X-Rate-Limit-Remaining", "X-Rate-Limit-Retry-After-Seconds"};
   http.collectHeaders(trackedHeaders, 2);
   if (useOpenSkyAuthentication) http.addHeader("Authorization", "Bearer " + bearerToken);
@@ -994,7 +1240,7 @@ void fetchAircraft(bool retriedAuth = false) {
   if (useOpenSkyAuthentication && code == HTTP_CODE_UNAUTHORIZED && !retriedAuth) {
     http.end(); bearerToken = "";
     if (requestAccessToken()) fetchAircraft(true);
-    else { status("AUTH", rgb(245,30,35)); present(); }
+    else { finishFeedAttempt("Authentication failed", code); status("AUTH", rgb(245,30,35)); present(); }
     return;
   }
   if (code == HTTP_CODE_TOO_MANY_REQUESTS) {
@@ -1002,16 +1248,21 @@ void fetchAircraft(bool retriedAuth = false) {
     if (retrySeconds < 60) retrySeconds = 3600;
     nextFetchAt = millis() + static_cast<uint32_t>(retrySeconds) * 1000UL;
     Serial.printf("OpenSky rate limit; retry in %ld seconds\n", retrySeconds);
-    http.end(); status("RATE",rgb(245,30,35)); present(); return;
+    http.end(); finishFeedAttempt("Rate limited", code); status("RATE",rgb(245,30,35)); present(); return;
   }
-  if (code != HTTP_CODE_OK) { Serial.printf("OpenSky HTTP %d\n",code); http.end(); status("API",rgb(245,30,35)); present(); return; }
+  if (code != HTTP_CODE_OK) {
+    Serial.printf("OpenSky HTTP %d\n",code); http.end();
+    finishFeedAttempt("HTTP error", code); status("API",rgb(245,30,35)); present(); return;
+  }
   String remainingHeader = http.header("X-Rate-Limit-Remaining");
   if (remainingHeader.length()) creditsRemaining = remainingHeader.toInt();
-  String payload = http.getString();
+  JsonDocument doc(&psramJsonAllocator);
+  DeserializationError error=deserializeJson(doc,http.getStream());
   http.end();
-  JsonDocument doc;
-  DeserializationError error=deserializeJson(doc,payload);
-  if (error) { Serial.printf("JSON %s\n",error.c_str()); status("JSON",rgb(245,30,35)); present(); return; }
+  if (error) {
+    Serial.printf("JSON %s\n",error.c_str()); finishFeedAttempt("Invalid response", code);
+    status("JSON",rgb(245,30,35)); present(); return;
+  }
   lastCount=0; lastMlat=0;
   for (JsonVariant item : doc["states"].as<JsonArray>()) {
     JsonArray state = item.as<JsonArray>();
@@ -1063,7 +1314,6 @@ void fetchAircraft(bool retriedAuth = false) {
     latestAircraft[j+1] = key;
   }
   doc.clear();
-  payload = "";
   }
   int routeLookups = 0;
   for (int i=0; i<lastCount; ++i) {
@@ -1076,6 +1326,7 @@ void fetchAircraft(bool retriedAuth = false) {
   }
   if (aircraftAtZeroMiles) beepAlert();
   lastFetchCompletedAt = millis();
+  finishFeedAttempt("OK", HTTP_CODE_OK);
   renderCurrentPage();
   Serial.printf("Displayed %d aircraft (%d MLAT), OpenSky credits remaining: %ld\n",lastCount,lastMlat,creditsRemaining);
 }
@@ -1101,6 +1352,9 @@ bool checkGithubUpdate() {
   githubUpdateStatus = "Checking GitHub";
   githubUpdateAvailable = false;
   githubFirmwareUrl = "";
+  githubSignatureUrl = "";
+  githubFirmwareSha256 = "";
+  githubFirmwareSize = 0;
   if (WiFi.status() != WL_CONNECTED) {
     githubUpdateStatus = "Wi-Fi unavailable";
     return false;
@@ -1134,9 +1388,14 @@ bool checkGithubUpdate() {
   for (JsonObject asset : doc["assets"].as<JsonArray>()) {
     String name = asset["name"] | "";
     name.toLowerCase();
-    if (name.endsWith(".bin") && (name.indexOf("firmware") >= 0 || name.indexOf("adsb-map") >= 0)) {
+    if (name.endsWith(".bin.sig") && name.indexOf("firmware") >= 0) {
+      githubSignatureUrl = asset["browser_download_url"] | "";
+    } else if (name.endsWith(".bin") && (name.indexOf("firmware") >= 0 || name.indexOf("adsb-map") >= 0)) {
       githubFirmwareUrl = asset["browser_download_url"] | "";
-      break;
+      githubFirmwareSize = asset["size"] | 0U;
+      githubFirmwareSha256 = asset["digest"] | "";
+      if (githubFirmwareSha256.startsWith("sha256:")) githubFirmwareSha256.remove(0, 7);
+      githubFirmwareSha256.toLowerCase();
     }
   }
   if (!githubLatestVersion.length()) {
@@ -1151,9 +1410,134 @@ bool checkGithubUpdate() {
     githubUpdateStatus = "Release has no firmware binary";
     return false;
   }
+  if (githubFirmwareSize < 1024 || githubFirmwareSha256.length() != 64 ||
+      !githubSignatureUrl.length()) {
+    githubUpdateStatus = "Release integrity metadata is missing";
+    return false;
+  }
   githubUpdateAvailable = true;
   githubUpdateStatus = "Version " + githubLatestVersion + " available";
   Serial.printf("GitHub firmware update available: %s\n", githubLatestVersion.c_str());
+  return true;
+}
+
+bool downloadGithubUpdateToSd() {
+  if (!sdMounted) return false;
+  SD_MMC.remove(SD_UPDATE_PART);
+  File file = SD_MMC.open(SD_UPDATE_PART, FILE_WRITE);
+  if (!file) {
+    githubUpdateStatus = "Unable to create SD staging file";
+    return false;
+  }
+  githubUpdateStatus = "Downloading " + githubLatestVersion + " to SD";
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setTimeout(15000);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  if (!http.begin(client, githubFirmwareUrl)) {
+    file.close();
+    SD_MMC.remove(SD_UPDATE_PART);
+    githubUpdateStatus = "Firmware download failed";
+    return false;
+  }
+  http.addHeader("User-Agent", "2E0LXY-ESP32-ADSB/" + String(FIRMWARE_VERSION));
+  const int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    http.end();
+    file.close();
+    SD_MMC.remove(SD_UPDATE_PART);
+    githubUpdateStatus = "Firmware HTTP " + String(code);
+    return false;
+  }
+  NetworkClient *stream = http.getStreamPtr();
+  uint8_t buffer[4096];
+  size_t total = 0;
+  uint32_t lastDataAt = millis();
+  bool validHeader = false;
+  mbedtls_sha256_context context;
+  mbedtls_sha256_init(&context);
+  bool hashOk = mbedtls_sha256_starts(&context, 0) == 0;
+  while (hashOk && (http.connected() || stream->available()) && total < githubFirmwareSize) {
+    const size_t available = stream->available();
+    if (!available) {
+      if (millis() - lastDataAt > 15000) break;
+      delay(2);
+      continue;
+    }
+    const size_t count = stream->readBytes(buffer, min(available, sizeof(buffer)));
+    if (!count) continue;
+    if (!total) validHeader = buffer[0] == 0xE9;
+    if (!validHeader || file.write(buffer, count) != count ||
+        mbedtls_sha256_update(&context, buffer, count) != 0) break;
+    total += count;
+    lastDataAt = millis();
+    delay(0);
+  }
+  uint8_t hash[32];
+  hashOk = hashOk && mbedtls_sha256_finish(&context, hash) == 0;
+  mbedtls_sha256_free(&context);
+  http.end();
+  file.flush();
+  file.close();
+  const String actualDigest = hashOk ? bytesToHex(hash, sizeof(hash)) : "";
+  if (!validHeader || total != githubFirmwareSize || actualDigest != githubFirmwareSha256 ||
+      !verifyFirmwareSignature(actualDigest)) {
+    SD_MMC.remove(SD_UPDATE_PART);
+    githubUpdateStatus = !validHeader ? "Downloaded file is not ESP32 firmware" :
+                         total != githubFirmwareSize ? "Firmware download was incomplete" :
+                         actualDigest != githubFirmwareSha256 ? "Firmware SHA-256 check failed" :
+                         "Firmware release signature check failed";
+    return false;
+  }
+  SD_MMC.remove(SD_UPDATE_FILE);
+  if (!SD_MMC.rename(SD_UPDATE_PART, SD_UPDATE_FILE)) {
+    SD_MMC.remove(SD_UPDATE_PART);
+    githubUpdateStatus = "Unable to finalise SD staging file";
+    return false;
+  }
+  stagedUpdateReady = true;
+  stagedUpdateVersion = githubLatestVersion;
+  stagedUpdateSha256 = actualDigest;
+  sdUsedBytes = SD_MMC.usedBytes();
+  githubUpdateStatus = "Version " + githubLatestVersion + " verified on SD";
+  return true;
+}
+
+bool installStagedUpdate() {
+  if (!sdMounted || !stagedUpdateReady) return false;
+  File file = SD_MMC.open(SD_UPDATE_FILE, FILE_READ);
+  if (!file || file.size() != githubFirmwareSize || file.read() != 0xE9 || !file.seek(0)) {
+    if (file) file.close();
+    stagedUpdateReady = false;
+    githubUpdateStatus = "Staged firmware is invalid";
+    return false;
+  }
+  file.close();
+  String digest;
+  if (!sha256File(SD_MMC, SD_UPDATE_FILE, digest) || digest != githubFirmwareSha256 ||
+      !verifyFirmwareSignature(digest)) {
+    stagedUpdateReady = false;
+    githubUpdateStatus = "Staged firmware SHA-256 check failed";
+    return false;
+  }
+  file = SD_MMC.open(SD_UPDATE_FILE, FILE_READ);
+  if (!file || !Update.begin(githubFirmwareSize, U_FLASH)) {
+    if (file) file.close();
+    githubUpdateStatus = Update.errorString();
+    return false;
+  }
+  githubUpdateStatus = "Installing verified SD update";
+  const size_t written = Update.writeStream(file);
+  file.close();
+  if (written != githubFirmwareSize || !Update.end(false)) {
+    githubUpdateStatus = written != githubFirmwareSize ? "SD firmware write was incomplete" : Update.errorString();
+    Update.abort();
+    return false;
+  }
+  githubUpdateStatus = "Update installed; rebooting";
+  delay(300);
+  ESP.restart();
   return true;
 }
 
@@ -1161,6 +1545,15 @@ bool installGithubUpdate() {
   if (!githubUpdateAvailable || !githubFirmwareUrl.length()) {
     githubUpdateStatus = "No update is ready";
     return false;
+  }
+  githubUpdateStatus = "Verifying release signature";
+  if (!downloadFirmwareSignature()) {
+    githubUpdateStatus = "Firmware release signature is unavailable";
+    return false;
+  }
+  if (sdMounted) {
+    if (!downloadGithubUpdateToSd()) return false;
+    return installStagedUpdate();
   }
   githubUpdateStatus = "Downloading " + githubLatestVersion;
   WiFiClientSecure client;
@@ -1190,7 +1583,11 @@ bool installGithubUpdate() {
   size_t total = 0;
   uint32_t lastDataAt = millis();
   bool validHeader = false;
-  while (http.connected() && (expected < 0 || total < static_cast<size_t>(expected))) {
+  mbedtls_sha256_context context;
+  mbedtls_sha256_init(&context);
+  bool hashOk = mbedtls_sha256_starts(&context, 0) == 0;
+  while ((http.connected() || stream->available()) &&
+         (expected < 0 || total < static_cast<size_t>(expected)) && hashOk) {
     const size_t available = stream->available();
     if (available) {
       const size_t count = stream->readBytes(buffer, min(available, sizeof(buffer)));
@@ -1198,6 +1595,10 @@ bool installGithubUpdate() {
       if (total == 0) {
         validHeader = buffer[0] == 0xE9;
         if (!validHeader) break;
+      }
+      if (mbedtls_sha256_update(&context, buffer, count) != 0) {
+        hashOk = false;
+        break;
       }
       if (Update.write(buffer, count) != count) break;
       total += count;
@@ -1207,10 +1608,28 @@ bool installGithubUpdate() {
       delay(2);
     }
   }
+  uint8_t hash[32];
+  hashOk = hashOk && mbedtls_sha256_finish(&context, hash) == 0;
+  mbedtls_sha256_free(&context);
   http.end();
-  if (!validHeader || (expected > 0 && total != static_cast<size_t>(expected)) || !Update.end(true)) {
-    if (!Update.hasError()) Update.abort();
-    githubUpdateStatus = validHeader ? String(Update.errorString()) : "Downloaded file is not ESP32 firmware";
+  const String actualDigest = hashOk ? bytesToHex(hash, sizeof(hash)) : "";
+  String installError;
+  if (!validHeader) {
+    installError = "Downloaded file is not ESP32 firmware";
+  } else if (expected > 0 && total != static_cast<size_t>(expected)) {
+    installError = "Firmware download was incomplete";
+  } else if (githubFirmwareSize && total != githubFirmwareSize) {
+    installError = "Firmware size does not match release metadata";
+  } else if (!hashOk || actualDigest != githubFirmwareSha256) {
+    installError = "Firmware SHA-256 check failed";
+  } else if (!verifyFirmwareSignature(actualDigest)) {
+    installError = "Firmware release signature check failed";
+  } else if (!Update.end(false)) {
+    installError = Update.errorString();
+  }
+  if (installError.length()) {
+    Update.abort();
+    githubUpdateStatus = installError;
     return false;
   }
   githubUpdateStatus = "Update installed; rebooting";
@@ -1222,6 +1641,24 @@ bool installGithubUpdate() {
 void sendJson(int statusCode, const String &payload) {
   webServer.sendHeader("Cache-Control", "no-store");
   webServer.send(statusCode, "application/json", payload);
+}
+
+void sendJsonDocument(int statusCode, const JsonDocument &doc) {
+  const size_t length = measureJson(doc);
+  char *payload = static_cast<char *>(
+      heap_caps_malloc(length + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (!payload) {
+    String fallback;
+    serializeJson(doc, fallback);
+    sendJson(statusCode, fallback);
+    return;
+  }
+  serializeJson(doc, payload, length + 1);
+  webServer.sendHeader("Cache-Control", "no-store");
+  webServer.setContentLength(length);
+  webServer.send(statusCode, "application/json", "");
+  webServer.client().write(reinterpret_cast<const uint8_t *>(payload), length);
+  heap_caps_free(payload);
 }
 
 bool requireWebAuthentication() {
@@ -1247,6 +1684,9 @@ void handleStatusApi() {
   doc["credits"] = creditsRemaining;
   doc["lastRefreshSeconds"] = lastFetchCompletedAt ?
       static_cast<int32_t>((millis() - lastFetchCompletedAt) / 1000UL) : -1;
+  doc["feedStatus"] = feedStatus;
+  doc["feedHttpCode"] = feedHttpCode;
+  doc["feedDurationMs"] = feedRequestDurationMs;
   doc["rssi"] = WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0;
   doc["uptimeSeconds"] = millis() / 1000UL;
   doc["ssid"] = WiFi.status() == WL_CONNECTED ? WiFi.SSID() : "";
@@ -1259,6 +1699,25 @@ void handleStatusApi() {
   doc["version"] = FIRMWARE_VERSION;
   doc["build"] = String(__DATE__) + " " + __TIME__;
   doc["updateSpace"] = ESP.getFreeSketchSpace();
+  doc["heapFree"] = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  doc["heapMinimum"] = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  doc["heapLargest"] = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  doc["loopStackMinimumFree"] = uxTaskGetStackHighWaterMark(nullptr);
+  doc["psramFree"] = ESP.getFreePsram();
+  doc["psramMinimum"] = ESP.getMinFreePsram();
+  doc["psramLargest"] = ESP.getMaxAllocPsram();
+  doc["temperatureC"] = temperatureRead();
+  doc["aircraftCapacity"] = MAX_AIRCRAFT;
+  doc["aircraftStorage"] = "PSRAM";
+  doc["sdMounted"] = sdMounted;
+  doc["sdStatus"] = sdStatus;
+  doc["sdType"] = sdCardType;
+  doc["sdTotalBytes"] = sdTotalBytes;
+  doc["sdUsedBytes"] = sdUsedBytes;
+  doc["sdFreeBytes"] = sdTotalBytes >= sdUsedBytes ? sdTotalBytes - sdUsedBytes : 0;
+  doc["tileCacheStorage"] = sdMounted ? "SD card" : "LittleFS";
+  doc["stagedUpdateReady"] = stagedUpdateReady;
+  doc["stagedUpdateVersion"] = stagedUpdateVersion;
   doc["brightness"] = brightnessPercent;
   doc["sound"] = soundAlerts;
   doc["page"] = displayPageName();
@@ -1270,14 +1729,12 @@ void handleStatusApi() {
   doc["latestVersion"] = githubLatestVersion;
   doc["updateStatus"] = githubUpdateStatus;
   doc["releaseRepository"] = String(GITHUB_OWNER) + "/" + GITHUB_REPOSITORY;
-  String payload;
-  serializeJson(doc, payload);
-  sendJson(200, payload);
+  sendJsonDocument(200, doc);
 }
 
 void handleAircraftApi() {
   if (!requireWebAuthentication()) return;
-  JsonDocument doc;
+  JsonDocument doc(&psramJsonAllocator);
   JsonArray aircraft = doc["aircraft"].to<JsonArray>();
   for (int i = 0; i < lastCount; ++i) {
     const AircraftDisplay &display = latestAircraft[i];
@@ -1309,9 +1766,7 @@ void handleAircraftApi() {
     if (route && route->hasRoute) item["route"] = String(route->origin) + ">" + route->destination;
     else item["route"] = "";
   }
-  String payload;
-  serializeJson(doc, payload);
-  sendJson(200, payload);
+  sendJsonDocument(200, doc);
 }
 
 void handleWifiScanStart() {
@@ -1335,15 +1790,32 @@ void handleWifiScanResults() {
   JsonDocument doc;
   if (count == WIFI_SCAN_RUNNING) {
     doc["complete"] = false;
+  } else if (count == WIFI_SCAN_FAILED) {
+    WiFi.scanDelete();
+    sendMessage(500, "Wi-Fi scan failed");
+    return;
   } else {
     doc["complete"] = true;
     JsonArray networks = doc["networks"].to<JsonArray>();
     if (count > 0) {
       for (int i = 0; i < count; ++i) {
-        JsonObject network = networks.add<JsonObject>();
-        network["ssid"] = WiFi.SSID(i);
-        network["rssi"] = WiFi.RSSI(i);
-        network["secure"] = WiFi.encryptionType(i) != WIFI_AUTH_OPEN;
+        const String ssid = WiFi.SSID(i);
+        JsonObject network;
+        for (JsonObject existing : networks) {
+          if (existing["ssid"].as<String>() == ssid) {
+            network = existing;
+            break;
+          }
+        }
+        if (network.isNull()) {
+          network = networks.add<JsonObject>();
+          network["ssid"] = ssid;
+          network["rssi"] = WiFi.RSSI(i);
+          network["secure"] = WiFi.encryptionType(i) != WIFI_AUTH_OPEN;
+        } else if (WiFi.RSSI(i) > network["rssi"].as<int>()) {
+          network["rssi"] = WiFi.RSSI(i);
+          network["secure"] = WiFi.encryptionType(i) != WIFI_AUTH_OPEN;
+        }
       }
     }
     WiFi.scanDelete();
@@ -1357,8 +1829,8 @@ void handleWifiConnect() {
   if (!requireWebAuthentication()) return;
   const String ssid = webServer.arg("ssid");
   const String password = webServer.arg("password");
-  if (!ssid.length() || ssid.length() > 32 || password.length() > 63) {
-    sendMessage(400, "Invalid Wi-Fi network name or password");
+  if (!ssid.length() || ssid.length() > 32 || !validWifiPassword(password)) {
+    sendMessage(400, "Use an SSID of 1 to 32 bytes and an empty, 8 to 63 character, or 64-digit hexadecimal password");
     return;
   }
   sendMessage(202, "Wi-Fi connection started; reconnect to the device at its new address");
@@ -1389,7 +1861,12 @@ void handleDisplaySettings() {
     settingsStore.putBool("sound", soundAlerts);
   }
   if (webServer.hasArg("brightness")) {
-    brightnessPercent = constrain(webServer.arg("brightness").toInt(), 10, 100);
+    long brightness = 0;
+    if (!parseStrictLong(webServer.arg("brightness"), brightness) || brightness < 10 || brightness > 100) {
+      sendMessage(400, "Brightness must be a whole number from 10 to 100");
+      return;
+    }
+    brightnessPercent = static_cast<uint8_t>(brightness);
     settingsStore.putUChar("brightness", brightnessPercent);
     WS_CH32_IO::setPwm(Wire, brightnessPercent);
   }
@@ -1403,20 +1880,26 @@ void handleLocationSettings() {
     sendMessage(400, "Latitude, longitude and radius are required");
     return;
   }
-  const double latitude = webServer.arg("latitude").toDouble();
-  const double longitude = webServer.arg("longitude").toDouble();
-  const int radius = webServer.arg("radius").toInt();
-  if (!isfinite(latitude) || latitude < -85.0 || latitude > 85.0 ||
-      !isfinite(longitude) || longitude < -180.0 || longitude > 180.0 ||
-      radius < 5 || radius > 250) {
-    sendMessage(400, "Use latitude -85 to 85, longitude -180 to 180, and radius 5 to 250 nm");
+  double latitude = 0;
+  double longitude = 0;
+  long radius = 0;
+  long requestedZoom = 0;
+  const bool hasRequestedZoom = webServer.hasArg("zoom");
+  if (!parseStrictDouble(webServer.arg("latitude"), latitude) ||
+      !parseStrictDouble(webServer.arg("longitude"), longitude) ||
+      !parseStrictLong(webServer.arg("radius"), radius) ||
+      (hasRequestedZoom && !parseStrictLong(webServer.arg("zoom"), requestedZoom)) ||
+      latitude < -85.0 || latitude > 85.0 ||
+      longitude < -180.0 || longitude > 180.0 ||
+      radius < 5 || radius > 250 ||
+      (hasRequestedZoom && (requestedZoom < 3 || requestedZoom > 16))) {
+    sendMessage(400, "Use latitude -85 to 85, longitude -180 to 180, radius 5 to 250 nm, and zoom 3 to 16");
     return;
   }
   homeLatitude = latitude;
   homeLongitude = longitude;
-  queryRadiusNm = radius;
-  const int requestedZoom = webServer.hasArg("zoom") ? webServer.arg("zoom").toInt() : zoomForRadius();
-  physicalMapZoom = constrain(requestedZoom, 3, 16);
+  queryRadiusNm = static_cast<uint16_t>(radius);
+  physicalMapZoom = hasRequestedZoom ? static_cast<uint8_t>(requestedZoom) : zoomForRadius();
   settingsStore.putFloat("home-lat", homeLatitude);
   settingsStore.putFloat("home-lon", homeLongitude);
   settingsStore.putUShort("radius-nm", queryRadiusNm);
@@ -1443,6 +1926,19 @@ void handleGithubUpdateInstall() {
   sendMessage(202, "GitHub firmware download and installation started");
 }
 
+void handleSdRescan() {
+  if (!requireWebAuthentication()) return;
+  if (githubInstallPending || Update.isRunning()) {
+    sendMessage(409, "SD card cannot be rescanned during a firmware update");
+    return;
+  }
+  const bool mounted = mountSdCard();
+  physicalMapReady = false;
+  physicalMapRefreshPending = true;
+  sendMessage(200, mounted ? "SD card mounted; map cache moved to SD" :
+                           "No readable SD card detected; LittleFS remains active");
+}
+
 void handlePasswordChange() {
   if (!requireWebAuthentication()) return;
   const String password = webServer.arg("password");
@@ -1462,6 +1958,12 @@ void handleProviderSettings() {
       provider != "airplaneslive" && provider != "adsblol" &&
       provider != "adsbone" && provider != "adsbx") {
     sendMessage(400, "Unknown aircraft data provider");
+    return;
+  }
+  if (webServer.arg("clientId").length() > 128 ||
+      webServer.arg("clientSecret").length() > 256 ||
+      webServer.arg("rapidApiKey").length() > 256) {
+    sendMessage(400, "API credential fields are too long");
     return;
   }
   if (webServer.arg("clear") == "1") {
@@ -1494,10 +1996,25 @@ void handleProviderSettings() {
 }
 
 void handleFirmwareUpload() {
-  HTTPUpload &upload = webServer.upload();
   if (!webServer.authenticate(WEB_USERNAME, managementPassword.c_str())) return;
+  const String contentType = webServer.header("Content-Type");
+  if (webServer.arg("upload") != "1" || !contentType.startsWith("multipart/")) {
+    firmwareUploadError = "Firmware uploads require a multipart file request";
+    firmwareUploadStarted = false;
+    firmwareUploadComplete = false;
+    firmwareUploadBytes = 0;
+    return;
+  }
+  HTTPUpload &upload = webServer.upload();
   if (upload.status == UPLOAD_FILE_START) {
     firmwareUploadError = "";
+    firmwareUploadStarted = true;
+    firmwareUploadComplete = false;
+    firmwareUploadBytes = 0;
+    if (webServer.arg("upload") != "1") {
+      firmwareUploadError = "Firmware upload request is missing its upload marker";
+      return;
+    }
     String filename = upload.filename;
     filename.toLowerCase();
     if (!filename.endsWith(".bin")) {
@@ -1509,26 +2026,46 @@ void handleFirmwareUpload() {
     }
   } else if (upload.status == UPLOAD_FILE_WRITE) {
     if (firmwareUploadError.length()) return;
-    if (Update.progress() == 0 && (upload.currentSize == 0 || upload.buf[0] != 0xE9)) {
-      firmwareUploadError = "Selected file is not an ESP32 application image";
+    if (firmwareUploadBytes == 0 && upload.currentSize > 0 && upload.buf[0] != 0xE9) {
       Update.abort();
+      firmwareUploadError = "Selected file is not an ESP32 application image";
       return;
     }
     if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
       firmwareUploadError = Update.errorString();
+      Update.abort();
+    } else {
+      firmwareUploadBytes += upload.currentSize;
     }
   } else if (upload.status == UPLOAD_FILE_END) {
     if (!firmwareUploadError.length() && !Update.end(true)) {
       firmwareUploadError = Update.errorString();
     }
+    firmwareUploadComplete = firmwareUploadBytes >= 1024 &&
+                             !firmwareUploadError.length() && !Update.hasError();
   } else if (upload.status == UPLOAD_FILE_ABORTED) {
     Update.abort();
     firmwareUploadError = "Firmware upload was cancelled";
+    firmwareUploadComplete = false;
+    firmwareUploadBytes = 0;
   }
 }
 
 void handleFirmwareResult() {
   if (!requireWebAuthentication()) return;
+  if (webServer.arg("upload") != "1" || !firmwareUploadStarted ||
+      !firmwareUploadComplete || firmwareUploadBytes < 1024) {
+    const String error = firmwareUploadError.length() ? firmwareUploadError : "No complete firmware image was uploaded";
+    JsonDocument doc;
+    doc["message"] = error;
+    String payload;
+    serializeJson(doc, payload);
+    sendJson(400, payload);
+    firmwareUploadStarted = false;
+    firmwareUploadComplete = false;
+    firmwareUploadBytes = 0;
+    return;
+  }
   if (firmwareUploadError.length() || Update.hasError()) {
     const String error = firmwareUploadError.length() ? firmwareUploadError : Update.errorString();
     JsonDocument doc;
@@ -1536,9 +2073,15 @@ void handleFirmwareResult() {
     String payload;
     serializeJson(doc, payload);
     sendJson(400, payload);
+    firmwareUploadStarted = false;
+    firmwareUploadComplete = false;
+    firmwareUploadBytes = 0;
     return;
   }
   sendMessage(200, "Firmware validated; device is rebooting");
+  firmwareUploadStarted = false;
+  firmwareUploadComplete = false;
+  firmwareUploadBytes = 0;
   restartPending = true;
   restartAt = millis() + 1500;
 }
@@ -1557,6 +2100,7 @@ void beginWebControl() {
     webServer.on("/api/location", HTTP_POST, handleLocationSettings);
     webServer.on("/api/update/check", HTTP_POST, handleGithubUpdateCheck);
     webServer.on("/api/update/github", HTTP_POST, handleGithubUpdateInstall);
+    webServer.on("/api/sd/rescan", HTTP_POST, handleSdRescan);
     webServer.on("/api/refresh", HTTP_POST, []() {
       if (!requireWebAuthentication()) return;
       nextFetchAt = 0;
@@ -1583,6 +2127,8 @@ void beginWebControl() {
       if (!requireWebAuthentication()) return;
       sendMessage(404, "Not found");
     });
+    const char *trackedRequestHeaders[] = {"Content-Type"};
+    webServer.collectHeaders(trackedRequestHeaders, 1);
     webServerReady = true;
   }
   webServer.begin();
@@ -1650,7 +2196,13 @@ void setup() {
   delay(2800);
   framebuffer=(uint16_t*)heap_caps_malloc(W*H*sizeof(uint16_t),MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
   baseMap=(uint16_t*)heap_caps_malloc(W*H*sizeof(uint16_t),MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
-  if (!framebuffer || !baseMap) { Serial.println("PSRAM map buffers unavailable"); while(true) delay(1000); }
+  latestAircraft = static_cast<AircraftDisplay *>(heap_caps_calloc(
+      MAX_AIRCRAFT, sizeof(AircraftDisplay), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (!framebuffer || !baseMap || !latestAircraft) {
+    Serial.println("PSRAM display/aircraft buffers unavailable");
+    while(true) delay(1000);
+  }
+  mountSdCard();
   restoreMap(); status("SETUP",rgb(245,150,0)); present();
   WiFi.setHostname(DEVICE_HOSTNAME);
   WiFi.mode(WIFI_STA);
@@ -1675,7 +2227,7 @@ void setup() {
     present();
   }
   beginWebControl();
-  Serial.printf("Web login: %s / %s\n", WEB_USERNAME, managementPassword.c_str());
+  Serial.printf("Web login username: %s\n", WEB_USERNAME);
   fetchAircraft();
   nextFetchAt=millis()+REFRESH_MS;
   nextGithubCheckAt=millis()+15000UL;
@@ -1730,10 +2282,12 @@ void loop() {
     Serial.printf("Page: %s\n", displayPageName());
   }
   if (displayPage == DisplayPage::Radar && static_cast<int32_t>(millis() - nextRadarFrameAt) >= 0) {
-    radarSweepDegrees += 6.0f;
+    // Full-screen PSRAM copies faster than this can starve the RGB DMA and
+    // momentarily wrap the bottom scan lines to the top of the panel.
+    radarSweepDegrees += 18.0f;
     if (radarSweepDegrees >= 360.0f) radarSweepDegrees -= 360.0f;
     renderRadarPage();
-    nextRadarFrameAt = millis() + 160;
+    nextRadarFrameAt = millis() + 750;
   }
   if (static_cast<int32_t>(millis()-nextFetchAt) >= 0) {
     fetchAircraft();

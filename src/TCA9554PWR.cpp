@@ -63,7 +63,7 @@ void Set_EXIO(uint8_t Pin,uint8_t State)                  // Sets the level stat
     uint8_t bitsStatus = Read_EXIOS(TCA9554_OUTPUT_REG);
     if(State == 1)                                     
       Data = (0x01 << (Pin-1)) | bitsStatus; 
-    else if(State == 0)                  
+    else
       Data = (~(0x01 << (Pin-1))) & bitsStatus;      
     uint8_t result = I2C_Write_EXIO(TCA9554_OUTPUT_REG,Data);  
     if (result != 0) {                         

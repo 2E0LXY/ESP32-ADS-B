@@ -7,7 +7,31 @@
 
 Firmware for the **Waveshare ESP32-S3 Touch-LCD-4 Rev 4.0, 480 × 480, non-touch panel**. It retrieves nearby ADS-B and MLAT aircraft, plots them on an OpenStreetMap base map on the LCD, and provides a password-protected web administration interface on the local network.
 
-Current firmware: **v2.4.0**
+Current firmware: **v2.5.0**
+
+### v2.5.0 SD storage and safer updates
+
+- Detects the optional microSD card at boot and from a new Firmware-page rescan control
+- Moves the physical OpenStreetMap tile cache to SD when a card is available, with automatic LittleFS fallback
+- Holds up to 250 live aircraft records in PSRAM while reducing reserved internal RAM
+- Parses provider responses directly from the network with field filtering instead of retaining a second full response copy
+- Builds large aircraft web responses in PSRAM to prevent the earlier Map/Table/reboot memory peak
+- Stages GitHub firmware on SD and verifies its ESP32 header, exact size, SHA-256 and RSA release signature before OTA installation
+- Applies the same release integrity and signature checks to direct OTA when no SD card is fitted
+- Reports card type, capacity, cache location, aircraft capacity and staged-update state in the admin interface
+- Prevents Radar screen wrap and white DMA flecks by recovering RGB DMA on vertical blank and reducing full-frame redraw pressure
+
+### v2.4.1 reliability fixes
+
+- Rejects empty, malformed, undersized, and non-ESP32 firmware uploads without rebooting
+- Handles Arduino-ESP32 raw POST callbacks safely before accessing multipart upload state
+- Releases large aircraft-response buffers before route lookups to prevent TLS allocation failures
+- Retries unsuccessful route lookups after five minutes instead of caching failures for six hours
+- Validates numeric settings and credential lengths on both the browser and ESP32
+- Reports live feed result, HTTP status, and request duration in **Data API**
+- Deduplicates Wi-Fi scan results and fixes phone-width overflow on the Wi-Fi page
+- Checks that release tags, firmware, README, installer, and manifest versions agree before publishing
+- Removes the management password from serial output
 
 ## Quick start
 
@@ -22,7 +46,8 @@ Current firmware: **v2.4.0**
 ## Main features
 
 - Live aircraft map on the 480 × 480 display and in the browser
-- OpenStreetMap tiles cached in LittleFS for the physical display
+- OpenStreetMap tiles cached on microSD when fitted, with automatic LittleFS fallback
+- Up to 250 live aircraft records held in PSRAM without consuming the card's write life
 - ADS-B and MLAT aircraft shown with distinct colours and heading markers
 - Receiver latitude, longitude, and radius configurable from the web interface
 - Receiver changes applied to the browser map, LCD map, API query area, and distance calculations
@@ -105,7 +130,7 @@ Select an aircraft provider and replace or clear the credentials required by tha
 
 ### Firmware
 
-Install a local `.bin` image, check GitHub for a new release, or install the latest release directly. The green update button pulses when a newer semantic version is available. Recovery shortcuts open the online USB installer and the current GitHub release.
+Install a local `.bin` image, check GitHub for a new release, or install the latest release directly. The green update button pulses when a newer semantic version is available. With microSD present the download is staged there; otherwise direct OTA is used. Both routes require the published size, SHA-256 digest, RSA signature and ESP32 image header to validate before installation. The page reports card state and has a manual rescan control.
 
 ![Firmware page](docs/screenshots/firmware.png)
 
@@ -130,15 +155,18 @@ The ESP32 stores credentials in Preferences/NVS. Existing secrets are never retu
 
 ## GitHub OTA updates
 
-The firmware checks the latest release from `2E0LXY/ESP32-ADS-B` at startup and every six hours. If a newer version exists, the footer button flashes green. Pressing it downloads the release asset containing `firmware` or `adsb-map`, validates the ESP32 image header, writes it through the Arduino Update API, and reboots only after a successful write.
+The firmware checks the latest release from `2E0LXY/ESP32-ADS-B` at startup and every six hours. If a newer version exists, the footer button flashes green. Pressing it downloads the release firmware and detached signature. The ESP32 validates the exact asset size, SHA-256 digest, RSA signature and image header before writing the inactive OTA slot, and reboots only after a successful complete write. With microSD fitted, the verified image is staged on the card first.
+
+Remote receivers do not need inbound access or to be on the maintainer's LAN. They make an outbound HTTPS request to GitHub. The notification is the pulsing green button in the receiver's local admin interface; this firmware does not send email, SMS, or a phone push notification.
 
 Do not remove power while an update is being installed. The `default_16MB.csv` partition layout supplies two application slots for OTA updates.
 
-Creating and pushing a tag such as `v2.4.1` runs `.github/workflows/release.yml`, builds both upgrade and factory images, generates SHA-256 checksums, and attaches them to a GitHub Release. A successful release then triggers `.github/workflows/pages.yml`, which publishes the same factory asset to the online USB installer.
+Creating and pushing a tag such as `v2.5.0` runs `.github/workflows/release.yml`, builds both upgrade and factory images, signs the OTA image with the protected `FIRMWARE_SIGNING_KEY` repository secret, generates SHA-256 checksums, and attaches them to a GitHub Release. A successful release then triggers `.github/workflows/pages.yml`, which publishes the same factory asset to the online USB installer.
 
 | Release asset | Use |
 | --- | --- |
 | `ESP32-ADSB-firmware.bin` | Normal OTA or local web update; preserves settings |
+| `ESP32-ADSB-firmware.bin.sig` | Detached RSA/SHA-256 signature required by GitHub OTA |
 | `ESP32-ADSB-factory.bin` | First installation or full recovery; clears saved settings |
 | `SHA256SUMS.txt` | Integrity hashes for the published firmware files |
 
@@ -192,7 +220,7 @@ If the board does not enter download mode, hold **BOOT**, tap **RESET**, begin t
 
 ## OpenStreetMap usage
 
-Map data is © OpenStreetMap contributors. The browser and LCD show attribution. The LCD requests only the tiles visible for the configured receiver area, identifies this firmware in its User-Agent, and caches tiles persistently in LittleFS. Do not modify the firmware to bulk-download tiles from the public OpenStreetMap tile service.
+Map data is © OpenStreetMap contributors. The browser and LCD show attribution. The LCD requests only the tiles visible for the configured receiver area, identifies this firmware in its User-Agent, and caches tiles on microSD when available or LittleFS otherwise. Do not modify the firmware to bulk-download tiles from the public OpenStreetMap tile service.
 
 ## Security notes
 
