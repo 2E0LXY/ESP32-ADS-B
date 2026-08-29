@@ -17,6 +17,8 @@
 #include <mbedtls/sha256.h>
 #include <mbedtls/pk.h>
 #include <math.h>
+
+#include "board_config.h"
 #include <vector>
 #include <esp_random.h>
 
@@ -40,48 +42,40 @@
 // HTTPS handshakes and ArduinoJson parsing exceed the default 8 KB loop stack.
 SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 
-// GPIO 1 and 2 are the ST7701 configuration SPI (LCD_MOSI and LCD_CLK in the
-// Waveshare reference header) and are re-used below as SDMMC CMD and CLK.
-// That is only safe because the panel is fully initialised in setup() before
-// mountSdCard() runs, and its chip select (GPIO 42) idles high afterwards.
-// Never re-initialise the display once the card is mounted.
-constexpr int8_t LCD_SPI_CS_PIN = 42;
-constexpr int8_t LCD_SPI_SCK_PIN = 2;
-constexpr int8_t LCD_SPI_MOSI_PIN = 1;
-
-// Timings from the Waveshare Rev 4.0 reference (HPW 8, HBP 10, HFP 50,
-// VPW 2, VBP 18, VFP 8). The previous values transposed HBP and HFP and used
-// VPW 8 / VBP 20 / VFP 10. No pixel clock was passed either, so the library
-// fell back to 12 MHz, giving 12e6 / (548 * 518) = 42 Hz. 16.5 MHz over the
-// corrected 548 x 508 total gives ~59 Hz.
-constexpr uint16_t PANEL_HSYNC_POLARITY = 1;
-constexpr uint16_t PANEL_HSYNC_FRONT_PORCH = 50;
-constexpr uint16_t PANEL_HSYNC_PULSE_WIDTH = 8;
-constexpr uint16_t PANEL_HSYNC_BACK_PORCH = 10;
-constexpr uint16_t PANEL_VSYNC_POLARITY = 1;
-constexpr uint16_t PANEL_VSYNC_FRONT_PORCH = 8;
-constexpr uint16_t PANEL_VSYNC_PULSE_WIDTH = 2;
-constexpr uint16_t PANEL_VSYNC_BACK_PORCH = 18;
-constexpr uint16_t PANEL_PCLK_ACTIVE_NEG = 0;
-constexpr int32_t PANEL_PCLK_HZ = 16500000L;
-
+// Panel pins, timings and capabilities all resolve through src/board_config.h,
+// selected by -DADSB_BOARD_WS4 or -DADSB_BOARD_WS7. Nothing about the display
+// is hardcoded here any more.
+//
+// On the 480x480 board GPIO 1 and 2 are the ST7701 configuration SPI and are
+// re-used as SDMMC CMD and CLK. That is only safe because the panel is fully
+// initialised in setup() before mountSdCard() runs and its chip select idles
+// high afterwards. Never re-initialise the display once the card is mounted.
+#if PANEL_NEEDS_SPI_INIT
 Arduino_DataBus *bus = new Arduino_SWSPI(
-    GFX_NOT_DEFINED, LCD_SPI_CS_PIN, LCD_SPI_SCK_PIN, LCD_SPI_MOSI_PIN,
+    GFX_NOT_DEFINED, PANEL_SPI_CS, PANEL_SPI_SCK, PANEL_SPI_MOSI,
     GFX_NOT_DEFINED);
+#endif
+
 Arduino_ESP32RGBPanel *rgbpanel = new Arduino_ESP32RGBPanel(
-    40, 39, 38, 41,
-    46, 3, 8, 18, 17,
-    14, 13, 12, 11, 10, 9,
-    5, 45, 48, 47, 21,
+    PANEL_PIN_DE, PANEL_PIN_VSYNC, PANEL_PIN_HSYNC, PANEL_PIN_PCLK,
+    PANEL_PINS_R, PANEL_PINS_G, PANEL_PINS_B,
     PANEL_HSYNC_POLARITY, PANEL_HSYNC_FRONT_PORCH, PANEL_HSYNC_PULSE_WIDTH,
     PANEL_HSYNC_BACK_PORCH,
     PANEL_VSYNC_POLARITY, PANEL_VSYNC_FRONT_PORCH, PANEL_VSYNC_PULSE_WIDTH,
     PANEL_VSYNC_BACK_PORCH,
     PANEL_PCLK_ACTIVE_NEG, PANEL_PCLK_HZ);
+
+#if PANEL_NEEDS_SPI_INIT
+// The ST7701 needs an SPI register sequence before its RGB interface works.
 Arduino_RGB_Display *gfx = new Arduino_RGB_Display(
-    480, 480, rgbpanel, 2, true,
+    PANEL_WIDTH, PANEL_HEIGHT, rgbpanel, PANEL_ROTATION, true,
     bus, GFX_NOT_DEFINED, st7701_type1_init_operations,
     sizeof(st7701_type1_init_operations));
+#else
+// The ST7262 is a plain RGB driver with no configuration bus.
+Arduino_RGB_Display *gfx = new Arduino_RGB_Display(
+    PANEL_WIDTH, PANEL_HEIGHT, rgbpanel, PANEL_ROTATION, true);
+#endif
 
 #if !ADSB_TLS_INSECURE
 // Declared at global scope on purpose: an unnamed namespace would give these
@@ -91,8 +85,8 @@ extern const uint8_t rootca_crt_bundle_end[] asm("_binary_x509_crt_bundle_end");
 #endif
 
 namespace {
-constexpr int W = 480;
-constexpr int H = 480;
+constexpr int W = layout::W;
+constexpr int H = layout::H;
 constexpr float DEFAULT_HOME_LAT = 53.73f;
 constexpr float DEFAULT_HOME_LON = -1.57f;
 constexpr uint16_t DEFAULT_RADIUS_NM = 60;
@@ -115,9 +109,11 @@ constexpr uint32_t UPDATE_CHECK_MS = 6UL * 60UL * 60UL * 1000UL;
 constexpr size_t MAX_SIGNATURE_BYTES = 512;
 constexpr size_t MIN_SIGNATURE_BYTES = 64;
 constexpr uint64_t MIN_TILE_CACHE_FREE_BYTES = 192UL * 1024UL;
-constexpr int SD_CLK_PIN = 2;
-constexpr int SD_CMD_PIN = 1;
-constexpr int SD_D0_PIN = 4;
+#if BOARD_SD_SDMMC
+constexpr int SD_CLK_PIN = BOARD_SD_CLK;
+constexpr int SD_CMD_PIN = BOARD_SD_CMD;
+constexpr int SD_D0_PIN = BOARD_SD_D0;
+#endif
 constexpr char SD_UPDATE_DIR[] = "/adsb/update";
 constexpr char SD_UPDATE_PART[] = "/adsb/update/firmware.bin.part";
 constexpr char SD_UPDATE_FILE[] = "/adsb/update/firmware.bin";
