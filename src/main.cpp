@@ -10,7 +10,14 @@
 #include <Preferences.h>
 #include <ESPmDNS.h>
 #include <LittleFS.h>
+#if BOARD_SD_SDMMC
 #include <SD_MMC.h>
+#define SDCARD SD_MMC
+#else
+#include <SD.h>
+#include <SPI.h>
+#define SDCARD SD
+#endif
 #include <PNGdec.h>
 #include <esp_heap_caps.h>
 #include <esp_system.h>
@@ -22,7 +29,11 @@
 #include <vector>
 #include <esp_random.h>
 
+#if BOARD_EXPANDER_CH32
 #include "WS_CH32_IO.h"
+#else
+#include "WS_CH422G.h"
+#endif
 #include "boot_asset.h"
 #include "map_asset.h"
 #include "opensky_secrets.h"
@@ -85,6 +96,9 @@ extern const uint8_t rootca_crt_bundle_end[] asm("_binary_x509_crt_bundle_end");
 #endif
 
 namespace {
+// boot_asset.h and map_asset.h are generated at 480x480.
+constexpr int ASSET_W = 480;
+constexpr int ASSET_H = 480;
 constexpr int W = layout::W;
 constexpr int H = layout::H;
 constexpr float DEFAULT_HOME_LAT = 53.73f;
@@ -360,44 +374,53 @@ const char *sdTypeName(sdcard_type_t type) {
 }
 
 bool mountSdCard() {
-  SD_MMC.end();
+  SDCARD.end();
   sdMounted = false;
   sdStatus = "No card detected";
   sdCardType = "None";
   sdTotalBytes = 0;
   sdUsedBytes = 0;
   stagedUpdateReady = false;
-  if (!SD_MMC.setPins(SD_CLK_PIN, SD_CMD_PIN, SD_D0_PIN) ||
-      !SD_MMC.begin("/sdcard", true, false, SDMMC_FREQ_DEFAULT, 5)) {
+#if BOARD_SD_SDMMC
+  if (!SDCARD.setPins(SD_CLK_PIN, SD_CMD_PIN, SD_D0_PIN) ||
+      !SDCARD.begin("/sdcard", true, false, SDMMC_FREQ_DEFAULT, 5)) {
+#else
+  // Chip select sits on the expander, which the SD library cannot drive. The
+  // card is the only device on this SPI bus, so CS is asserted once and left
+  // low; BOARD_SD_CS_GPIO is an unused pin handed to the library as a decoy.
+  SPI.begin(BOARD_SD_SCK, BOARD_SD_MISO, BOARD_SD_MOSI);
+  WS_CH422G::writePin(BOARD_SD_CS_EXIO, false);
+  if (!SDCARD.begin(BOARD_SD_CS_GPIO, SPI, 20000000)) {
+#endif
     Serial.println("SD card not mounted; using PSRAM and LittleFS");
     return false;
   }
-  if (SD_MMC.cardType() == CARD_NONE) {
-    SD_MMC.end();
+  if (SDCARD.cardType() == CARD_NONE) {
+    SDCARD.end();
     return false;
   }
-  SD_MMC.mkdir("/adsb");
-  SD_MMC.mkdir(SD_UPDATE_DIR);
+  SDCARD.mkdir("/adsb");
+  SDCARD.mkdir(SD_UPDATE_DIR);
   sdMounted = true;
   sdStatus = "Ready";
-  sdCardType = sdTypeName(SD_MMC.cardType());
-  sdTotalBytes = SD_MMC.totalBytes();
-  sdUsedBytes = SD_MMC.usedBytes();
+  sdCardType = sdTypeName(SDCARD.cardType());
+  sdTotalBytes = SDCARD.totalBytes();
+  sdUsedBytes = SDCARD.usedBytes();
   // Restore the staging metadata so a firmware staged before a reboot can
   // still be validated and installed; discard the file if it cannot be.
   stagedUpdateVersion = settingsStore.getString("staged-ver", "");
   stagedUpdateSha256 = settingsStore.getString("staged-sha", "");
   stagedUpdateSize = settingsStore.getULong("staged-size", 0);
-  stagedUpdateReady = SD_MMC.exists(SD_UPDATE_FILE);
+  stagedUpdateReady = SDCARD.exists(SD_UPDATE_FILE);
   if (stagedUpdateReady && (!stagedUpdateSize || stagedUpdateSha256.length() != 64)) {
-    SD_MMC.remove(SD_UPDATE_FILE);
+    SDCARD.remove(SD_UPDATE_FILE);
     stagedUpdateReady = false;
     stagedUpdateVersion = "";
     stagedUpdateSha256 = "";
     stagedUpdateSize = 0;
     Serial.println("Discarded staged firmware with no stored metadata");
   }
-  SD_MMC.remove(SD_UPDATE_PART);
+  SDCARD.remove(SD_UPDATE_PART);
   Serial.printf("SD card ready: %s, %.1f MB free\n", sdCardType.c_str(),
                 (sdTotalBytes - sdUsedBytes) / 1048576.0);
   return true;
@@ -483,6 +506,7 @@ bool touchWriteRegister(uint16_t reg, uint8_t value) {
 }
 
 bool beginTouch() {
+#if BOARD_EXPANDER_CH32
   // Give GT911 a dedicated reset pulse after panel power has stabilised.
   WS_CH32_IO::writeRegister(Wire, WS_CH32_IO::REG_OUTPUT,
                             WS_CH32_IO::PIN_SYS_EN | WS_CH32_IO::PIN_LCD_RST);
@@ -491,7 +515,7 @@ bool beginTouch() {
                             WS_CH32_IO::OUT_DISPLAY_ON);
   delay(300);
   // Waveshare's Rev4 touch example reopens the shared bus after LCD init.
-  Wire.begin(WS_CH32_IO::DEFAULT_I2C_SDA, WS_CH32_IO::DEFAULT_I2C_SCL);
+  Wire.begin(BOARD_I2C_SDA, BOARD_I2C_SCL);
   Wire.setClock(WS_CH32_IO::DEFAULT_I2C_FREQ);
   delay(100);
   Serial.print("I2C devices:");
@@ -515,6 +539,16 @@ bool beginTouch() {
   }
   Serial.println("GT911 touch controller not found");
   return false;
+#else
+  // On the CH422G boards the GT911 reset line sits on the expander. The
+  // controller is present at 0x5D but the driver is not ported yet, so the
+  // reset is issued and the probe deliberately reports no touch.
+  WS_CH422G::writePin(BOARD_TOUCH_RST_EXIO, false);
+  delay(10);
+  WS_CH422G::writePin(BOARD_TOUCH_RST_EXIO, true);
+  delay(60);
+  return false;
+#endif
 }
 
 bool touchTapped() {
@@ -599,7 +633,12 @@ void text5(int x, int y, const char *s, uint16_t c, int scale=1) {
 
 void restoreMap() {
   if (physicalMapReady && baseMap) memcpy(framebuffer, baseMap, W * H * sizeof(uint16_t));
-  else memcpy_P(framebuffer, MAP_IMAGE, W * H * sizeof(uint16_t));
+  else if (W == ASSET_W && H == ASSET_H)
+    memcpy_P(framebuffer, MAP_IMAGE, W * H * sizeof(uint16_t));
+  else
+    // The baked map is 480x480 and does not fit this panel. Clear instead of
+    // overrunning the array; OSM tiles replace it once cached anyway.
+    memset(framebuffer, 0, W * H * sizeof(uint16_t));
 }
 
 double osmWorldX(double longitude, uint8_t zoom) {
@@ -669,8 +708,8 @@ String osmTilePath(uint8_t zoom, int tileX, int tileY) {
 
 uint64_t tileCacheFreeBytes() {
   if (sdMounted) {
-    const uint64_t total = SD_MMC.totalBytes();
-    const uint64_t used = SD_MMC.usedBytes();
+    const uint64_t total = SDCARD.totalBytes();
+    const uint64_t used = SDCARD.usedBytes();
     return total > used ? total - used : 0;
   }
   const size_t total = LittleFS.totalBytes();
@@ -683,7 +722,7 @@ uint64_t tileCacheFreeBytes() {
 // silently and the LCD stayed on the radar fallback for good.
 int clearTileCache(bool littleFsOnly = false) {
   const bool useSd = sdMounted && !littleFsOnly;
-  fs::FS &cache = useSd ? static_cast<fs::FS &>(SD_MMC) : static_cast<fs::FS &>(LittleFS);
+  fs::FS &cache = useSd ? static_cast<fs::FS &>(SDCARD) : static_cast<fs::FS &>(LittleFS);
   const String directory = useSd ? "/adsb" : "/";
   std::vector<String> victims;
   File dir = cache.open(directory.c_str());
@@ -713,7 +752,7 @@ int clearTileCache(bool littleFsOnly = false) {
 }
 
 bool cacheOsmTile(uint8_t zoom, int tileX, int tileY, const String &path) {
-  fs::FS &cache = sdMounted ? static_cast<fs::FS &>(SD_MMC) : static_cast<fs::FS &>(LittleFS);
+  fs::FS &cache = sdMounted ? static_cast<fs::FS &>(SDCARD) : static_cast<fs::FS &>(LittleFS);
   if (cache.exists(path)) return true;
   if (WiFi.status() != WL_CONNECTED) return false;
   if (tileCacheFreeBytes() < MIN_TILE_CACHE_FREE_BYTES) {
@@ -748,7 +787,7 @@ bool cacheOsmTile(uint8_t zoom, int tileX, int tileY, const String &path) {
 }
 
 bool drawCachedOsmTile(const String &path, int screenX, int screenY) {
-  fs::FS &cache = sdMounted ? static_cast<fs::FS &>(SD_MMC) : static_cast<fs::FS &>(LittleFS);
+  fs::FS &cache = sdMounted ? static_cast<fs::FS &>(SDCARD) : static_cast<fs::FS &>(LittleFS);
   File file = cache.open(path, FILE_READ);
   if (!file) return false;
   const size_t size = file.size();
@@ -830,16 +869,24 @@ bool refreshPhysicalBaseMap() {
 bool applyBrightness(uint8_t percent) {
   const uint8_t duty = static_cast<uint8_t>(
       (constrain(static_cast<int>(percent), 0, 100) * 255 + 50) / 100);
+#if BOARD_HAS_BACKLIGHT_PWM
   return WS_CH32_IO::setPwm(Wire, duty);
+#else
+  // EXIO2 is a switch, not a PWM output. Report false for any intermediate
+  // level so the caller can tell the user the duty was not honoured.
+  return WS_CH422G::setPwm(Wire, duty);
+#endif
 }
 
 void beepAlert() {
+#if BOARD_EXPANDER_CH32
   if (!soundAlerts) return;
   WS_CH32_IO::writeRegister(Wire, WS_CH32_IO::REG_OUTPUT,
                             WS_CH32_IO::OUT_DISPLAY_ON | WS_CH32_IO::PIN_BEE_EN);
   delay(200);
   WS_CH32_IO::writeRegister(Wire, WS_CH32_IO::REG_OUTPUT,
                             WS_CH32_IO::OUT_DISPLAY_ON);
+#endif  // no buzzer is wired on the CH422G boards
 }
 
 const char *compassDirection(float track) {
@@ -1068,7 +1115,14 @@ void present() {
 }
 
 void renderBootScreen(const String &networkLine = "", uint16_t networkColour = RGB565_CYAN) {
-  gfx->draw16bitRGBBitmap(0, 0, const_cast<uint16_t *>(BOOT_IMAGE), W, H);
+  if (W == ASSET_W && H == ASSET_H) {
+    gfx->draw16bitRGBBitmap(0, 0, const_cast<uint16_t *>(BOOT_IMAGE), W, H);
+  } else {
+    // Centre the 480x480 splash rather than overrunning the array.
+    gfx->fillScreen(rgb(4, 10, 16));
+    gfx->draw16bitRGBBitmap((W - ASSET_W) / 2, (H - ASSET_H) / 2,
+                            const_cast<uint16_t *>(BOOT_IMAGE), ASSET_W, ASSET_H);
+  }
   gfx->setTextWrap(false);
   gfx->setTextSize(2);
   gfx->setTextColor(RGB565_WHITE);
@@ -1696,8 +1750,8 @@ bool checkGithubUpdate() {
 
 bool downloadGithubUpdateToSd() {
   if (!sdMounted) return false;
-  SD_MMC.remove(SD_UPDATE_PART);
-  File file = SD_MMC.open(SD_UPDATE_PART, FILE_WRITE);
+  SDCARD.remove(SD_UPDATE_PART);
+  File file = SDCARD.open(SD_UPDATE_PART, FILE_WRITE);
   if (!file) {
     githubUpdateStatus = "Unable to create SD staging file";
     return false;
@@ -1710,7 +1764,7 @@ bool downloadGithubUpdateToSd() {
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   if (!http.begin(client, githubFirmwareUrl)) {
     file.close();
-    SD_MMC.remove(SD_UPDATE_PART);
+    SDCARD.remove(SD_UPDATE_PART);
     githubUpdateStatus = "Firmware download failed";
     return false;
   }
@@ -1719,7 +1773,7 @@ bool downloadGithubUpdateToSd() {
   if (code != HTTP_CODE_OK) {
     http.end();
     file.close();
-    SD_MMC.remove(SD_UPDATE_PART);
+    SDCARD.remove(SD_UPDATE_PART);
     githubUpdateStatus = "Firmware HTTP " + String(code);
     return false;
   }
@@ -1756,16 +1810,16 @@ bool downloadGithubUpdateToSd() {
   const String actualDigest = hashOk ? bytesToHex(hash, sizeof(hash)) : "";
   if (!validHeader || total != githubFirmwareSize || actualDigest != githubFirmwareSha256 ||
       !verifyFirmwareSignature(actualDigest)) {
-    SD_MMC.remove(SD_UPDATE_PART);
+    SDCARD.remove(SD_UPDATE_PART);
     githubUpdateStatus = !validHeader ? "Downloaded file is not ESP32 firmware" :
                          total != githubFirmwareSize ? "Firmware download was incomplete" :
                          actualDigest != githubFirmwareSha256 ? "Firmware SHA-256 check failed" :
                          "Firmware release signature check failed";
     return false;
   }
-  SD_MMC.remove(SD_UPDATE_FILE);
-  if (!SD_MMC.rename(SD_UPDATE_PART, SD_UPDATE_FILE)) {
-    SD_MMC.remove(SD_UPDATE_PART);
+  SDCARD.remove(SD_UPDATE_FILE);
+  if (!SDCARD.rename(SD_UPDATE_PART, SD_UPDATE_FILE)) {
+    SDCARD.remove(SD_UPDATE_PART);
     githubUpdateStatus = "Unable to finalise SD staging file";
     return false;
   }
@@ -1776,13 +1830,13 @@ bool downloadGithubUpdateToSd() {
   settingsStore.putString("staged-ver", stagedUpdateVersion);
   settingsStore.putString("staged-sha", stagedUpdateSha256);
   settingsStore.putULong("staged-size", stagedUpdateSize);
-  sdUsedBytes = SD_MMC.usedBytes();
+  sdUsedBytes = SDCARD.usedBytes();
   githubUpdateStatus = "Version " + githubLatestVersion + " verified on SD";
   return true;
 }
 
 void discardStagedUpdate() {
-  if (sdMounted) SD_MMC.remove(SD_UPDATE_FILE);
+  if (sdMounted) SDCARD.remove(SD_UPDATE_FILE);
   stagedUpdateReady = false;
   stagedUpdateVersion = "";
   stagedUpdateSha256 = "";
@@ -1803,7 +1857,7 @@ bool installStagedUpdate() {
     githubUpdateStatus = "Staged firmware metadata is missing";
     return false;
   }
-  File file = SD_MMC.open(SD_UPDATE_FILE, FILE_READ);
+  File file = SDCARD.open(SD_UPDATE_FILE, FILE_READ);
   if (!file || file.size() != expectedSize || file.read() != 0xE9 || !file.seek(0)) {
     if (file) file.close();
     discardStagedUpdate();
@@ -1812,13 +1866,13 @@ bool installStagedUpdate() {
   }
   file.close();
   String digest;
-  if (!sha256File(SD_MMC, SD_UPDATE_FILE, digest) || digest != expectedDigest ||
+  if (!sha256File(SDCARD, SD_UPDATE_FILE, digest) || digest != expectedDigest ||
       !verifyFirmwareSignature(digest)) {
     discardStagedUpdate();
     githubUpdateStatus = "Staged firmware SHA-256 check failed";
     return false;
   }
-  file = SD_MMC.open(SD_UPDATE_FILE, FILE_READ);
+  file = SDCARD.open(SD_UPDATE_FILE, FILE_READ);
   if (!file || !Update.begin(expectedSize, U_FLASH)) {
     if (file) file.close();
     githubUpdateStatus = Update.errorString();
@@ -2533,11 +2587,16 @@ void setup() {
   brightnessPercent = constrain(brightnessPercent, 10, 100);
   generateCsrfToken();
   pinMode(0, INPUT_PULLUP);
+#if BOARD_HAS_BOOT_BUTTON
   attachInterrupt(digitalPinToInterrupt(0), onBootButtonFalling, FALLING);
+#endif  // GPIO 0 is an RGB data line on the 800x480 boards
   delay(300);
-  if (!WS_CH32_IO::begin(Wire, WS_CH32_IO::DEFAULT_I2C_SDA,
-                         WS_CH32_IO::DEFAULT_I2C_SCL,
+#if BOARD_EXPANDER_CH32
+  if (!WS_CH32_IO::begin(Wire, BOARD_I2C_SDA, BOARD_I2C_SCL,
                          WS_CH32_IO::DEFAULT_I2C_FREQ, &Serial)) {
+#else
+  if (!WS_CH422G::begin(Wire, BOARD_I2C_SDA, BOARD_I2C_SCL, 400000, &Serial)) {
+#endif
     Serial.println("Rev4 display helper unavailable");
   }
   applyBrightness(brightnessPercent);

@@ -65,3 +65,7 @@
 #define BOARD_SD_SCK 12
 #define BOARD_SD_MISO 13
 #define BOARD_SD_CS_EXIO 4
+// The SD library drives chip select with digitalWrite and cannot reach the
+// expander. The card is the only device on this bus, so the real CS is held
+// low via EXIO4 and this unused GPIO is handed to the library as a decoy.
+#define BOARD_SD_CS_GPIO 16
