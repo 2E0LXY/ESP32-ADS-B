@@ -1,4 +1,8 @@
 #include <Arduino.h>
+
+// Board capability macros. Must come before anything that tests them,
+// notably the SD backend selection below.
+#include "board_config.h"
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
@@ -25,7 +29,6 @@
 #include <mbedtls/pk.h>
 #include <math.h>
 
-#include "board_config.h"
 #include <vector>
 #include <esp_random.h>
 
@@ -812,14 +815,16 @@ bool drawCachedOsmTile(const String &path, int screenX, int screenY) {
 
 void drawLocationFallback() {
   filledRect(0, 0, W, H, rgb(5, 20, 31));
-  for (int radius = 70; radius <= 210; radius += 70) {
+  const int ringStep = layout::radarRadius / 3;
+  for (int radius = ringStep; radius <= layout::radarRadius; radius += ringStep) {
     for (int degrees = 0; degrees < 360; ++degrees) {
       const float angle = radians(degrees);
-      pixel(240 + lroundf(cosf(angle) * radius), 240 + lroundf(sinf(angle) * radius), rgb(25, 75, 96));
+      pixel(layout::centreX + lroundf(cosf(angle) * radius),
+            layout::centreY + lroundf(sinf(angle) * radius), rgb(25, 75, 96));
     }
   }
-  line(0, 240, W - 1, 240, rgb(25, 75, 96));
-  line(240, 0, 240, H - 1, rgb(25, 75, 96));
+  line(0, layout::centreY, W - 1, layout::centreY, rgb(25, 75, 96));
+  line(layout::centreX, 0, layout::centreX, H - 1, rgb(25, 75, 96));
 }
 
 bool refreshPhysicalBaseMap() {
@@ -853,7 +858,7 @@ bool refreshPhysicalBaseMap() {
       if (webServerReady) webServer.handleClient();
     }
   }
-  filledRect(0, H - 15, 142, 15, rgb(0, 0, 0));
+  filledRect(0, H - 15, 17 * 6 + 4, 15, rgb(0, 0, 0));
   text5(3, H - 12, "(C) OPENSTREETMAP", rgb(255, 255, 255));
   memcpy(baseMap, framebuffer, W * H * sizeof(uint16_t));
   physicalMapReady = true;
@@ -1093,9 +1098,9 @@ void drawRouteLabel(int x, int y, const RouteCacheEntry *route) {
 }
 
 void status(const char *label, uint16_t colour) {
-  disc(240,18,12,rgb(0,0,0)); disc(240,18,8,colour);
+  disc(layout::centreX,18,12,rgb(0,0,0)); disc(layout::centreX,18,8,colour);
   int width=strlen(label)*6;
-  text5(240-width/2,32,label,rgb(255,255,255));
+  text5(layout::centreX-width/2,32,label,rgb(255,255,255));
 }
 
 void present() {
@@ -1156,17 +1161,29 @@ void renderMapPage() {
   present();
 }
 
+// Table column origins, expressed against the panel width. The 480 design
+// used 2/34/132/184/244/280/354; those ratios are preserved.
+constexpr int COL_LOGO = W * 2 / 480;
+constexpr int COL_CALLSIGN = W * 34 / 480;
+constexpr int COL_MILES = W * 132 / 480;
+constexpr int COL_SOURCE = W * 184 / 480;
+constexpr int COL_DIR = W * 244 / 480;
+constexpr int COL_ALT = W * 280 / 480;
+constexpr int COL_ROUTE = W * 354 / 480;
+
 void renderTablePage() {
   filledRect(0,0,W,H,rgb(2,10,18));
-  text5(144,7,"NEAREST AIRCRAFT",rgb(80,220,255),2);
-  text5(2,31,"LOGO",rgb(170,190,205));
-  text5(34,31,"CALLSIGN",rgb(170,190,205));
-  text5(132,31,"MILES",rgb(170,190,205));
-  text5(184,31,"SOURCE",rgb(170,190,205));
-  text5(244,31,"DIR",rgb(170,190,205));
-  text5(280,31,"ALT FT",rgb(170,190,205));
-  text5(354,31,"FROM TO",rgb(170,190,205));
-  line(3,41,476,41,rgb(55,85,105));
+  // Columns are fractions of the panel width so the 800px board spreads the
+  // table out instead of crowding it into the leftmost 480px.
+  text5(layout::centreX - 96,7,"NEAREST AIRCRAFT",rgb(80,220,255),2);
+  text5(COL_LOGO,31,"LOGO",rgb(170,190,205));
+  text5(COL_CALLSIGN,31,"CALLSIGN",rgb(170,190,205));
+  text5(COL_MILES,31,"MILES",rgb(170,190,205));
+  text5(COL_SOURCE,31,"SOURCE",rgb(170,190,205));
+  text5(COL_DIR,31,"DIR",rgb(170,190,205));
+  text5(COL_ALT,31,"ALT FT",rgb(170,190,205));
+  text5(COL_ROUTE,31,"FROM TO",rgb(170,190,205));
+  line(3,41,W - 4,41,rgb(55,85,105));
 
   int rows = min(lastCount, 10);
   for (int i=0; i<rows; ++i) {
@@ -1182,12 +1199,12 @@ void renderTablePage() {
     const char *identity=display.flight[0] ? display.flight : display.hex;
     if (display.positionSource == 2) drawMlatPlane(16,y+7,display.track);
     else drawOperatorBadge(16,y+7,display.flight,display.hex);
-    text5(34,y,identity,rgb(255,255,255),2);
-    text5(132,y,distance,rgb(255,220,80),2);
-    text5(184,y,display.positionSource==2 ? "MLAT" : "ADSB",display.positionSource==2 ? rgb(255,65,65) : rgb(60,220,130),2);
-    text5(244,y,compassDirection(display.track),rgb(255,255,255),2);
-    text5(280,y,altitude,rgb(255,255,255),2);
-    text5(354,y,routeLabel,rgb(130,210,255),2);
+    text5(COL_CALLSIGN,y,identity,rgb(255,255,255),2);
+    text5(COL_MILES,y,distance,rgb(255,220,80),2);
+    text5(COL_SOURCE,y,display.positionSource==2 ? "MLAT" : "ADSB",display.positionSource==2 ? rgb(255,65,65) : rgb(60,220,130),2);
+    text5(COL_DIR,y,compassDirection(display.track),rgb(255,255,255),2);
+    text5(COL_ALT,y,altitude,rgb(255,255,255),2);
+    text5(COL_ROUTE,y,routeLabel,rgb(130,210,255),2);
     line(3,y+25,476,y+25,rgb(25,45,60));
   }
   char footer[24];
@@ -1195,7 +1212,7 @@ void renderTablePage() {
     snprintf(footer,sizeof(footer),"%d AIRCRAFT  C%ld",lastCount,creditsRemaining);
   else
     snprintf(footer,sizeof(footer),"%d AIRCRAFT",lastCount);
-  text5(170,459,footer,rgb(130,160,180));
+  text5(layout::centreX - 70,layout::footerY,footer,rgb(130,160,180));
   present();
 }
 
@@ -1210,7 +1227,7 @@ void radarRing(int centreX, int centreY, int radius, uint16_t colour) {
 void renderRadarPage() {
   constexpr int centreX = W / 2;
   constexpr int centreY = 245;
-  constexpr int outerRadius = 190;
+  constexpr int outerRadius = layout::radarRadius;
   const uint16_t background = rgb(1, 12, 16);
   const uint16_t grid = rgb(22, 93, 84);
   const uint16_t gridBright = rgb(42, 145, 119);
@@ -1219,7 +1236,7 @@ void renderRadarPage() {
   text5(12, 9, "LIVE AIRCRAFT RADAR", rgb(90, 235, 185), 2);
   char rangeLabel[22];
   snprintf(rangeLabel, sizeof(rangeLabel), "RANGE %u NM", queryRadiusNm);
-  text5(345, 13, rangeLabel, rgb(175, 205, 195));
+  text5(W - 135, 13, rangeLabel, rgb(175, 205, 195));
 
   for (int ring = 1; ring <= 4; ++ring) {
     radarRing(centreX, centreY, outerRadius * ring / 4,
@@ -1276,7 +1293,7 @@ void renderRadarPage() {
   text5(7, H - 12, "RED RIM TARGETS ARE OUTSIDE RANGE", rgb(170, 195, 188));
   char countLabel[18];
   snprintf(countLabel, sizeof(countLabel), "%d TRACKED", plotted);
-  text5(394, H - 12, countLabel, rgb(90, 235, 185));
+  text5(W - 86, H - 12, countLabel, rgb(90, 235, 185));
   present();
 }
 
