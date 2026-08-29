@@ -2,6 +2,12 @@
 
 #include "Arduino_ESP32RGBPanel.h"
 
+// Bounce buffer height in scanlines. Upstream hardcodes 40; see the note at
+// the bounce_buffer_size_px assignment below.
+#ifndef RGB_BOUNCE_BUFFER_LINES
+#define RGB_BOUNCE_BUFFER_LINES 40
+#endif
+
 #if defined(ESP32) && (CONFIG_IDF_TARGET_ESP32S3)
 Arduino_ESP32RGBPanel::Arduino_ESP32RGBPanel(
     int8_t de, int8_t vsync, int8_t hsync, int8_t pclk,
@@ -72,7 +78,13 @@ uint16_t *Arduino_ESP32RGBPanel::getFrameBuffer(int16_t w, int16_t h)
 #else
       .bits_per_pixel = 16,
       .num_fbs = 1,
-      .bounce_buffer_size_px = static_cast<size_t>(40) * static_cast<size_t>(w),
+      // esp_lcd allocates TWO bounce buffers of this size from internal
+      // DMA-capable DRAM. The upstream default of 40 lines costs
+      // 2 * 40 * width * 2 bytes: 75 KB at 480 px wide, 125 KB at 800 px.
+      // On the 800x480 boards that starves mbedTLS and every HTTPS request
+      // fails with MBEDTLS_ERR_SSL_ALLOC_FAILED (-32512). Override with
+      // -DRGB_BOUNCE_BUFFER_LINES=<n>; 0 disables bounce buffers entirely.
+      .bounce_buffer_size_px = static_cast<size_t>(RGB_BOUNCE_BUFFER_LINES) * static_cast<size_t>(w),
 #endif
       .sram_trans_align = 8,
       .psram_trans_align = 64,

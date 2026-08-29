@@ -111,7 +111,7 @@ constexpr char TOKEN_URL[] = "https://auth.opensky-network.org/auth/realms/opens
 constexpr uint32_t REFRESH_MS = 30000;
 constexpr int MAX_AIRCRAFT = 250;
 constexpr int ROUTE_CACHE_SIZE = 48;
-constexpr int MAX_ROUTE_LOOKUPS_PER_REFRESH = 4;
+constexpr int MAX_ROUTE_LOOKUPS_PER_REFRESH = 2;
 constexpr uint32_t ROUTE_CACHE_MS = 6UL * 60UL * 60UL * 1000UL;
 constexpr uint32_t ROUTE_RETRY_MS = 5UL * 60UL * 1000UL;
 constexpr char FIRMWARE_VERSION[] = "2.5.1";
@@ -157,6 +157,51 @@ class PsramAllocator : public ArduinoJson::Allocator {
 };
 
 PsramAllocator psramJsonAllocator;
+
+// HTTPClient only de-chunks a response inside getString() and writeToStream().
+// getStream() hands back the raw socket, so on a Transfer-Encoding: chunked
+// reply ArduinoJson sees the hex chunk-length prefix first and parses "56f1"
+// as a number: deserializeJson() returns Ok and the expected object is simply
+// absent. Every Cloudflare-fronted API here chunks (adsb.fi, api.github.com),
+// which is why adsb.fi logged "JSON Ok" with zero aircraft while
+// airplanes.live, which sends Content-Length, worked.
+//
+// Buffer the body through writeToStream into PSRAM so HTTPClient's own
+// de-chunking runs, then parse from the flat buffer.
+class PsramSink : public Stream {
+ public:
+  ~PsramSink() { heap_caps_free(_data); }
+  size_t write(uint8_t b) override { return write(&b, 1); }
+  size_t write(const uint8_t *data, size_t length) override {
+    if (!reserve(_size + length + 1)) return 0;
+    memcpy(_data + _size, data, length);
+    _size += length;
+    _data[_size] = '\0';
+    return length;
+  }
+  int available() override { return 0; }
+  int read() override { return -1; }
+  int peek() override { return -1; }
+  void flush() override {}
+  const char *data() const { return _data ? _data : ""; }
+  size_t size() const { return _size; }
+
+ private:
+  bool reserve(size_t needed) {
+    if (needed <= _capacity) return true;
+    size_t want = _capacity ? _capacity : 8192;
+    while (want < needed) want *= 2;
+    char *grown = static_cast<char *>(
+        heap_caps_realloc(_data, want, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (!grown) return false;
+    _data = grown;
+    _capacity = want;
+    return true;
+  }
+  char *_data = nullptr;
+  size_t _size = 0;
+  size_t _capacity = 0;
+};
 
 struct RouteCacheEntry {
   char callsign[9] = {};
@@ -208,8 +253,11 @@ int lastMlat = 0;
 long creditsRemaining = -1;
 RouteCacheEntry routeCache[ROUTE_CACHE_SIZE];
 AircraftDisplay *latestAircraft = nullptr;
-enum class DisplayPage : uint8_t { Map = 0, Table = 1, Radar = 2 };
-DisplayPage displayPage = DisplayPage::Map;
+// Page order matches the swipe order on the panel: Overview is the first
+// screen, then swipe right advances Table -> Map -> Radar and wraps.
+enum class DisplayPage : uint8_t { Overview = 0, Table = 1, Map = 2, Radar = 3 };
+constexpr uint8_t DISPLAY_PAGE_COUNT = 4;
+DisplayPage displayPage = DisplayPage::Overview;
 float radarSweepDegrees = 0.0f;
 uint32_t nextRadarFrameAt = 0;
 bool touchReady = false;
@@ -508,19 +556,7 @@ bool touchWriteRegister(uint16_t reg, uint8_t value) {
   return Wire.endTransmission() == 0;
 }
 
-bool beginTouch() {
-#if BOARD_EXPANDER_CH32
-  // Give GT911 a dedicated reset pulse after panel power has stabilised.
-  WS_CH32_IO::writeRegister(Wire, WS_CH32_IO::REG_OUTPUT,
-                            WS_CH32_IO::PIN_SYS_EN | WS_CH32_IO::PIN_LCD_RST);
-  delay(80);
-  WS_CH32_IO::writeRegister(Wire, WS_CH32_IO::REG_OUTPUT,
-                            WS_CH32_IO::OUT_DISPLAY_ON);
-  delay(300);
-  // Waveshare's Rev4 touch example reopens the shared bus after LCD init.
-  Wire.begin(BOARD_I2C_SDA, BOARD_I2C_SCL);
-  Wire.setClock(WS_CH32_IO::DEFAULT_I2C_FREQ);
-  delay(100);
+bool probeGt911() {
   Serial.print("I2C devices:");
   for (uint8_t address = 1; address < 127; ++address) {
     Wire.beginTransmission(address);
@@ -542,28 +578,103 @@ bool beginTouch() {
   }
   Serial.println("GT911 touch controller not found");
   return false;
+}
+
+bool beginTouch() {
+#if BOARD_EXPANDER_CH32
+  // Give GT911 a dedicated reset pulse after panel power has stabilised.
+  WS_CH32_IO::writeRegister(Wire, WS_CH32_IO::REG_OUTPUT,
+                            WS_CH32_IO::PIN_SYS_EN | WS_CH32_IO::PIN_LCD_RST);
+  delay(80);
+  WS_CH32_IO::writeRegister(Wire, WS_CH32_IO::REG_OUTPUT,
+                            WS_CH32_IO::OUT_DISPLAY_ON);
+  delay(300);
+  // Waveshare's Rev4 touch example reopens the shared bus after LCD init.
+  Wire.begin(BOARD_I2C_SDA, BOARD_I2C_SCL);
+  Wire.setClock(WS_CH32_IO::DEFAULT_I2C_FREQ);
+  delay(100);
+  return probeGt911();
 #else
-  // On the CH422G boards the GT911 reset line sits on the expander. The
-  // controller is present at 0x5D but the driver is not ported yet, so the
-  // reset is issued and the probe deliberately reports no touch.
+  // CH422G boards: the GT911 reset line is EXIO1 and its INT line is a plain
+  // GPIO. Hold INT low across the reset release so the controller latches the
+  // 0x5D address, then probe on the shared bus.
+  pinMode(BOARD_TOUCH_INT, OUTPUT);
+  digitalWrite(BOARD_TOUCH_INT, LOW);
   WS_CH422G::writePin(BOARD_TOUCH_RST_EXIO, false);
-  delay(10);
+  delay(20);
   WS_CH422G::writePin(BOARD_TOUCH_RST_EXIO, true);
-  delay(60);
-  return false;
+  delay(10);
+  pinMode(BOARD_TOUCH_INT, INPUT);
+  delay(120);
+  Wire.begin(BOARD_I2C_SDA, BOARD_I2C_SCL);
+  Wire.setClock(400000);
+  delay(50);
+  return probeGt911();
 #endif
 }
 
-bool touchTapped() {
-  if (!touchReady) return false;
+enum class TouchGesture : uint8_t { None, Tap, SwipeLeft, SwipeRight };
+
+// A swipe must travel this far horizontally, stay mostly horizontal, and
+// finish inside the time limit. Anything shorter that lifts cleanly is a tap.
+constexpr int SWIPE_MIN_PIXELS = 70;
+constexpr uint32_t SWIPE_MAX_MS = 700;
+
+// Reads the current contact, if any. GT911 keeps point 0 at 0x8150 as
+// x-lo, x-hi, y-lo, y-hi. The status byte's high bit means the coordinate
+// buffer is ready and must be cleared by writing zero back.
+bool touchPoint(int &x, int &y) {
   uint8_t statusByte = 0;
   if (!touchReadRegister(0x814E, &statusByte, 1)) return false;
   if ((statusByte & 0x80) == 0) return false;
   const bool hasPoint = (statusByte & 0x0F) > 0;
+  bool valid = false;
+  if (hasPoint) {
+    uint8_t point[4] = {};
+    if (touchReadRegister(0x8150, point, sizeof(point))) {
+      x = point[0] | (point[1] << 8);
+      y = point[2] | (point[3] << 8);
+      valid = true;
+    }
+  }
   touchWriteRegister(0x814E, 0);
-  if (!hasPoint || millis() - lastTouchAt < 350) return false;
+  return valid;
+}
+
+TouchGesture touchGesture() {
+  if (!touchReady) return TouchGesture::None;
+  static bool down = false;
+  static int startX = 0, startY = 0, lastX = 0, lastY = 0;
+  static uint32_t startedAt = 0;
+
+  int x = 0, y = 0;
+  const bool contact = touchPoint(x, y);
+
+  if (contact) {
+    if (!down) {
+      down = true;
+      startX = lastX = x;
+      startY = lastY = y;
+      startedAt = millis();
+    } else {
+      lastX = x;
+      lastY = y;
+    }
+    return TouchGesture::None;
+  }
+
+  if (!down) return TouchGesture::None;
+  down = false;
+  const uint32_t heldFor = millis() - startedAt;
+  const int deltaX = lastX - startX;
+  const int deltaY = lastY - startY;
+  if (millis() - lastTouchAt < 350) return TouchGesture::None;
   lastTouchAt = millis();
-  return true;
+  if (heldFor <= SWIPE_MAX_MS && abs(deltaX) >= SWIPE_MIN_PIXELS &&
+      abs(deltaX) > abs(deltaY) * 2) {
+    return deltaX < 0 ? TouchGesture::SwipeLeft : TouchGesture::SwipeRight;
+  }
+  return TouchGesture::Tap;
 }
 
 bool bootButtonTapped() {
@@ -757,7 +868,10 @@ int clearTileCache(bool littleFsOnly = false) {
 bool cacheOsmTile(uint8_t zoom, int tileX, int tileY, const String &path) {
   fs::FS &cache = sdMounted ? static_cast<fs::FS &>(SDCARD) : static_cast<fs::FS &>(LittleFS);
   if (cache.exists(path)) return true;
-  if (WiFi.status() != WL_CONNECTED) return false;
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.printf("OSM tile %d/%d/%d skipped: WiFi not connected\n", zoom, tileX, tileY);
+    return false;
+  }
   if (tileCacheFreeBytes() < MIN_TILE_CACHE_FREE_BYTES) {
     clearTileCache();
     if (tileCacheFreeBytes() < MIN_TILE_CACHE_FREE_BYTES) {
@@ -770,7 +884,10 @@ bool cacheOsmTile(uint8_t zoom, int tileX, int tileY, const String &path) {
   HTTPClient http;
   http.setTimeout(12000);
   const String url = "https://tile.openstreetmap.org/" + String(zoom) + "/" + String(tileX) + "/" + String(tileY) + ".png";
-  if (!http.begin(client, url)) return false;
+  if (!http.begin(client, url)) {
+    Serial.printf("OSM tile %d/%d/%d begin() failed\n", zoom, tileX, tileY);
+    return false;
+  }
   http.addHeader("User-Agent", userAgent());
   const int code = http.GET();
   if (code != HTTP_CODE_OK) {
@@ -778,11 +895,16 @@ bool cacheOsmTile(uint8_t zoom, int tileX, int tileY, const String &path) {
     http.end();
     return false;
   }
+  const int expected = http.getSize();
   File file = cache.open(path, FILE_WRITE);
   const int written = file ? http.writeToStream(&file) : -1;
   if (file) file.close();
   http.end();
-  if (written <= 0) {
+  // A short write used to be committed as a valid cache entry and then decode
+  // as half a tile for ever. Verify against Content-Length before keeping it.
+  if (written <= 0 || (expected > 0 && written != expected)) {
+    Serial.printf("OSM tile %d/%d/%d write failed: %d of %d bytes\n", zoom,
+                  tileX, tileY, written, expected);
     cache.remove(path);
     return false;
   }
@@ -842,16 +964,18 @@ bool refreshPhysicalBaseMap() {
   const int lastTileX = static_cast<int>(floor((left + W - 1) / 256.0));
   const int lastTileY = static_cast<int>(floor((top + H - 1) / 256.0));
   const int tilesPerAxis = 1 << physicalMapZoom;
-  bool drewTile = false;
+  int tilesDrawn = 0;
   mapRebuildTotal = max(0, (lastTileY - firstTileY + 1) * (lastTileX - firstTileX + 1));
   for (int tileY = firstTileY; tileY <= lastTileY; ++tileY) {
     if (tileY < 0 || tileY >= tilesPerAxis) { mapRebuildDone += lastTileX - firstTileX + 1; continue; }
     for (int tileX = firstTileX; tileX <= lastTileX; ++tileX) {
       const int wrappedX = (tileX % tilesPerAxis + tilesPerAxis) % tilesPerAxis;
       const String path = osmTilePath(physicalMapZoom, wrappedX, tileY);
-      if (cacheOsmTile(physicalMapZoom, wrappedX, tileY, path)) {
-        drewTile |= drawCachedOsmTile(path, tileX * 256 - left, tileY * 256 - top);
-      }
+      const bool cached = cacheOsmTile(physicalMapZoom, wrappedX, tileY, path);
+      const bool drawn = cached && drawCachedOsmTile(path, tileX * 256 - left, tileY * 256 - top);
+      if (drawn) ++tilesDrawn;
+      Serial.printf("tile %d/%d at %d,%d cached=%d drawn=%d\n", wrappedX, tileY,
+                    tileX * 256 - left, tileY * 256 - top, cached, drawn);
       ++mapRebuildDone;
       // Each tile is a separate HTTPS round trip. Service the admin interface
       // between them so the UI stays responsive and can show progress.
@@ -863,10 +987,10 @@ bool refreshPhysicalBaseMap() {
   memcpy(baseMap, framebuffer, W * H * sizeof(uint16_t));
   physicalMapReady = true;
   mapRebuildActive = false;
-  Serial.printf("Physical map %s at %.5f, %.5f radius %u nm zoom %u\n",
-                drewTile ? "ready" : "using radar fallback", homeLatitude,
+  Serial.printf("Physical map %d/%d tiles at %.5f, %.5f radius %u nm zoom %u\n",
+                tilesDrawn, mapRebuildTotal, homeLatitude,
                 homeLongitude, queryRadiusNm, physicalMapZoom);
-  return drewTile;
+  return tilesDrawn > 0;
 }
 
 // REG_PWM takes 0-255. Writing the raw percentage capped the panel at ~39%
@@ -931,7 +1055,10 @@ bool requestAccessToken() {
     return false;
   }
   JsonDocument tokenDoc;
-  DeserializationError error = deserializeJson(tokenDoc, http.getStream());
+  PsramSink tokenBody;
+  http.writeToStream(&tokenBody);
+  DeserializationError error =
+      deserializeJson(tokenDoc, tokenBody.data(), tokenBody.size());
   http.end();
   if (error || tokenDoc["access_token"].isNull()) {
     Serial.printf("OpenSky token JSON %s\n", error.c_str());
@@ -970,7 +1097,8 @@ void airportCode(JsonObject airport, char output[5]) {
   output[4] = 0;
 }
 
-RouteCacheEntry *routeForCallsign(const char *rawCallsign, int &lookupsUsed) {
+RouteCacheEntry *routeForCallsign(const char *rawCallsign, int &lookupsUsed,
+                                  WiFiClientSecure &client, HTTPClient &http) {
   char callsign[9];
   normalizeCallsign(rawCallsign, callsign);
   if (strlen(callsign) < 3) return nullptr;
@@ -1003,10 +1131,10 @@ RouteCacheEntry *routeForCallsign(const char *rawCallsign, int &lookupsUsed) {
   slot->occupied = true;
   slot->resolvedAt = slot->lastUsed = millis();
 
-  WiFiClientSecure client;
-  applyTlsPolicy(client);
-  HTTPClient http;
-  http.setTimeout(6000);
+  // client and http are owned by the caller and reused across the whole batch:
+  // api.adsbdb.com is the same host every time, so keeping the TLS session
+  // open turns N handshakes into one and cuts the window in which loop() -
+  // and therefore the web server - is blocked.
   String url = "https://api.adsbdb.com/v0/callsign/" + String(callsign);
   if (!http.begin(client, url)) return slot;
   http.addHeader("Accept-Encoding", "identity");
@@ -1142,6 +1270,53 @@ void renderBootScreen(const String &networkLine = "", uint16_t networkColour = R
   }
 }
 
+// Overview: the map on the left with a compact nearest-aircraft strip down
+// the right. Aircraft are clipped to the map pane so markers never spill
+// under the table.
+constexpr int OVERVIEW_MAP_WIDTH = W * 5 / 8;
+
+void renderOverviewPage() {
+  restoreMap();
+  for (int i = 0; i < lastCount; ++i) {
+    AircraftDisplay &display = latestAircraft[i];
+    if (display.x < 0 || display.x >= OVERVIEW_MAP_WIDTH - 10) continue;
+    if (display.y < 0 || display.y >= H) continue;
+    if (display.positionSource == 2) drawMlatPlane(display.x, display.y, display.track);
+    else drawAdsbLogo(display.x, display.y, display.track, display.flight, display.hex);
+  }
+
+  filledRect(OVERVIEW_MAP_WIDTH, 0, W - OVERVIEW_MAP_WIDTH, H, rgb(2, 10, 18));
+  line(OVERVIEW_MAP_WIDTH, 0, OVERVIEW_MAP_WIDTH, H - 1, rgb(30, 90, 120));
+  const int panelX = OVERVIEW_MAP_WIDTH + 8;
+  text5(panelX, 8, "NEAREST", rgb(80, 220, 255));
+  text5(panelX + 66, 8, "MI", rgb(120, 170, 200));
+  text5(panelX + 108, 8, "ALT", rgb(120, 170, 200));
+  line(panelX, 18, W - 6, 18, rgb(30, 90, 120));
+
+  const int rows = min(lastCount, (H - 46) / 22);
+  for (int i = 0; i < rows; ++i) {
+    AircraftDisplay &display = latestAircraft[i];
+    const int y = 26 + i * 22;
+    const char *callsign = strlen(display.flight) ? display.flight : display.hex;
+    text5(panelX, y, callsign, rgb(190, 235, 255));
+    char miles[8];
+    snprintf(miles, sizeof(miles), "%d", static_cast<int>(display.distanceMiles + 0.5f));
+    text5(panelX + 66, y, miles, rgb(245, 205, 65));
+    char altitude[10];
+    if (display.altitudeFt > 0) snprintf(altitude, sizeof(altitude), "%d", display.altitudeFt);
+    else snprintf(altitude, sizeof(altitude), "--");
+    text5(panelX + 108, y, altitude, rgb(150, 225, 190));
+  }
+
+  char footer[24];
+  snprintf(footer, sizeof(footer), "%d AIRCRAFT", lastCount);
+  text5(panelX, H - 16, footer, rgb(90, 190, 230));
+  char count[20];
+  snprintf(count, sizeof(count), "%d", lastCount);
+  status(count, rgb(35, 210, 80));
+  present();
+}
+
 void renderMapPage() {
   restoreMap();
   for (int i=0; i<lastCount; ++i) {
@@ -1205,7 +1380,7 @@ void renderTablePage() {
     text5(COL_DIR,y,compassDirection(display.track),rgb(255,255,255),2);
     text5(COL_ALT,y,altitude,rgb(255,255,255),2);
     text5(COL_ROUTE,y,routeLabel,rgb(130,210,255),2);
-    line(3,y+25,476,y+25,rgb(25,45,60));
+    line(3,y+25,W - 4,y+25,rgb(25,45,60));
   }
   char footer[24];
   if (creditsRemaining >= 0)
@@ -1298,13 +1473,15 @@ void renderRadarPage() {
 }
 
 const char *displayPageName() {
+  if (displayPage == DisplayPage::Overview) return "overview";
   if (displayPage == DisplayPage::Table) return "table";
   if (displayPage == DisplayPage::Radar) return "radar";
   return "map";
 }
 
 void renderCurrentPage() {
-  if (displayPage == DisplayPage::Table) renderTablePage();
+  if (displayPage == DisplayPage::Overview) renderOverviewPage();
+  else if (displayPage == DisplayPage::Table) renderTablePage();
   else if (displayPage == DisplayPage::Radar) renderRadarPage();
   else renderMapPage();
 }
@@ -1417,11 +1594,14 @@ void fetchAdsbV2Aircraft() {
                           "squawk", "category", "ownOp", "cou", "emergency", "mlat"};
   for (const char *field : fields) aircraftFilter[field] = true;
   JsonDocument doc(&psramJsonAllocator);
+  PsramSink body;
+  http.writeToStream(&body);
   const DeserializationError error = deserializeJson(
-      doc, http.getStream(), DeserializationOption::Filter(filter));
+      doc, body.data(), body.size(), DeserializationOption::Filter(filter));
   http.end();
   if (error || !doc["ac"].is<JsonArray>()) {
-    Serial.printf("%s JSON %s\n", apiProvider.c_str(), error.c_str());
+    Serial.printf("%s JSON %s (%u bytes)\n", apiProvider.c_str(), error.c_str(),
+                  static_cast<unsigned>(body.size()));
     finishFeedAttempt("Invalid response", code);
     status("JSON", rgb(245,30,35));
     present();
@@ -1479,10 +1659,25 @@ void fetchAdsbV2Aircraft() {
   }
   sortAircraftByDistance();
   int routeLookups = 0;
+  {
+  WiFiClientSecure routeClient;
+  applyTlsPolicy(routeClient);
+  HTTPClient routeHttp;
+  routeHttp.setReuse(true);
+  routeHttp.setTimeout(6000);
   for (int i = 0; i < lastCount; ++i) {
     AircraftDisplay &display = latestAircraft[i];
     if (display.positionSource == 2) ++lastMlat;
-    else routeForCallsign(display.flight, routeLookups);
+    else {
+      // Each lookup is a fresh TLS handshake to api.adsbdb.com and blocks the
+      // single-threaded web server. Service pending admin requests around it
+      // so the browser does not fill the listen backlog and get RST.
+      if (webServerReady) webServer.handleClient();
+      routeForCallsign(display.flight, routeLookups, routeClient, routeHttp);
+      if (webServerReady) webServer.handleClient();
+    }
+  }
+  routeHttp.end();
   }
   if (aircraftAtZeroMiles) beepAlert();
   lastFetchCompletedAt = millis();
@@ -1559,7 +1754,10 @@ void fetchAircraft() {
   String remainingHeader = http.header("X-Rate-Limit-Remaining");
   if (remainingHeader.length()) creditsRemaining = remainingHeader.toInt();
   JsonDocument doc(&psramJsonAllocator);
-  DeserializationError error=deserializeJson(doc,http.getStream());
+  PsramSink openSkyBody;
+  http.writeToStream(&openSkyBody);
+  DeserializationError error =
+      deserializeJson(doc, openSkyBody.data(), openSkyBody.size());
   http.end();
   if (error) {
     Serial.printf("JSON %s\n",error.c_str()); finishFeedAttempt("Invalid response", code);
@@ -1610,13 +1808,23 @@ void fetchAircraft() {
   doc.clear();
   }
   int routeLookups = 0;
+  {
+  WiFiClientSecure routeClient;
+  applyTlsPolicy(routeClient);
+  HTTPClient routeHttp;
+  routeHttp.setReuse(true);
+  routeHttp.setTimeout(6000);
   for (int i=0; i<lastCount; ++i) {
     AircraftDisplay &display = latestAircraft[i];
     if (display.positionSource == 2) {
       ++lastMlat;
     } else {
-      routeForCallsign(display.flight, routeLookups);
+      if (webServerReady) webServer.handleClient();
+      routeForCallsign(display.flight, routeLookups, routeClient, routeHttp);
+      if (webServerReady) webServer.handleClient();
     }
+  }
+  routeHttp.end();
   }
   if (aircraftAtZeroMiles) beepAlert();
   lastFetchCompletedAt = millis();
@@ -1714,7 +1922,10 @@ bool checkGithubUpdate() {
     return false;
   }
   JsonDocument doc;
-  const DeserializationError error = deserializeJson(doc, http.getStream());
+  PsramSink releaseBody;
+  http.writeToStream(&releaseBody);
+  const DeserializationError error =
+      deserializeJson(doc, releaseBody.data(), releaseBody.size());
   http.end();
   if (error) {
     githubUpdateStatus = "Invalid GitHub response";
@@ -2239,15 +2450,17 @@ void handlePageControl() {
   if (!requireWebAuthentication()) return;
   if (!requireCsrfToken()) return;
   const String page = webServer.arg("page");
-  if (page != "map" && page != "table" && page != "radar") {
-    sendMessage(400, "Page must be map, radar or table");
+  if (page != "overview" && page != "map" && page != "table" && page != "radar") {
+    sendMessage(400, "Page must be overview, map, radar or table");
     return;
   }
-  displayPage = page == "table" ? DisplayPage::Table :
+  displayPage = page == "overview" ? DisplayPage::Overview :
+                page == "table" ? DisplayPage::Table :
                 page == "radar" ? DisplayPage::Radar : DisplayPage::Map;
   settingsStore.putUChar("display-page", static_cast<uint8_t>(displayPage));
   renderCurrentPage();
-  if (displayPage == DisplayPage::Table) sendMessage(200, "Table page selected");
+  if (displayPage == DisplayPage::Overview) sendMessage(200, "Overview page selected");
+  else if (displayPage == DisplayPage::Table) sendMessage(200, "Table page selected");
   else if (displayPage == DisplayPage::Radar) sendMessage(200, "Radar page selected");
   else sendMessage(200, "Map page selected");
 }
@@ -2259,16 +2472,10 @@ void handleDisplaySettings() {
     soundAlerts = webServer.arg("sound") == "1";
     settingsStore.putBool("sound", soundAlerts);
   }
-  if (webServer.hasArg("brightness")) {
-    long brightness = 0;
-    if (!parseStrictLong(webServer.arg("brightness"), brightness) || brightness < 10 || brightness > 100) {
-      sendMessage(400, "Brightness must be a whole number from 10 to 100");
-      return;
-    }
-    brightnessPercent = static_cast<uint8_t>(brightness);
-    settingsStore.putUChar("brightness", brightnessPercent);
-    applyBrightness(brightnessPercent);
-  }
+  // The brightness slider is gone: the CH422G drives the backlight enable as a
+  // plain switch with no PWM channel, so any value between 10 and 100 looked
+  // identical on the 800x480 boards. The backlight is still switched on at
+  // boot via applyBrightness().
   sendMessage(200, "Display settings saved");
 }
 
@@ -2598,7 +2805,7 @@ void setup() {
   if (!isfinite(homeLatitude) || homeLatitude < -85.0f || homeLatitude > 85.0f) homeLatitude = DEFAULT_HOME_LAT;
   if (!isfinite(homeLongitude) || homeLongitude < -180.0f || homeLongitude > 180.0f) homeLongitude = DEFAULT_HOME_LON;
   physicalMapZoom = constrain(settingsStore.getUChar("map-zoom", zoomForRadius()), 3, 16);
-  displayPage = static_cast<DisplayPage>(constrain(settingsStore.getUChar("display-page", 0), 0, 2));
+  displayPage = static_cast<DisplayPage>(constrain(settingsStore.getUChar("display-page", 0), 0, DISPLAY_PAGE_COUNT - 1));
   soundAlerts = settingsStore.getBool("sound", true);
   brightnessPercent = settingsStore.getUChar("brightness", 100);
   brightnessPercent = constrain(brightnessPercent, 10, 100);
@@ -2735,14 +2942,26 @@ void loop() {
   }
   // Evaluate both: short-circuiting used to leave bootButtonPending set, which
   // advanced the page twice on the following pass.
-  const bool touched = touchTapped();
+  const TouchGesture gesture = touchGesture();
   const bool pressed = bootButtonTapped();
-  if (touched || pressed) {
-    displayPage = static_cast<DisplayPage>((static_cast<uint8_t>(displayPage) + 1) % 3);
+  int pageStep = 0;
+  // Swipe right advances Overview -> Table -> Map -> Radar and wraps; swipe
+  // left walks back. Tap and the boot button both advance.
+  if (gesture == TouchGesture::SwipeRight) pageStep = 1;
+  else if (gesture == TouchGesture::SwipeLeft) pageStep = -1;
+  else if (gesture == TouchGesture::Tap || pressed) pageStep = 1;
+  if (pageStep) {
+    const int pageCount = DISPLAY_PAGE_COUNT;
+    displayPage = static_cast<DisplayPage>(
+        (static_cast<int>(displayPage) + pageStep + pageCount) % pageCount);
     pageSavePending = true;
     pageSaveAt = millis() + 5000UL;
     renderCurrentPage();
-    Serial.printf("Page: %s\n", displayPageName());
+    Serial.printf("Page: %s (%s)\n", displayPageName(),
+                  gesture == TouchGesture::SwipeLeft    ? "swipe left"
+                  : gesture == TouchGesture::SwipeRight ? "swipe right"
+                  : gesture == TouchGesture::Tap        ? "tap"
+                                                        : "button");
   }
   if (displayPage == DisplayPage::Radar && static_cast<int32_t>(millis() - nextRadarFrameAt) >= 0) {
     // Full-screen PSRAM copies faster than this can starve the RGB DMA and
@@ -2753,7 +2972,10 @@ void loop() {
     nextRadarFrameAt = millis() + 750;
   }
   if (static_cast<int32_t>(millis()-nextFetchAt) >= 0) {
+    const uint32_t fetchStartedAt = millis();
     fetchAircraft();
+    Serial.printf("fetchAircraft blocked the loop for %lu ms\n",
+                  static_cast<unsigned long>(millis() - fetchStartedAt));
     if (openSkyAuthRetryPending) nextFetchAt = millis() + 1000UL;
     else if (static_cast<int32_t>(millis()-nextFetchAt) >= 0) nextFetchAt=millis()+REFRESH_MS;
   }
