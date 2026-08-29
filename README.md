@@ -7,7 +7,23 @@
 
 Firmware for the **Waveshare ESP32-S3 Touch-LCD-4 Rev 4.0, 480 × 480, non-touch panel**. It retrieves nearby ADS-B and MLAT aircraft, plots them on an OpenStreetMap base map on the LCD, and provides a password-protected web administration interface on the local network.
 
-Current firmware: **v2.5.0**
+Current firmware: **v2.5.1**
+
+### v2.5.1 correctness and hardening
+
+- Corrects the RGB panel timings to the Waveshare Rev 4.0 reference and sets an explicit 16.5 MHz pixel clock, raising the refresh rate from 42 Hz to about 59 Hz
+- Reports at boot whether the vertical-blank DMA restart is actually supported by the running sdkconfig
+- Validates TLS certificates on every outbound HTTPS request instead of trusting any certificate
+- Requires a per-boot request token on every state-changing web route, so cached Basic credentials alone can no longer drive the device from another site
+- Persists staged-update metadata so firmware staged on SD before a reboot can still be verified and installed
+- Evicts cached map tiles when the view changes or storage runs low, and deletes tiles that fail to decode
+- Restores the previous Wi-Fi network automatically if new credentials fail to connect within 45 seconds
+- Scales LCD brightness to the full 0-255 range instead of writing the raw percentage
+- Reports genuine LCD map rebuild progress and keeps the admin interface responsive while tiles download
+- Falls back to the release SHA256SUMS.txt when the GitHub API omits an asset digest
+- Accepts signing keys up to RSA-4096 rather than only RSA-2048
+- Stops compiling OpenSky credentials into the binary unless `ADSB_BAKE_CREDENTIALS` is defined
+- Fetches the aircraft table only for pages that display it
 
 ### v2.5.0 SD storage and safer updates
 
@@ -130,7 +146,7 @@ Select an aircraft provider and replace or clear the credentials required by tha
 
 ### Firmware
 
-Install a local `.bin` image, check GitHub for a new release, or install the latest release directly. The green update button pulses when a newer semantic version is available. With microSD present the download is staged there; otherwise direct OTA is used. Both routes require the published size, SHA-256 digest, RSA signature and ESP32 image header to validate before installation. The page reports card state and has a manual rescan control.
+Install a local `.bin` image, check GitHub for a new release, or install the latest release directly. The green update button pulses when a newer semantic version is available. With microSD present the download is staged there; otherwise direct OTA is used. Both **GitHub** routes require the published size, SHA-256 digest, RSA signature and ESP32 image header to validate before installation. A **local `.bin` upload is not signature-checked** — it is validated only for the ESP32 image header and a minimum size, so upload only images you built or trust. The page reports card state and has a manual rescan control.
 
 ![Firmware page](docs/screenshots/firmware.png)
 
@@ -225,6 +241,8 @@ Map data is © OpenStreetMap contributors. The browser and LCD show attribution.
 ## Security notes
 
 - All web-management and JSON API routes use HTTP Basic authentication.
+- Every state-changing route additionally requires an `X-ADSB-Token` header carrying a token regenerated at each boot. This blocks cross-site requests that would otherwise ride on cached Basic credentials.
+- Outbound HTTPS connections validate certificates against the ESP-IDF root bundle. Build with `-DADSB_TLS_INSECURE=1` only if that bundle is unavailable in your toolchain.
 - Change the initial password before placing the receiver on a shared network.
 - The admin interface is intended for a trusted local network and does not provide TLS.
 - Wi-Fi and provider credentials remain in ESP32 NVS and are excluded from Git.
@@ -235,6 +253,7 @@ Map data is © OpenStreetMap contributors. The browser and LCD show attribution.
 - If Wi-Fi fails, connect to the `ADSBMAP` access point and open `http://192.168.4.1/`.
 - If the LCD says **Rebuilding LCD map**, leave the receiver powered while it downloads and caches tiles for the newly saved position, range, or zoom.
 - If aircraft stop updating, open **Data API**, run **Refresh / test feed**, and check the returned HTTP status and latency.
+- The browser map uses Leaflet and OpenStreetMap tiles loaded from the internet. On an isolated network the **Map** page shows a fallback message; every other page, and the LCD map, still work from cached tiles.
 - For support, download the JSON file from **Device → Download diagnostics**. It contains useful runtime state without passwords or API secrets.
 - For recovery, use the online USB installer. A factory flash erases configuration, while normal OTA firmware preserves it.
 
@@ -254,3 +273,26 @@ The script captures every current admin section plus the public USB installer in
 ## Copyright
 
 Firmware (c) 2026 2E0LXY / D. Loxley. All rights reserved. No open-source licence is granted unless a `LICENSE` file is added to the repository.
+
+## Build flags
+
+| Flag | Default | Effect |
+| --- | --- | --- |
+| `ADSB_ENABLE_TOUCH` | `0` | The Rev 4.0 480 x 480 panel has no touch controller. Set to `1` to probe the GT911 at boot and poll it each loop. |
+| `ADSB_TLS_INSECURE` | `0` | Set to `1` to skip TLS certificate validation. Only for toolchains without the ESP-IDF certificate bundle. |
+| `ADSB_BAKE_CREDENTIALS` | undefined | Compiles OpenSky credentials from `credentials.json` into the image. Never define this for a build you intend to publish; compiled-in secrets are recoverable with `strings firmware.bin`. |
+| `DISPLAY_DIAGNOSTIC` | undefined | Replaces normal operation with a colour-cycle panel test. |
+
+Serial ports are no longer hard-coded. Select one per invocation:
+
+```powershell
+pio run -t upload --upload-port COM25
+```
+
+## Panel timings
+
+The RGB timings come from the Waveshare Rev 4.0 reference, retained at
+`docs/hardware-reference-rev3-ST7701.h`: HPW 8, HBP 10, HFP 50, VPW 2, VBP 18,
+VFP 8, with an explicit 16.5 MHz pixel clock giving roughly 59 Hz over the
+548 x 508 total. If the panel shows tearing or a horizontal offset, these
+constants at the top of `src/main.cpp` are the first thing to adjust.

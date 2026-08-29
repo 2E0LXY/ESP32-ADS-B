@@ -3,3 +3,4 @@ credentials.json
 *.key
 *.pem
 release/*.bin
+docs/firmware/

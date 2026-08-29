@@ -1,8 +1,9 @@
 name: Publish USB firmware installer
 
 on:
-  release:
-    types: [published]
+  # Only trigger once the whole release workflow has finished. The
+  # release:published event fires while assets are still uploading, so
+  # `gh release download` could race the factory image.
   workflow_run:
     workflows: ["Build firmware release"]
     types: [completed]
@@ -30,9 +31,13 @@ jobs:
         id: release
         env:
           GH_TOKEN: ${{ github.token }}
-          EVENT_TAG: ${{ github.event.release.tag_name }}
+          EVENT_TAG: ${{ github.event.workflow_run.head_branch }}
         run: |
           tag="$EVENT_TAG"
+          case "$tag" in
+            v*) ;;
+            *) tag="" ;;
+          esac
           if [ -z "$tag" ]; then
             tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)"
           fi

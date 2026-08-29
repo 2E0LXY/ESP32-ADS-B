@@ -17,6 +17,8 @@
 #include <mbedtls/sha256.h>
 #include <mbedtls/pk.h>
 #include <math.h>
+#include <vector>
+#include <esp_random.h>
 
 #include "WS_CH32_IO.h"
 #include "boot_asset.h"
@@ -24,22 +26,69 @@
 #include "opensky_secrets.h"
 #include "web_ui.h"
 
+// The Rev 4.0 480x480 panel has no touch controller. Building with
+// -DADSB_ENABLE_TOUCH=1 re-enables GT911 probing and per-loop polling.
+#ifndef ADSB_ENABLE_TOUCH
+#define ADSB_ENABLE_TOUCH 0
+#endif
+
+// Set to 1 only if the certificate bundle is unavailable in your build.
+#ifndef ADSB_TLS_INSECURE
+#define ADSB_TLS_INSECURE 0
+#endif
+
 // HTTPS handshakes and ArduinoJson parsing exceed the default 8 KB loop stack.
 SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 
+// GPIO 1 and 2 are the ST7701 configuration SPI (LCD_MOSI and LCD_CLK in the
+// Waveshare reference header) and are re-used below as SDMMC CMD and CLK.
+// That is only safe because the panel is fully initialised in setup() before
+// mountSdCard() runs, and its chip select (GPIO 42) idles high afterwards.
+// Never re-initialise the display once the card is mounted.
+constexpr int8_t LCD_SPI_CS_PIN = 42;
+constexpr int8_t LCD_SPI_SCK_PIN = 2;
+constexpr int8_t LCD_SPI_MOSI_PIN = 1;
+
+// Timings from the Waveshare Rev 4.0 reference (HPW 8, HBP 10, HFP 50,
+// VPW 2, VBP 18, VFP 8). The previous values transposed HBP and HFP and used
+// VPW 8 / VBP 20 / VFP 10. No pixel clock was passed either, so the library
+// fell back to 12 MHz, giving 12e6 / (548 * 518) = 42 Hz. 16.5 MHz over the
+// corrected 548 x 508 total gives ~59 Hz.
+constexpr uint16_t PANEL_HSYNC_POLARITY = 1;
+constexpr uint16_t PANEL_HSYNC_FRONT_PORCH = 50;
+constexpr uint16_t PANEL_HSYNC_PULSE_WIDTH = 8;
+constexpr uint16_t PANEL_HSYNC_BACK_PORCH = 10;
+constexpr uint16_t PANEL_VSYNC_POLARITY = 1;
+constexpr uint16_t PANEL_VSYNC_FRONT_PORCH = 8;
+constexpr uint16_t PANEL_VSYNC_PULSE_WIDTH = 2;
+constexpr uint16_t PANEL_VSYNC_BACK_PORCH = 18;
+constexpr uint16_t PANEL_PCLK_ACTIVE_NEG = 0;
+constexpr int32_t PANEL_PCLK_HZ = 16500000L;
+
 Arduino_DataBus *bus = new Arduino_SWSPI(
-    GFX_NOT_DEFINED, 42, 2, 1, GFX_NOT_DEFINED);
+    GFX_NOT_DEFINED, LCD_SPI_CS_PIN, LCD_SPI_SCK_PIN, LCD_SPI_MOSI_PIN,
+    GFX_NOT_DEFINED);
 Arduino_ESP32RGBPanel *rgbpanel = new Arduino_ESP32RGBPanel(
     40, 39, 38, 41,
     46, 3, 8, 18, 17,
     14, 13, 12, 11, 10, 9,
     5, 45, 48, 47, 21,
-    1, 10, 8, 50,
-    1, 10, 8, 20);
+    PANEL_HSYNC_POLARITY, PANEL_HSYNC_FRONT_PORCH, PANEL_HSYNC_PULSE_WIDTH,
+    PANEL_HSYNC_BACK_PORCH,
+    PANEL_VSYNC_POLARITY, PANEL_VSYNC_FRONT_PORCH, PANEL_VSYNC_PULSE_WIDTH,
+    PANEL_VSYNC_BACK_PORCH,
+    PANEL_PCLK_ACTIVE_NEG, PANEL_PCLK_HZ);
 Arduino_RGB_Display *gfx = new Arduino_RGB_Display(
     480, 480, rgbpanel, 2, true,
     bus, GFX_NOT_DEFINED, st7701_type1_init_operations,
     sizeof(st7701_type1_init_operations));
+
+#if !ADSB_TLS_INSECURE
+// Declared at global scope on purpose: an unnamed namespace would give these
+// internal linkage and the asm-labelled bundle symbols would not resolve.
+extern const uint8_t rootca_crt_bundle_start[] asm("_binary_x509_crt_bundle_start");
+extern const uint8_t rootca_crt_bundle_end[] asm("_binary_x509_crt_bundle_end");
+#endif
 
 namespace {
 constexpr int W = 480;
@@ -54,13 +103,18 @@ constexpr int ROUTE_CACHE_SIZE = 48;
 constexpr int MAX_ROUTE_LOOKUPS_PER_REFRESH = 4;
 constexpr uint32_t ROUTE_CACHE_MS = 6UL * 60UL * 60UL * 1000UL;
 constexpr uint32_t ROUTE_RETRY_MS = 5UL * 60UL * 1000UL;
-constexpr char FIRMWARE_VERSION[] = "2.5.0";
+constexpr char FIRMWARE_VERSION[] = "2.5.1";
 constexpr char DEVICE_HOSTNAME[] = "adsb-map";
 constexpr char WEB_USERNAME[] = "admin";
 constexpr char GITHUB_OWNER[] = "2E0LXY";
 constexpr char GITHUB_REPOSITORY[] = "ESP32-ADS-B";
 constexpr char GITHUB_RELEASE_API[] = "https://api.github.com/repos/2E0LXY/ESP32-ADS-B/releases/latest";
 constexpr uint32_t UPDATE_CHECK_MS = 6UL * 60UL * 60UL * 1000UL;
+// Sized for RSA-4096 so rotating the signing key does not silently disable
+// every OTA path. verifyFirmwareSignature() checks the actual length.
+constexpr size_t MAX_SIGNATURE_BYTES = 512;
+constexpr size_t MIN_SIGNATURE_BYTES = 64;
+constexpr uint64_t MIN_TILE_CACHE_FREE_BYTES = 192UL * 1024UL;
 constexpr int SD_CLK_PIN = 2;
 constexpr int SD_CMD_PIN = 1;
 constexpr int SD_D0_PIN = 4;
@@ -185,7 +239,7 @@ String githubFirmwareUrl;
 String githubSignatureUrl;
 String githubFirmwareSha256;
 size_t githubFirmwareSize = 0;
-uint8_t githubSignature[256] = {};
+uint8_t githubSignature[MAX_SIGNATURE_BYTES] = {};
 size_t githubSignatureSize = 0;
 String githubUpdateStatus = "Not checked";
 uint32_t nextGithubCheckAt = 0;
@@ -197,6 +251,40 @@ uint64_t sdUsedBytes = 0;
 bool stagedUpdateReady = false;
 String stagedUpdateVersion;
 String stagedUpdateSha256;
+size_t stagedUpdateSize = 0;
+String csrfToken;
+bool mapRebuildActive = false;
+int mapRebuildDone = 0;
+int mapRebuildTotal = 0;
+bool openSkyAuthRetryPending = false;
+bool pageSavePending = false;
+uint32_t pageSaveAt = 0;
+String previousWifiSsid;
+String previousWifiPassword;
+uint32_t wifiRollbackAt = 0;
+
+// Certificate validation for every outbound HTTPS request. The OTA image is
+// separately RSA-signed, but the RapidAPI key and the OpenSky client secret
+// were previously sent over an unauthenticated channel. Build with
+// -DADSB_TLS_INSECURE=1 to fall back to the old behaviour.
+void applyTlsPolicy(WiFiClientSecure &client) {
+#if ADSB_TLS_INSECURE
+  client.setInsecure();
+#else
+  client.setCACertBundle(
+      rootca_crt_bundle_start,
+      static_cast<size_t>(rootca_crt_bundle_end - rootca_crt_bundle_start));
+#endif
+}
+
+// One User-Agent for every outbound request, always matching the running
+// build. OpenStreetMap's tile policy requires an identifying, accurate UA.
+const String &userAgent() {
+  static const String agent =
+      String("2E0LXY-ESP32-ADSB/") + FIRMWARE_VERSION +
+      " (+https://github.com/2E0LXY/ESP32-ADS-B)";
+  return agent;
+}
 
 String bytesToHex(const uint8_t *bytes, size_t length) {
   static const char digits[] = "0123456789abcdef";
@@ -212,7 +300,11 @@ String bytesToHex(const uint8_t *bytes, size_t length) {
 bool hexToBytes(const String &hex, uint8_t *output, size_t length) {
   if (hex.length() != length * 2) return false;
   for (size_t i = 0; i < length; ++i) {
-    char pair[3] = {hex[i * 2], hex[i * 2 + 1], 0};
+    const char high = hex[i * 2];
+    const char low = hex[i * 2 + 1];
+    if (!isxdigit(static_cast<unsigned char>(high)) ||
+        !isxdigit(static_cast<unsigned char>(low))) return false;
+    char pair[3] = {high, low, 0};
     char *end = nullptr;
     const long value = strtol(pair, &end, 16);
     if (end != pair + 2) return false;
@@ -222,7 +314,7 @@ bool hexToBytes(const String &hex, uint8_t *output, size_t length) {
 }
 
 bool verifyFirmwareSignature(const String &digest) {
-  if (githubSignatureSize != sizeof(githubSignature)) return false;
+  if (githubSignatureSize < MIN_SIGNATURE_BYTES) return false;
   uint8_t hash[32];
   if (!hexToBytes(digest, hash, sizeof(hash))) return false;
   mbedtls_pk_context key;
@@ -230,9 +322,12 @@ bool verifyFirmwareSignature(const String &digest) {
   const int parsed = mbedtls_pk_parse_public_key(
       &key, reinterpret_cast<const unsigned char *>(FIRMWARE_PUBLIC_KEY),
       strlen(FIRMWARE_PUBLIC_KEY) + 1);
-  const int verified = parsed == 0 ? mbedtls_pk_verify(
+  // Reject anything that is not the RSA key this firmware expects rather than
+  // relying on mbedtls_pk_verify alone to notice a substituted key type.
+  const bool usableKey = parsed == 0 && mbedtls_pk_can_do(&key, MBEDTLS_PK_RSA);
+  const int verified = usableKey ? mbedtls_pk_verify(
       &key, MBEDTLS_MD_SHA256, hash, sizeof(hash), githubSignature,
-      githubSignatureSize) : parsed;
+      githubSignatureSize) : (parsed == 0 ? -1 : parsed);
   mbedtls_pk_free(&key);
   return verified == 0;
 }
@@ -241,19 +336,22 @@ bool downloadFirmwareSignature() {
   githubSignatureSize = 0;
   if (!githubSignatureUrl.length()) return false;
   WiFiClientSecure client;
-  client.setInsecure();
+  applyTlsPolicy(client);
   HTTPClient http;
   http.setTimeout(12000);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   if (!http.begin(client, githubSignatureUrl)) return false;
-  http.addHeader("User-Agent", "2E0LXY-ESP32-ADSB/" + String(FIRMWARE_VERSION));
+  http.addHeader("User-Agent", userAgent());
   const int code = http.GET();
-  if (code == HTTP_CODE_OK && http.getSize() == static_cast<int>(sizeof(githubSignature))) {
+  const int advertised = http.getSize();
+  if (code == HTTP_CODE_OK && advertised >= static_cast<int>(MIN_SIGNATURE_BYTES) &&
+      advertised <= static_cast<int>(MAX_SIGNATURE_BYTES)) {
     NetworkClient *stream = http.getStreamPtr();
-    githubSignatureSize = stream->readBytes(githubSignature, sizeof(githubSignature));
+    githubSignatureSize = stream->readBytes(githubSignature, advertised);
+    if (githubSignatureSize != static_cast<size_t>(advertised)) githubSignatureSize = 0;
   }
   http.end();
-  return githubSignatureSize == sizeof(githubSignature);
+  return githubSignatureSize >= MIN_SIGNATURE_BYTES;
 }
 
 const char *sdTypeName(sdcard_type_t type) {
@@ -289,7 +387,21 @@ bool mountSdCard() {
   sdCardType = sdTypeName(SD_MMC.cardType());
   sdTotalBytes = SD_MMC.totalBytes();
   sdUsedBytes = SD_MMC.usedBytes();
+  // Restore the staging metadata so a firmware staged before a reboot can
+  // still be validated and installed; discard the file if it cannot be.
+  stagedUpdateVersion = settingsStore.getString("staged-ver", "");
+  stagedUpdateSha256 = settingsStore.getString("staged-sha", "");
+  stagedUpdateSize = settingsStore.getULong("staged-size", 0);
   stagedUpdateReady = SD_MMC.exists(SD_UPDATE_FILE);
+  if (stagedUpdateReady && (!stagedUpdateSize || stagedUpdateSha256.length() != 64)) {
+    SD_MMC.remove(SD_UPDATE_FILE);
+    stagedUpdateReady = false;
+    stagedUpdateVersion = "";
+    stagedUpdateSha256 = "";
+    stagedUpdateSize = 0;
+    Serial.println("Discarded staged firmware with no stored metadata");
+  }
+  SD_MMC.remove(SD_UPDATE_PART);
   Serial.printf("SD card ready: %s, %.1f MB free\n", sdCardType.c_str(),
                 (sdTotalBytes - sdUsedBytes) / 1048576.0);
   return true;
@@ -481,7 +593,7 @@ const uint8_t *glyph(char ch) {
 
 void text5(int x, int y, const char *s, uint16_t c, int scale=1) {
   while (*s) {
-    const uint8_t *g = glyph(toupper(*s++));
+    const uint8_t *g = glyph(static_cast<char>(toupper(static_cast<unsigned char>(*s++))));
     for (int col=0; col<5; ++col) for (int row=0; row<7; ++row)
       if (g[col] & (1 << row)) for(int yy=0;yy<scale;++yy) for(int xx=0;xx<scale;++xx)
         pixel(x+col*scale+xx, y+row*scale+yy, c);
@@ -509,7 +621,7 @@ double osmWorldY(double latitude, uint8_t zoom) {
 uint8_t zoomForRadius() {
   const double diameterMeters = max(1.0, static_cast<double>(queryRadiusNm) * 1852.0 * 2.2);
   const double ratio = 156543.03392 * cos(radians(homeLatitude)) * W / diameterMeters;
-  return constrain(static_cast<int>(floor(log(ratio) / log(2.0))), 3, 15);
+  return constrain(static_cast<int>(floor(log(ratio) / log(2.0))), 3, 16);
 }
 
 bool mapPoint(float lat, float lon, int &x, int &y) {
@@ -559,17 +671,69 @@ String osmTilePath(uint8_t zoom, int tileX, int tileY) {
          String(tileX) + "_" + String(tileY) + ".png";
 }
 
+uint64_t tileCacheFreeBytes() {
+  if (sdMounted) {
+    const uint64_t total = SD_MMC.totalBytes();
+    const uint64_t used = SD_MMC.usedBytes();
+    return total > used ? total - used : 0;
+  }
+  const size_t total = LittleFS.totalBytes();
+  const size_t used = LittleFS.usedBytes();
+  return total > used ? total - used : 0;
+}
+
+// A position, range or zoom change invalidates every cached tile, and nothing
+// previously deleted them. Once the partition filled, cacheOsmTile() failed
+// silently and the LCD stayed on the radar fallback for good.
+int clearTileCache(bool littleFsOnly = false) {
+  const bool useSd = sdMounted && !littleFsOnly;
+  fs::FS &cache = useSd ? static_cast<fs::FS &>(SD_MMC) : static_cast<fs::FS &>(LittleFS);
+  const String directory = useSd ? "/adsb" : "/";
+  std::vector<String> victims;
+  File dir = cache.open(directory.c_str());
+  if (!dir || !dir.isDirectory()) {
+    if (dir) dir.close();
+    return 0;
+  }
+  for (File entry = dir.openNextFile(); entry; entry = dir.openNextFile()) {
+    String name = entry.name();
+    const int slash = name.lastIndexOf('/');
+    if (slash >= 0) name = name.substring(slash + 1);
+    if (name.startsWith("osm_") && name.endsWith(".png")) {
+      victims.push_back(directory.endsWith("/") ? directory + name
+                                                : directory + "/" + name);
+    }
+    entry.close();
+  }
+  dir.close();
+  int removed = 0;
+  for (const String &victim : victims) {
+    if (cache.remove(victim)) ++removed;
+    delay(0);
+  }
+  if (removed) Serial.printf("Removed %d cached map tiles from %s\n", removed,
+                             useSd ? "SD" : "LittleFS");
+  return removed;
+}
+
 bool cacheOsmTile(uint8_t zoom, int tileX, int tileY, const String &path) {
   fs::FS &cache = sdMounted ? static_cast<fs::FS &>(SD_MMC) : static_cast<fs::FS &>(LittleFS);
   if (cache.exists(path)) return true;
   if (WiFi.status() != WL_CONNECTED) return false;
+  if (tileCacheFreeBytes() < MIN_TILE_CACHE_FREE_BYTES) {
+    clearTileCache();
+    if (tileCacheFreeBytes() < MIN_TILE_CACHE_FREE_BYTES) {
+      Serial.println("Tile cache storage is full; skipping tile download");
+      return false;
+    }
+  }
   WiFiClientSecure client;
-  client.setInsecure();
+  applyTlsPolicy(client);
   HTTPClient http;
   http.setTimeout(12000);
   const String url = "https://tile.openstreetmap.org/" + String(zoom) + "/" + String(tileX) + "/" + String(tileY) + ".png";
   if (!http.begin(client, url)) return false;
-  http.addHeader("User-Agent", "2E0LXY-ADSB-Map/2.1 (ESP32-S3 personal display)");
+  http.addHeader("User-Agent", userAgent());
   const int code = http.GET();
   if (code != HTTP_CODE_OK) {
     Serial.printf("OSM tile %d/%d/%d HTTP %d\n", zoom, tileX, tileY, code);
@@ -596,13 +760,18 @@ bool drawCachedOsmTile(const String &path, int screenX, int screenY) {
   if (!data) { file.close(); return false; }
   const size_t read = file.read(data, size);
   file.close();
-  if (read != size) { free(data); return false; }
+  if (read != size) { heap_caps_free(data); return false; }
   pngTileScreenX = screenX;
   pngTileScreenY = screenY;
   const int opened = pngDecoder.openRAM(data, size, drawPngLine);
   const bool success = opened == PNG_SUCCESS && pngDecoder.decode(nullptr, 0) == PNG_SUCCESS;
   if (opened == PNG_SUCCESS) pngDecoder.close();
-  free(data);
+  heap_caps_free(data);
+  // A truncated or corrupt tile used to persist for ever and never redraw.
+  if (!success) {
+    cache.remove(path);
+    Serial.printf("Removed undecodable cached tile %s\n", path.c_str());
+  }
   return success;
 }
 
@@ -619,7 +788,10 @@ void drawLocationFallback() {
 }
 
 bool refreshPhysicalBaseMap() {
-  if (!framebuffer || !baseMap) return false;
+  if (!framebuffer || !baseMap || mapRebuildActive) return false;
+  mapRebuildActive = true;
+  mapRebuildDone = 0;
+  mapRebuildTotal = 0;
   drawLocationFallback();
   const double centerX = osmWorldX(homeLongitude, physicalMapZoom);
   const double centerY = osmWorldY(homeLatitude, physicalMapZoom);
@@ -631,23 +803,38 @@ bool refreshPhysicalBaseMap() {
   const int lastTileY = static_cast<int>(floor((top + H - 1) / 256.0));
   const int tilesPerAxis = 1 << physicalMapZoom;
   bool drewTile = false;
+  mapRebuildTotal = max(0, (lastTileY - firstTileY + 1) * (lastTileX - firstTileX + 1));
   for (int tileY = firstTileY; tileY <= lastTileY; ++tileY) {
-    if (tileY < 0 || tileY >= tilesPerAxis) continue;
+    if (tileY < 0 || tileY >= tilesPerAxis) { mapRebuildDone += lastTileX - firstTileX + 1; continue; }
     for (int tileX = firstTileX; tileX <= lastTileX; ++tileX) {
       const int wrappedX = (tileX % tilesPerAxis + tilesPerAxis) % tilesPerAxis;
       const String path = osmTilePath(physicalMapZoom, wrappedX, tileY);
-      if (!cacheOsmTile(physicalMapZoom, wrappedX, tileY, path)) continue;
-      drewTile |= drawCachedOsmTile(path, tileX * 256 - left, tileY * 256 - top);
+      if (cacheOsmTile(physicalMapZoom, wrappedX, tileY, path)) {
+        drewTile |= drawCachedOsmTile(path, tileX * 256 - left, tileY * 256 - top);
+      }
+      ++mapRebuildDone;
+      // Each tile is a separate HTTPS round trip. Service the admin interface
+      // between them so the UI stays responsive and can show progress.
+      if (webServerReady) webServer.handleClient();
     }
   }
   filledRect(0, H - 15, 142, 15, rgb(0, 0, 0));
   text5(3, H - 12, "(C) OPENSTREETMAP", rgb(255, 255, 255));
   memcpy(baseMap, framebuffer, W * H * sizeof(uint16_t));
   physicalMapReady = true;
+  mapRebuildActive = false;
   Serial.printf("Physical map %s at %.5f, %.5f radius %u nm zoom %u\n",
                 drewTile ? "ready" : "using radar fallback", homeLatitude,
                 homeLongitude, queryRadiusNm, physicalMapZoom);
   return drewTile;
+}
+
+// REG_PWM takes 0-255. Writing the raw percentage capped the panel at ~39%
+// and meant "100%" from the web UI was dimmer than the boot default.
+bool applyBrightness(uint8_t percent) {
+  const uint8_t duty = static_cast<uint8_t>(
+      (constrain(static_cast<int>(percent), 0, 100) * 255 + 50) / 100);
+  return WS_CH32_IO::setPwm(Wire, duty);
 }
 
 void beepAlert() {
@@ -682,7 +869,7 @@ String urlEncode(const char *value) {
 
 bool requestAccessToken() {
   WiFiClientSecure client;
-  client.setInsecure();
+  applyTlsPolicy(client);
   HTTPClient http;
   http.setTimeout(8000);
   if (!http.begin(client, TOKEN_URL)) return false;
@@ -720,7 +907,7 @@ void normalizeCallsign(const char *input, char output[9]) {
   int n = 0;
   if (input) {
     while (*input && n < 8) {
-      if (*input != ' ') output[n++] = toupper(*input);
+      if (*input != ' ') output[n++] = toupper(static_cast<unsigned char>(*input));
       ++input;
     }
   }
@@ -747,6 +934,9 @@ RouteCacheEntry *routeForCallsign(const char *rawCallsign, int &lookupsUsed) {
       const uint32_t lifetime = entry.hasRoute ? ROUTE_CACHE_MS : ROUTE_RETRY_MS;
       if (millis() - entry.resolvedAt < lifetime) return &entry;
       slot = &entry;
+      // Keep the stale entry usable if the refresh budget is already spent,
+      // rather than dropping a route we already know.
+      if (lookupsUsed >= MAX_ROUTE_LOOKUPS_PER_REFRESH) return &entry;
       break;
     }
   }
@@ -766,13 +956,13 @@ RouteCacheEntry *routeForCallsign(const char *rawCallsign, int &lookupsUsed) {
   slot->resolvedAt = slot->lastUsed = millis();
 
   WiFiClientSecure client;
-  client.setInsecure();
+  applyTlsPolicy(client);
   HTTPClient http;
   http.setTimeout(6000);
   String url = "https://api.adsbdb.com/v0/callsign/" + String(callsign);
   if (!http.begin(client, url)) return slot;
   http.addHeader("Accept-Encoding", "identity");
-  http.addHeader("User-Agent", "Waveshare-OpenSky-Map/1.0");
+  http.addHeader("User-Agent", userAgent());
   int code = http.GET();
   if (code != HTTP_CODE_OK) {
     Serial.printf("Route %s HTTP %d\n", callsign, code);
@@ -829,10 +1019,10 @@ void drawMlatPlane(int x, int y, float heading) {
 void drawAdsbLogo(int x, int y, float heading, const char *flight, const char *hex) {
   char code[4] = {'?','?','?',0};
   const char *src = (flight && strlen(flight)>=3) ? flight : hex;
-  for (int i=0;i<3 && src && src[i];++i) code[i]=toupper(src[i]);
+  for (int i=0;i<3 && src && src[i];++i) code[i]=toupper(static_cast<unsigned char>(src[i]));
   uint16_t brand=operatorColour(code), white=rgb(255,255,255), dark=rgb(5,15,20);
-  disc(x,y,10,dark); disc(x,y,8,brand);
-  text5(x-7,y-3,code,white,1);
+  disc(x,y,11,dark); disc(x,y,10,brand);
+  text5(x-8,y-3,code,white,1);
   float a=radians(heading-90.0f);
   int nx=x+lroundf(cosf(a)*15), ny=y+lroundf(sinf(a)*15);
   line(x,y,nx,ny,white);
@@ -842,10 +1032,10 @@ void drawAdsbLogo(int x, int y, float heading, const char *flight, const char *h
 void drawOperatorBadge(int x, int y, const char *flight, const char *hex) {
   char code[4] = {'?','?','?',0};
   const char *src = (flight && strlen(flight)>=3) ? flight : hex;
-  for (int i=0; i<3 && src && src[i]; ++i) code[i]=toupper(src[i]);
-  disc(x,y,10,rgb(5,15,20));
-  disc(x,y,8,operatorColour(code));
-  text5(x-7,y-3,code,rgb(255,255,255));
+  for (int i=0; i<3 && src && src[i]; ++i) code[i]=toupper(static_cast<unsigned char>(src[i]));
+  disc(x,y,11,rgb(5,15,20));
+  disc(x,y,10,operatorColour(code));
+  text5(x-8,y-3,code,rgb(255,255,255));
 }
 
 void drawRouteLabel(int x, int y, const RouteCacheEntry *route) {
@@ -867,9 +1057,18 @@ void status(const char *label, uint16_t colour) {
 
 void present() {
   gfx->draw16bitRGBBitmap(0, 0, framebuffer, W, H);
-  // Recover the RGB DMA at the next vertical blank if a bandwidth spike
-  // desynchronised its PSRAM scan position.
-  rgbpanel->restartAtNextVsync();
+  // esp_lcd_rgb_panel_restart() returns ESP_ERR_INVALID_STATE unless
+  // CONFIG_LCD_RGB_RESTART_IN_VSYNC is set in the sdkconfig, which cannot be
+  // changed from platformio.ini with the prebuilt Arduino libraries. The
+  // return value used to be discarded, so a permanent no-op was invisible.
+  // Log it once at boot; if it reports 0 this call does nothing and the
+  // corrected panel timings above are the real fix.
+  const bool restarted = rgbpanel->restartAtNextVsync();
+  static bool logged = false;
+  if (!logged) {
+    logged = true;
+    Serial.printf("RGB vsync restart supported: %s\n", restarted ? "yes" : "NO");
+  }
 }
 
 void renderBootScreen(const String &networkLine = "", uint16_t networkColour = RGB565_CYAN) {
@@ -942,7 +1141,10 @@ void renderTablePage() {
     line(3,y+25,476,y+25,rgb(25,45,60));
   }
   char footer[24];
-  snprintf(footer,sizeof(footer),"%d AIRCRAFT  C%ld",lastCount,creditsRemaining);
+  if (creditsRemaining >= 0)
+    snprintf(footer,sizeof(footer),"%d AIRCRAFT  C%ld",lastCount,creditsRemaining);
+  else
+    snprintf(footer,sizeof(footer),"%d AIRCRAFT",lastCount);
   text5(170,459,footer,rgb(130,160,180));
   present();
 }
@@ -1010,7 +1212,8 @@ void renderRadarPage() {
     } else {
       drawAdsbLogo(x, y, aircraft.track, aircraft.flight, aircraft.hex);
     }
-    if (!outside && plotted < 10) {
+    if (outside) continue;
+    if (plotted < 10) {
       const char *identity = aircraft.flight[0] ? aircraft.flight : aircraft.hex;
       const int labelX = constrain(x + 12, 2, W - static_cast<int>(strlen(identity)) * 6 - 2);
       const int labelY = constrain(y - 3, 37, H - 12);
@@ -1037,6 +1240,38 @@ void renderCurrentPage() {
   if (displayPage == DisplayPage::Table) renderTablePage();
   else if (displayPage == DisplayPage::Radar) renderRadarPage();
   else renderMapPage();
+}
+
+// Sorting indices and applying one permutation costs at most `lastCount`
+// struct moves instead of up to ~31k copies of a ~196 byte record in PSRAM.
+void sortAircraftByDistance() {
+  if (lastCount < 2) return;
+  static uint16_t order[MAX_AIRCRAFT];
+  static bool placed[MAX_AIRCRAFT];
+  for (int i = 0; i < lastCount; ++i) order[i] = static_cast<uint16_t>(i);
+  for (int i = 1; i < lastCount; ++i) {
+    const uint16_t key = order[i];
+    const float keyDistance = latestAircraft[key].distanceMiles;
+    int j = i - 1;
+    while (j >= 0 && latestAircraft[order[j]].distanceMiles > keyDistance) {
+      order[j + 1] = order[j];
+      --j;
+    }
+    order[j + 1] = key;
+  }
+  memset(placed, 0, sizeof(placed));
+  for (int i = 0; i < lastCount; ++i) {
+    if (placed[i] || order[i] == i) { placed[i] = true; continue; }
+    AircraftDisplay hold = latestAircraft[i];
+    int slot = i;
+    while (true) {
+      const int source = order[slot];
+      placed[slot] = true;
+      if (source == i) { latestAircraft[slot] = hold; break; }
+      latestAircraft[slot] = latestAircraft[source];
+      slot = source;
+    }
+  }
 }
 
 void fetchAdsbV2Aircraft() {
@@ -1073,7 +1308,7 @@ void fetchAdsbV2Aircraft() {
   // are released before the optional TLS route-enrichment requests.
   {
   WiFiClientSecure client;
-  client.setInsecure();
+  applyTlsPolicy(client);
   HTTPClient http;
   http.setTimeout(9000);
   if (!http.begin(client, url)) {
@@ -1083,7 +1318,7 @@ void fetchAdsbV2Aircraft() {
     return;
   }
   http.addHeader("Accept-Encoding", "identity");
-  http.addHeader("User-Agent", "ADSB-Map-Control/2.0 (ESP32-S3; personal display)");
+  http.addHeader("User-Agent", userAgent());
   if (apiProvider == "adsbx") {
     http.addHeader("X-RapidAPI-Key", rapidApiKey);
     http.addHeader("X-RapidAPI-Host", "adsbexchange-com1.p.rapidapi.com");
@@ -1175,15 +1410,7 @@ void fetchAdsbV2Aircraft() {
     ++lastCount;
   }
   }
-  for (int i = 1; i < lastCount; ++i) {
-    AircraftDisplay key = latestAircraft[i];
-    int j = i - 1;
-    while (j >= 0 && latestAircraft[j].distanceMiles > key.distanceMiles) {
-      latestAircraft[j + 1] = latestAircraft[j];
-      --j;
-    }
-    latestAircraft[j + 1] = key;
-  }
+  sortAircraftByDistance();
   int routeLookups = 0;
   for (int i = 0; i < lastCount; ++i) {
     AircraftDisplay &display = latestAircraft[i];
@@ -1197,7 +1424,9 @@ void fetchAdsbV2Aircraft() {
   Serial.printf("Displayed %d aircraft (%d MLAT) from %s\n", lastCount, lastMlat, apiProvider.c_str());
 }
 
-void fetchAircraft(bool retriedAuth = false) {
+void fetchAircraft() {
+  const bool retriedAuth = openSkyAuthRetryPending;
+  openSkyAuthRetryPending = false;
   feedRequestStartedAt = millis();
   feedStatus = "Fetching";
   feedHttpCode = 0;
@@ -1218,7 +1447,7 @@ void fetchAircraft(bool retriedAuth = false) {
   // Release the large OpenSky response and JSON allocation before starting
   // the optional per-callsign HTTPS route lookups.
   {
-  WiFiClientSecure client; client.setInsecure();
+  WiFiClientSecure client; applyTlsPolicy(client);
   HTTPClient http; http.setTimeout(7000);
   const float latDelta = queryRadiusNm / 60.0f;
   const float lonDelta = queryRadiusNm / max(1.0f, 60.0f * cosf(radians(homeLatitude)));
@@ -1234,13 +1463,19 @@ void fetchAircraft(bool retriedAuth = false) {
   const char *trackedHeaders[] = {"X-Rate-Limit-Remaining", "X-Rate-Limit-Retry-After-Seconds"};
   http.collectHeaders(trackedHeaders, 2);
   if (useOpenSkyAuthentication) http.addHeader("Authorization", "Bearer " + bearerToken);
-  http.addHeader("User-Agent", "Waveshare-OpenSky-Map/1.0");
+  http.addHeader("User-Agent", userAgent());
   http.addHeader("Accept-Encoding", "identity");
   int code=http.GET();
   if (useOpenSkyAuthentication && code == HTTP_CODE_UNAUTHORIZED && !retriedAuth) {
-    http.end(); bearerToken = "";
-    if (requestAccessToken()) fetchAircraft(true);
-    else { finishFeedAttempt("Authentication failed", code); status("AUTH", rgb(245,30,35)); present(); }
+    http.end();
+    bearerToken = "";
+    // Retry on the next loop pass so this request's TLS context is destroyed
+    // first. Recursing here put two mbedTLS sessions in internal RAM at once.
+    openSkyAuthRetryPending = true;
+    nextFetchAt = millis();
+    finishFeedAttempt("Reauthenticating", code);
+    status("AUTH", rgb(245,150,0));
+    present();
     return;
   }
   if (code == HTTP_CODE_TOO_MANY_REQUESTS) {
@@ -1304,15 +1539,7 @@ void fetchAircraft(bool retriedAuth = false) {
     strcpy(display.emergency, "none");
     ++lastCount;
   }
-  for (int i=1; i<lastCount; ++i) {
-    AircraftDisplay key = latestAircraft[i];
-    int j=i-1;
-    while (j >= 0 && latestAircraft[j].distanceMiles > key.distanceMiles) {
-      latestAircraft[j+1] = latestAircraft[j];
-      --j;
-    }
-    latestAircraft[j+1] = key;
-  }
+  sortAircraftByDistance();
   doc.clear();
   }
   int routeLookups = 0;
@@ -1339,13 +1566,55 @@ int compareVersions(const String &leftValue, const String &rightValue) {
   for (int part = 0; part < 3; ++part) {
     const int leftDot = left.indexOf('.');
     const int rightDot = right.indexOf('.');
-    const int leftPart = (leftDot < 0 ? left : left.substring(0, leftDot)).toInt();
-    const int rightPart = (rightDot < 0 ? right : right.substring(0, rightDot)).toInt();
+    String leftSegment = leftDot < 0 ? left : left.substring(0, leftDot);
+    String rightSegment = rightDot < 0 ? right : right.substring(0, rightDot);
+    // Strip any pre-release suffix ("0-rc1") so it cannot silently read as 0
+    // and make a release candidate compare equal to the final release.
+    const int leftDash = leftSegment.indexOf('-');
+    const int rightDash = rightSegment.indexOf('-');
+    const bool leftPre = leftDash >= 0;
+    const bool rightPre = rightDash >= 0;
+    if (leftPre) leftSegment = leftSegment.substring(0, leftDash);
+    if (rightPre) rightSegment = rightSegment.substring(0, rightDash);
+    const int leftPart = leftSegment.toInt();
+    const int rightPart = rightSegment.toInt();
+    if (leftPart == rightPart && leftPre != rightPre) return leftPre ? -1 : 1;
     if (leftPart != rightPart) return leftPart < rightPart ? -1 : 1;
     left = leftDot < 0 ? "" : left.substring(leftDot + 1);
     right = rightDot < 0 ? "" : right.substring(rightDot + 1);
   }
   return 0;
+}
+
+// Parses "<64 hex>  <filename>" lines from the release SHA256SUMS.txt asset.
+String fetchPublishedSha256(const String &url, const String &wantedName) {
+  WiFiClientSecure client;
+  applyTlsPolicy(client);
+  HTTPClient http;
+  http.setTimeout(12000);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  if (!http.begin(client, url)) return "";
+  http.addHeader("User-Agent", userAgent());
+  String digest;
+  if (http.GET() == HTTP_CODE_OK) {
+    const String body = http.getString();
+    int start = 0;
+    while (start < static_cast<int>(body.length())) {
+      int end = body.indexOf('\n', start);
+      if (end < 0) end = body.length();
+      String line = body.substring(start, end);
+      line.trim();
+      const int gap = line.indexOf(' ');
+      if (gap == 64 && line.indexOf(wantedName) > gap) {
+        digest = line.substring(0, 64);
+        digest.toLowerCase();
+        break;
+      }
+      start = end + 1;
+    }
+  }
+  http.end();
+  return digest;
 }
 
 bool checkGithubUpdate() {
@@ -1360,7 +1629,7 @@ bool checkGithubUpdate() {
     return false;
   }
   WiFiClientSecure client;
-  client.setInsecure();
+  applyTlsPolicy(client);
   HTTPClient http;
   http.setTimeout(12000);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
@@ -1370,7 +1639,7 @@ bool checkGithubUpdate() {
   }
   http.addHeader("Accept", "application/vnd.github+json");
   http.addHeader("X-GitHub-Api-Version", "2022-11-28");
-  http.addHeader("User-Agent", "2E0LXY-ESP32-ADSB/" + String(FIRMWARE_VERSION));
+  http.addHeader("User-Agent", userAgent());
   const int code = http.GET();
   if (code != HTTP_CODE_OK) {
     githubUpdateStatus = "GitHub HTTP " + String(code);
@@ -1385,10 +1654,13 @@ bool checkGithubUpdate() {
     return false;
   }
   githubLatestVersion = doc["tag_name"] | "";
+  String checksumsUrl;
   for (JsonObject asset : doc["assets"].as<JsonArray>()) {
     String name = asset["name"] | "";
     name.toLowerCase();
-    if (name.endsWith(".bin.sig") && name.indexOf("firmware") >= 0) {
+    if (name == "sha256sums.txt") {
+      checksumsUrl = asset["browser_download_url"] | "";
+    } else if (name.endsWith(".bin.sig") && name.indexOf("firmware") >= 0) {
       githubSignatureUrl = asset["browser_download_url"] | "";
     } else if (name.endsWith(".bin") && (name.indexOf("firmware") >= 0 || name.indexOf("adsb-map") >= 0)) {
       githubFirmwareUrl = asset["browser_download_url"] | "";
@@ -1409,6 +1681,11 @@ bool checkGithubUpdate() {
   if (!githubFirmwareUrl.length()) {
     githubUpdateStatus = "Release has no firmware binary";
     return false;
+  }
+  // The GitHub API digest field is not guaranteed. SHA256SUMS.txt is published
+  // in every release, so fall back to it rather than blocking updates.
+  if (githubFirmwareSha256.length() != 64 && checksumsUrl.length()) {
+    githubFirmwareSha256 = fetchPublishedSha256(checksumsUrl, "ESP32-ADSB-firmware.bin");
   }
   if (githubFirmwareSize < 1024 || githubFirmwareSha256.length() != 64 ||
       !githubSignatureUrl.length()) {
@@ -1431,7 +1708,7 @@ bool downloadGithubUpdateToSd() {
   }
   githubUpdateStatus = "Downloading " + githubLatestVersion + " to SD";
   WiFiClientSecure client;
-  client.setInsecure();
+  applyTlsPolicy(client);
   HTTPClient http;
   http.setTimeout(15000);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
@@ -1441,7 +1718,7 @@ bool downloadGithubUpdateToSd() {
     githubUpdateStatus = "Firmware download failed";
     return false;
   }
-  http.addHeader("User-Agent", "2E0LXY-ESP32-ADSB/" + String(FIRMWARE_VERSION));
+  http.addHeader("User-Agent", userAgent());
   const int code = http.GET();
   if (code != HTTP_CODE_OK) {
     http.end();
@@ -1499,30 +1776,54 @@ bool downloadGithubUpdateToSd() {
   stagedUpdateReady = true;
   stagedUpdateVersion = githubLatestVersion;
   stagedUpdateSha256 = actualDigest;
+  stagedUpdateSize = githubFirmwareSize;
+  settingsStore.putString("staged-ver", stagedUpdateVersion);
+  settingsStore.putString("staged-sha", stagedUpdateSha256);
+  settingsStore.putULong("staged-size", stagedUpdateSize);
   sdUsedBytes = SD_MMC.usedBytes();
   githubUpdateStatus = "Version " + githubLatestVersion + " verified on SD";
   return true;
 }
 
+void discardStagedUpdate() {
+  if (sdMounted) SD_MMC.remove(SD_UPDATE_FILE);
+  stagedUpdateReady = false;
+  stagedUpdateVersion = "";
+  stagedUpdateSha256 = "";
+  stagedUpdateSize = 0;
+  settingsStore.remove("staged-ver");
+  settingsStore.remove("staged-sha");
+  settingsStore.remove("staged-size");
+}
+
 bool installStagedUpdate() {
   if (!sdMounted || !stagedUpdateReady) return false;
+  // Validate against the persisted metadata, not against RAM that is empty
+  // after a reboot. Previously this always failed and leaked the staged image.
+  const size_t expectedSize = stagedUpdateSize;
+  const String expectedDigest = stagedUpdateSha256;
+  if (!expectedSize || expectedDigest.length() != 64) {
+    discardStagedUpdate();
+    githubUpdateStatus = "Staged firmware metadata is missing";
+    return false;
+  }
   File file = SD_MMC.open(SD_UPDATE_FILE, FILE_READ);
-  if (!file || file.size() != githubFirmwareSize || file.read() != 0xE9 || !file.seek(0)) {
+  if (!file || file.size() != expectedSize || file.read() != 0xE9 || !file.seek(0)) {
     if (file) file.close();
-    stagedUpdateReady = false;
+    discardStagedUpdate();
     githubUpdateStatus = "Staged firmware is invalid";
     return false;
   }
   file.close();
   String digest;
-  if (!sha256File(SD_MMC, SD_UPDATE_FILE, digest) || digest != githubFirmwareSha256 ||
+  if (!sha256File(SD_MMC, SD_UPDATE_FILE, digest) || digest != expectedDigest ||
       !verifyFirmwareSignature(digest)) {
-    stagedUpdateReady = false;
+    discardStagedUpdate();
     githubUpdateStatus = "Staged firmware SHA-256 check failed";
     return false;
   }
   file = SD_MMC.open(SD_UPDATE_FILE, FILE_READ);
-  if (!file || !Update.begin(githubFirmwareSize, U_FLASH)) {
+  if (!file || !Update.begin(expectedSize, U_FLASH)) {
     if (file) file.close();
     githubUpdateStatus = Update.errorString();
     return false;
@@ -1530,8 +1831,8 @@ bool installStagedUpdate() {
   githubUpdateStatus = "Installing verified SD update";
   const size_t written = Update.writeStream(file);
   file.close();
-  if (written != githubFirmwareSize || !Update.end(false)) {
-    githubUpdateStatus = written != githubFirmwareSize ? "SD firmware write was incomplete" : Update.errorString();
+  if (written != expectedSize || !Update.end(false)) {
+    githubUpdateStatus = written != expectedSize ? "SD firmware write was incomplete" : Update.errorString();
     Update.abort();
     return false;
   }
@@ -1557,7 +1858,7 @@ bool installGithubUpdate() {
   }
   githubUpdateStatus = "Downloading " + githubLatestVersion;
   WiFiClientSecure client;
-  client.setInsecure();
+  applyTlsPolicy(client);
   HTTPClient http;
   http.setTimeout(15000);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
@@ -1565,7 +1866,7 @@ bool installGithubUpdate() {
     githubUpdateStatus = "Firmware download failed";
     return false;
   }
-  http.addHeader("User-Agent", "2E0LXY-ESP32-ADSB/" + String(FIRMWARE_VERSION));
+  http.addHeader("User-Agent", userAgent());
   const int code = http.GET();
   if (code != HTTP_CODE_OK) {
     githubUpdateStatus = "Firmware HTTP " + String(code);
@@ -1661,9 +1962,27 @@ void sendJsonDocument(int statusCode, const JsonDocument &doc) {
   heap_caps_free(payload);
 }
 
+// Every state-changing route requires this token in an X-ADSB-Token header.
+// A cross-origin page cannot read /api/status to obtain it, and cannot set a
+// custom header without a preflight this server does not answer, so cached
+// Basic credentials alone are no longer enough to drive the device.
+void generateCsrfToken() {
+  char buffer[33];
+  for (int i = 0; i < 4; ++i) snprintf(buffer + i * 8, 9, "%08x", esp_random());
+  csrfToken = buffer;
+}
+
 bool requireWebAuthentication() {
   if (webServer.authenticate(WEB_USERNAME, managementPassword.c_str())) return true;
   webServer.requestAuthentication(BASIC_AUTH, "ADSB Map Control");
+  return false;
+}
+
+bool requireCsrfToken() {
+  if (csrfToken.length() && webServer.header("X-ADSB-Token") == csrfToken) return true;
+  webServer.sendHeader("Cache-Control", "no-store");
+  webServer.send(403, "application/json",
+                 "{\"message\":\"Request token missing or stale; reload the admin page\"}");
   return false;
 }
 
@@ -1729,6 +2048,10 @@ void handleStatusApi() {
   doc["latestVersion"] = githubLatestVersion;
   doc["updateStatus"] = githubUpdateStatus;
   doc["releaseRepository"] = String(GITHUB_OWNER) + "/" + GITHUB_REPOSITORY;
+  doc["csrfToken"] = csrfToken;
+  doc["mapRebuildActive"] = mapRebuildActive;
+  doc["mapRebuildDone"] = mapRebuildDone;
+  doc["mapRebuildTotal"] = mapRebuildTotal;
   sendJsonDocument(200, doc);
 }
 
@@ -1771,6 +2094,7 @@ void handleAircraftApi() {
 
 void handleWifiScanStart() {
   if (!requireWebAuthentication()) return;
+  if (!requireCsrfToken()) return;
   const int state = WiFi.scanComplete();
   if (state == WIFI_SCAN_RUNNING) {
     sendMessage(202, "Wi-Fi scan already running");
@@ -1827,12 +2151,18 @@ void handleWifiScanResults() {
 
 void handleWifiConnect() {
   if (!requireWebAuthentication()) return;
+  if (!requireCsrfToken()) return;
   const String ssid = webServer.arg("ssid");
   const String password = webServer.arg("password");
   if (!ssid.length() || ssid.length() > 32 || !validWifiPassword(password)) {
     sendMessage(400, "Use an SSID of 1 to 32 bytes and an empty, 8 to 63 character, or 64-digit hexadecimal password");
     return;
   }
+  // Keep the working credentials so a bad SSID or password does not strand the
+  // receiver off the LAN until someone power-cycles it into the setup portal.
+  previousWifiSsid = WiFi.SSID();
+  previousWifiPassword = WiFi.psk();
+  wifiRollbackAt = millis() + 45000UL;
   sendMessage(202, "Wi-Fi connection started; reconnect to the device at its new address");
   delay(120);
   WiFi.begin(ssid.c_str(), password.c_str());
@@ -1840,6 +2170,7 @@ void handleWifiConnect() {
 
 void handlePageControl() {
   if (!requireWebAuthentication()) return;
+  if (!requireCsrfToken()) return;
   const String page = webServer.arg("page");
   if (page != "map" && page != "table" && page != "radar") {
     sendMessage(400, "Page must be map, radar or table");
@@ -1856,6 +2187,7 @@ void handlePageControl() {
 
 void handleDisplaySettings() {
   if (!requireWebAuthentication()) return;
+  if (!requireCsrfToken()) return;
   if (webServer.hasArg("sound")) {
     soundAlerts = webServer.arg("sound") == "1";
     settingsStore.putBool("sound", soundAlerts);
@@ -1868,13 +2200,14 @@ void handleDisplaySettings() {
     }
     brightnessPercent = static_cast<uint8_t>(brightness);
     settingsStore.putUChar("brightness", brightnessPercent);
-    WS_CH32_IO::setPwm(Wire, brightnessPercent);
+    applyBrightness(brightnessPercent);
   }
   sendMessage(200, "Display settings saved");
 }
 
 void handleLocationSettings() {
   if (!requireWebAuthentication()) return;
+  if (!requireCsrfToken()) return;
   if (!webServer.hasArg("latitude") || !webServer.hasArg("longitude") ||
       !webServer.hasArg("radius")) {
     sendMessage(400, "Latitude, longitude and radius are required");
@@ -1907,17 +2240,24 @@ void handleLocationSettings() {
   physicalMapReady = false;
   physicalMapRefreshPending = true;
   nextFetchAt = 0;
+  clearTileCache();
   sendMessage(202, "Location saved; rebuilding both maps and refreshing aircraft");
 }
 
 void handleGithubUpdateCheck() {
   if (!requireWebAuthentication()) return;
+  if (!requireCsrfToken()) return;
   githubCheckPending = true;
   sendMessage(202, "GitHub update check requested");
 }
 
 void handleGithubUpdateInstall() {
   if (!requireWebAuthentication()) return;
+  if (!requireCsrfToken()) return;
+  if (firmwareUploadStarted || githubInstallPending || Update.isRunning()) {
+    sendMessage(409, "Another firmware operation is already in progress");
+    return;
+  }
   if (!githubUpdateAvailable || !githubFirmwareUrl.length()) {
     sendMessage(409, "No newer GitHub firmware release is ready");
     return;
@@ -1928,11 +2268,19 @@ void handleGithubUpdateInstall() {
 
 void handleSdRescan() {
   if (!requireWebAuthentication()) return;
+  if (!requireCsrfToken()) return;
   if (githubInstallPending || Update.isRunning()) {
     sendMessage(409, "SD card cannot be rescanned during a firmware update");
     return;
   }
+  if (mapRebuildActive) {
+    sendMessage(409, "SD card cannot be rescanned while the LCD map is rebuilding");
+    return;
+  }
   const bool mounted = mountSdCard();
+  // Mounting a card moves the cache prefix from /osm_ to /adsb/osm_, orphaning
+  // everything already written to LittleFS.
+  if (mounted) clearTileCache(true);
   physicalMapReady = false;
   physicalMapRefreshPending = true;
   sendMessage(200, mounted ? "SD card mounted; map cache moved to SD" :
@@ -1941,6 +2289,7 @@ void handleSdRescan() {
 
 void handlePasswordChange() {
   if (!requireWebAuthentication()) return;
+  if (!requireCsrfToken()) return;
   const String password = webServer.arg("password");
   if (password.length() < 8 || password.length() > 63) {
     sendMessage(400, "Management password must be 8 to 63 characters");
@@ -1953,6 +2302,7 @@ void handlePasswordChange() {
 
 void handleProviderSettings() {
   if (!requireWebAuthentication()) return;
+  if (!requireCsrfToken()) return;
   const String provider = webServer.arg("provider");
   if (provider != "opensky" && provider != "adsbfi" &&
       provider != "airplaneslive" && provider != "adsblol" &&
@@ -1997,6 +2347,13 @@ void handleProviderSettings() {
 
 void handleFirmwareUpload() {
   if (!webServer.authenticate(WEB_USERNAME, managementPassword.c_str())) return;
+  if (!csrfToken.length() || webServer.header("X-ADSB-Token") != csrfToken) {
+    firmwareUploadError = "Request token missing or stale; reload the admin page";
+    firmwareUploadStarted = false;
+    firmwareUploadComplete = false;
+    firmwareUploadBytes = 0;
+    return;
+  }
   const String contentType = webServer.header("Content-Type");
   if (webServer.arg("upload") != "1" || !contentType.startsWith("multipart/")) {
     firmwareUploadError = "Firmware uploads require a multipart file request";
@@ -2013,6 +2370,10 @@ void handleFirmwareUpload() {
     firmwareUploadBytes = 0;
     if (webServer.arg("upload") != "1") {
       firmwareUploadError = "Firmware upload request is missing its upload marker";
+      return;
+    }
+    if (githubInstallPending || Update.isRunning()) {
+      firmwareUploadError = "Another firmware operation is already in progress";
       return;
     }
     String filename = upload.filename;
@@ -2053,6 +2414,7 @@ void handleFirmwareUpload() {
 
 void handleFirmwareResult() {
   if (!requireWebAuthentication()) return;
+  if (!requireCsrfToken()) return;
   if (webServer.arg("upload") != "1" || !firmwareUploadStarted ||
       !firmwareUploadComplete || firmwareUploadBytes < 1024) {
     const String error = firmwareUploadError.length() ? firmwareUploadError : "No complete firmware image was uploaded";
@@ -2103,6 +2465,7 @@ void beginWebControl() {
     webServer.on("/api/sd/rescan", HTTP_POST, handleSdRescan);
     webServer.on("/api/refresh", HTTP_POST, []() {
       if (!requireWebAuthentication()) return;
+      if (!requireCsrfToken()) return;
       nextFetchAt = 0;
       sendMessage(202, "Aircraft refresh requested");
     });
@@ -2114,12 +2477,14 @@ void beginWebControl() {
     webServer.on("/api/firmware", HTTP_POST, handleFirmwareResult, handleFirmwareUpload);
     webServer.on("/api/reboot", HTTP_POST, []() {
       if (!requireWebAuthentication()) return;
+      if (!requireCsrfToken()) return;
       sendMessage(202, "Device is rebooting");
       restartPending = true;
       restartAt = millis() + 800;
     });
     webServer.on("/api/portal", HTTP_POST, []() {
       if (!requireWebAuthentication()) return;
+      if (!requireCsrfToken()) return;
       sendMessage(202, "Setup portal will start as ADSBMAP");
       setupPortalPending = true;
     });
@@ -2127,8 +2492,8 @@ void beginWebControl() {
       if (!requireWebAuthentication()) return;
       sendMessage(404, "Not found");
     });
-    const char *trackedRequestHeaders[] = {"Content-Type"};
-    webServer.collectHeaders(trackedRequestHeaders, 1);
+    const char *trackedRequestHeaders[] = {"Content-Type", "X-ADSB-Token"};
+    webServer.collectHeaders(trackedRequestHeaders, 2);
     webServerReady = true;
   }
   webServer.begin();
@@ -2150,8 +2515,15 @@ void setup() {
   if (apiProvider != "opensky" && apiProvider != "adsbfi" &&
       apiProvider != "airplaneslive" && apiProvider != "adsblol" &&
       apiProvider != "adsbone" && apiProvider != "adsbx") apiProvider = "opensky";
+  // Compiled-in credentials are opt-in. Without this flag a locally built
+  // image carries no secret that `strings firmware.bin` could recover.
+#ifdef ADSB_BAKE_CREDENTIALS
   openSkyClientId = settingsStore.getString("os-client", OPENSKY_CLIENT_ID);
   openSkyClientSecret = settingsStore.getString("os-secret", OPENSKY_CLIENT_SECRET);
+#else
+  openSkyClientId = settingsStore.getString("os-client", "");
+  openSkyClientSecret = settingsStore.getString("os-secret", "");
+#endif
   rapidApiKey = settingsStore.getString("rapid-key", "");
   homeLatitude = settingsStore.getFloat("home-lat", DEFAULT_HOME_LAT);
   homeLongitude = settingsStore.getFloat("home-lon", DEFAULT_HOME_LON);
@@ -2163,6 +2535,7 @@ void setup() {
   soundAlerts = settingsStore.getBool("sound", true);
   brightnessPercent = settingsStore.getUChar("brightness", 100);
   brightnessPercent = constrain(brightnessPercent, 10, 100);
+  generateCsrfToken();
   pinMode(0, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(0), onBootButtonFalling, FALLING);
   delay(300);
@@ -2171,13 +2544,13 @@ void setup() {
                          WS_CH32_IO::DEFAULT_I2C_FREQ, &Serial)) {
     Serial.println("Rev4 display helper unavailable");
   }
-  if (brightnessPercent < 100) WS_CH32_IO::setPwm(Wire, brightnessPercent);
+  applyBrightness(brightnessPercent);
   if (!gfx->begin()) {
     Serial.println("Display initialization failed");
     while (true) delay(1000);
   }
-  touchReady = beginTouch();
-#if DISPLAY_DIAGNOSTIC
+  touchReady = ADSB_ENABLE_TOUCH ? beginTouch() : false;
+#ifdef DISPLAY_DIAGNOSTIC
   // Keep this test independent of PSRAM, Wi-Fi, the map and OpenSky.
   gfx->fillScreen(RGB565_RED);
   delay(1500);
@@ -2234,7 +2607,7 @@ void setup() {
 }
 
 void loop() {
-#if DISPLAY_DIAGNOSTIC
+#ifdef DISPLAY_DIAGNOSTIC
   static uint8_t colour = 0;
   static uint32_t nextChange = 0;
   if (millis() >= nextChange) {
@@ -2271,13 +2644,31 @@ void loop() {
     wm.startConfigPortal("ADSBMAP", "aircraft");
     beginWebControl();
   }
+  if (pageSavePending && static_cast<int32_t>(millis() - pageSaveAt) >= 0) {
+    pageSavePending = false;
+    settingsStore.putUChar("display-page", static_cast<uint8_t>(displayPage));
+  }
+  if (wifiRollbackAt && static_cast<int32_t>(millis() - wifiRollbackAt) >= 0) {
+    wifiRollbackAt = 0;
+    if (WiFi.status() != WL_CONNECTED && previousWifiSsid.length()) {
+      Serial.println("New Wi-Fi credentials failed; restoring the previous network");
+      WiFi.begin(previousWifiSsid.c_str(), previousWifiPassword.c_str());
+    }
+    previousWifiSsid = "";
+    previousWifiPassword = "";
+  }
   if (restartPending && static_cast<int32_t>(millis() - restartAt) >= 0) {
     delay(100);
     ESP.restart();
   }
-  if (touchTapped() || bootButtonTapped()) {
+  // Evaluate both: short-circuiting used to leave bootButtonPending set, which
+  // advanced the page twice on the following pass.
+  const bool touched = touchTapped();
+  const bool pressed = bootButtonTapped();
+  if (touched || pressed) {
     displayPage = static_cast<DisplayPage>((static_cast<uint8_t>(displayPage) + 1) % 3);
-    settingsStore.putUChar("display-page", static_cast<uint8_t>(displayPage));
+    pageSavePending = true;
+    pageSaveAt = millis() + 5000UL;
     renderCurrentPage();
     Serial.printf("Page: %s\n", displayPageName());
   }
@@ -2291,7 +2682,8 @@ void loop() {
   }
   if (static_cast<int32_t>(millis()-nextFetchAt) >= 0) {
     fetchAircraft();
-    if (static_cast<int32_t>(millis()-nextFetchAt) >= 0) nextFetchAt=millis()+REFRESH_MS;
+    if (openSkyAuthRetryPending) nextFetchAt = millis() + 1000UL;
+    else if (static_cast<int32_t>(millis()-nextFetchAt) >= 0) nextFetchAt=millis()+REFRESH_MS;
   }
   delay(50);
 }

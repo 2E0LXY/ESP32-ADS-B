@@ -29,8 +29,16 @@ jobs:
           FIRMWARE_SIGNING_KEY: ${{ secrets.FIRMWARE_SIGNING_KEY }}
         run: |
           test -n "$FIRMWARE_SIGNING_KEY"
-          cp .pio/build/waveshare_esp32_s3_lcd_4/firmware.bin ESP32-ADSB-firmware.bin
-          cp .pio/build/waveshare_esp32_s3_lcd_4/firmware.factory.bin ESP32-ADSB-factory.bin
+          build=.pio/build/waveshare_esp32_s3_lcd_4
+          test -f "$build/firmware.bin" || { echo "::error::firmware.bin was not produced"; exit 1; }
+          if [ ! -f "$build/firmware.factory.bin" ]; then
+            echo "::error::firmware.factory.bin was not produced by the platform."
+            echo "The USB installer manifest expects a single image at offset 0."
+            ls -l "$build"
+            exit 1
+          fi
+          cp "$build/firmware.bin" ESP32-ADSB-firmware.bin
+          cp "$build/firmware.factory.bin" ESP32-ADSB-factory.bin
           printf '%s' "$FIRMWARE_SIGNING_KEY" > firmware-private.pem
           openssl dgst -sha256 -sign firmware-private.pem -out ESP32-ADSB-firmware.bin.sig ESP32-ADSB-firmware.bin
           rm -f firmware-private.pem

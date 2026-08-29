@@ -9,9 +9,9 @@ static void logLine(Print *log, const char *text)
     }
 }
 
-void recoverI2CBus(int sda, int scl)
+void recoverI2CBus(TwoWire &wire, int sda, int scl)
 {
-    Wire.end();
+    wire.end();
     delay(2);
 
 #ifdef OUTPUT_OPEN_DRAIN
@@ -135,7 +135,7 @@ bool initDisplayPower(TwoWire &wire, Print *log)
 
 bool begin(TwoWire &wire, int sda, int scl, uint32_t frequency, Print *log)
 {
-    recoverI2CBus(sda, scl);
+    recoverI2CBus(wire, sda, scl);
     wire.begin(sda, scl);
     wire.setClock(frequency);
     delay(20);
