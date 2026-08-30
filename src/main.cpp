@@ -295,6 +295,7 @@ bool aisConnected = false;
 uint32_t aisLastMessageAt = 0;
 uint16_t marineRadiusNm = DEFAULT_MARINE_RADIUS_NM;
 WebSocketsClient aisWebSocket;
+void connectAisWebSocket();  // defined near setup(); handleMarineCredentials() needs it earlier
 // Page order matches the swipe order on the panel: Overview is the first
 // screen, then swipe right advances Table -> Map -> Radar -> Marine and wraps.
 enum class DisplayPage : uint8_t { Overview = 0, Table = 1, Map = 2, Radar = 3, Marine = 4 };
