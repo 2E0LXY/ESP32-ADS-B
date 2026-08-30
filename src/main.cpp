@@ -1643,7 +1643,11 @@ void renderTablePage() {
     // Registration (tail number) is the airframe's fixed ID, distinct from
     // the callsign above it which can vary flight to flight (e.g. QTR74X
     // flown by A7-AOA, or a squadron callsign like REDARROW on XX221).
-    if (display.registration[0]) text5(COL_CALLSIGN,y+16,display.registration,rgb(150,180,200));
+    // Scale 1 is a 5x7px glyph - legible in an 800px-wide route label but too
+    // small to read as text at normal viewing distance; it reads as a row of
+    // dots instead. Scale 2 matches the callsign line above it and still
+    // clears the row band (40px tall) with room to spare.
+    if (display.registration[0]) text5(COL_CALLSIGN,y+16,display.registration,rgb(150,180,200),2);
     text5(COL_MILES,y,distance,rgb(255,255,255),2);
     text5(COL_SOURCE,y,isMlat ? "M" : "A",isMlat ? rgb(255,65,65) : rgb(60,220,130),2);
     text5(COL_DIR,y,compassDirection(display.track),rgb(255,255,255),2);
@@ -3393,7 +3397,7 @@ void onAisEvent(WStype_t type, uint8_t *payload, size_t length) {
       Serial.println("AIS WebSocket connected; subscribing");
       const double latRadius = marineRadiusNm / 60.0;
       const double lonRadius = marineRadiusNm / (60.0 * max(0.1, cos(radians(homeLatitude))));
-      JsonDocument sub;
+      JsonDocument sub(&psramJsonAllocator);
       sub["APIKey"] = aisApiKey;
       JsonArray boxes = sub["BoundingBoxes"].to<JsonArray>();
       JsonArray box = boxes.add<JsonArray>();
@@ -3421,7 +3425,11 @@ void onAisEvent(WStype_t type, uint8_t *payload, size_t length) {
     case WStype_TEXT:
     case WStype_BIN: {
       aisLastMessageAt = millis();
-      JsonDocument doc;
+      // Every position report parses here, often several times a second in
+      // busy waters - unlike a one-off request, this allocator choice runs
+      // hot, so it must come from PSRAM like every other large JSON parse in
+      // this file rather than fragmenting the scarce internal heap.
+      JsonDocument doc(&psramJsonAllocator);
       if (deserializeJson(doc, payload, length)) return;
       const char *messageType = doc["MessageType"] | "";
       JsonObject meta = doc["MetaData"].as<JsonObject>();
