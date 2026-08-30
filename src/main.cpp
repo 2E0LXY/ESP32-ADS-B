@@ -114,6 +114,11 @@ constexpr int MAX_AIRCRAFT = 250;
 constexpr int MAX_VESSELS = 250;
 constexpr uint16_t DEFAULT_MARINE_RADIUS_NM = 25;  // typical VHF AIS coastal range
 constexpr uint32_t MARINE_STALE_MS = 20UL * 60UL * 1000UL;  // AIS position reports are event-driven, not polled
+// REST marine providers are polled, unlike AISstream's push WebSocket.
+// AISHub's terms forbid querying more than once a minute; MyShipTracking
+// and Datalastic bill per vessel per request, so this stays conservative
+// for all three rather than tuning a separate interval per provider.
+constexpr uint32_t MARINE_REST_REFRESH_MS = 60UL * 1000UL;
 constexpr int ROUTE_CACHE_SIZE = 48;
 constexpr int MAX_ROUTE_LOOKUPS_PER_REFRESH = 2;
 constexpr uint32_t ROUTE_CACHE_MS = 6UL * 60UL * 60UL * 1000UL;
@@ -290,14 +295,26 @@ RouteCacheEntry routeCache[ROUTE_CACHE_SIZE];
 AircraftDisplay *latestAircraft = nullptr;
 VesselDisplay *latestVessels = nullptr;
 int vesselCount = 0;
+String marineProvider = "aisstream";
 String aisApiKey;
+String aisHubUsername;
+String myShipTrackingApiKey;
+String datalasticApiKey;
 bool aisConnected = false;
 uint32_t aisLastMessageAt = 0;
+uint32_t nextMarineFetchAt = 0;
 uint16_t marineRadiusNm = DEFAULT_MARINE_RADIUS_NM;
 WebSocketsClient aisWebSocket;
 // Defined near setup(), inside this same anonymous namespace, but
 // handleMarineCredentials() below needs to call it earlier in the file.
 void connectAisWebSocket();
+
+bool marineConfigured() {
+  if (marineProvider == "aishub") return aisHubUsername.length() > 0;
+  if (marineProvider == "myshiptracking") return myShipTrackingApiKey.length() > 0;
+  if (marineProvider == "datalastic") return datalasticApiKey.length() > 0;
+  return aisApiKey.length() > 0;
+}
 // Page order matches the swipe order on the panel: Overview is the first
 // screen, then swipe right advances Table -> Map -> Radar -> Marine and wraps.
 enum class DisplayPage : uint8_t { Overview = 0, Table = 1, Map = 2, Radar = 3, Marine = 4 };
@@ -1541,9 +1558,9 @@ void renderMarinePage() {
     ++plotted;
   }
   char count[28];
-  if (!aisApiKey.length()) snprintf(count, sizeof(count), "AIS NOT CONFIGURED");
+  if (!marineConfigured()) snprintf(count, sizeof(count), "AIS NOT CONFIGURED");
   else snprintf(count, sizeof(count), "%d SHIPS%s", plotted, aisConnected ? "" : " (OFFLINE)");
-  status(count, !aisApiKey.length() ? rgb(150,150,150) : aisConnected ? rgb(35,210,80) : rgb(220,60,60));
+  status(count, !marineConfigured() ? rgb(150,150,150) : aisConnected ? rgb(35,210,80) : rgb(220,60,60));
   present();
 }
 
@@ -2561,7 +2578,12 @@ void handleStatusApi() {
   doc["temperatureC"] = temperatureRead();
   doc["aircraftCapacity"] = MAX_AIRCRAFT;
   doc["aircraftStorage"] = "PSRAM";
-  doc["aisConfigured"] = aisApiKey.length() > 0;
+  doc["marineProvider"] = marineProvider;
+  doc["aisConfigured"] = marineConfigured();
+  doc["hasAisApiKey"] = aisApiKey.length() > 0;
+  doc["hasAisHubUsername"] = aisHubUsername.length() > 0;
+  doc["hasMyShipTrackingApiKey"] = myShipTrackingApiKey.length() > 0;
+  doc["hasDatalasticApiKey"] = datalasticApiKey.length() > 0;
   doc["aisConnected"] = aisConnected;
   doc["vesselCount"] = vesselCount;
   doc["vesselCapacity"] = MAX_VESSELS;
@@ -2892,17 +2914,28 @@ void handleProviderSettings() {
 void handleMarineCredentials() {
   if (!requireWebAuthentication()) return;
   if (!requireCsrfToken()) return;
-  if (webServer.arg("apiKey").length() > 128) {
-    sendMessage(400, "AIS API key is too long");
+  const String provider = webServer.hasArg("provider") ? webServer.arg("provider") : marineProvider;
+  if (provider != "aisstream" && provider != "aishub" &&
+      provider != "myshiptracking" && provider != "datalastic") {
+    sendMessage(400, "Unknown marine data provider");
     return;
   }
-  const bool hadKey = aisApiKey.length() > 0;
+  if (webServer.arg("credential").length() > 128) {
+    sendMessage(400, "Marine credential is too long");
+    return;
+  }
+  String *credentialField = provider == "aishub" ? &aisHubUsername :
+                             provider == "myshiptracking" ? &myShipTrackingApiKey :
+                             provider == "datalastic" ? &datalasticApiKey : &aisApiKey;
+  const char *storeKey = provider == "aishub" ? "aishub-user" :
+                         provider == "myshiptracking" ? "mst-key" :
+                         provider == "datalastic" ? "datalastic-key" : "ais-key";
   if (webServer.arg("clear") == "1") {
-    aisApiKey = "";
-    settingsStore.putString("ais-key", "");
-  } else if (webServer.hasArg("apiKey") && webServer.arg("apiKey").length()) {
-    aisApiKey = webServer.arg("apiKey");
-    settingsStore.putString("ais-key", aisApiKey);
+    *credentialField = "";
+    settingsStore.putString(storeKey, "");
+  } else if (webServer.hasArg("credential") && webServer.arg("credential").length()) {
+    *credentialField = webServer.arg("credential");
+    settingsStore.putString(storeKey, *credentialField);
   }
   if (webServer.hasArg("radius")) {
     const long radius = webServer.arg("radius").toInt();
@@ -2913,15 +2946,16 @@ void handleMarineCredentials() {
     marineRadiusNm = static_cast<uint16_t>(radius);
     settingsStore.putUShort("marine-radius", marineRadiusNm);
   }
-  // A key change needs a fresh subscription (the bounding box or the key
-  // itself may differ), so always reconnect once one is configured.
-  if (aisApiKey.length()) {
-    if (hadKey) aisWebSocket.disconnect();
-    connectAisWebSocket();
-  } else if (hadKey) {
-    aisWebSocket.disconnect();
-    aisConnected = false;
-  }
+  marineProvider = provider;
+  settingsStore.putString("marine-provider", marineProvider);
+  // Any provider, key, or radius change needs a clean slate: the old
+  // vessels came from a different source/area and would otherwise linger
+  // stale on the map until MARINE_STALE_MS quietly drops them.
+  aisWebSocket.disconnect();
+  aisConnected = false;
+  vesselCount = 0;
+  nextMarineFetchAt = 0;
+  if (marineProvider == "aisstream" && aisApiKey.length()) connectAisWebSocket();
   sendMessage(200, "Marine settings saved");
 }
 
@@ -3174,6 +3208,181 @@ void pruneStaleVessels() {
 
 bool marineDataDirty = false;
 
+// Shared by every REST provider below: writes name/type/nav-status text
+// fields and marks the vessel touched, so each fetch function only has to
+// pull its provider-specific field names into these common slots.
+void applyVesselTextFields(VesselDisplay *vessel, const char *name, int shipType, int navStatus) {
+  if (name && name[0]) {
+    strncpy(vessel->name, name, sizeof(vessel->name) - 1);
+    vessel->name[sizeof(vessel->name) - 1] = 0;
+  }
+  const char *typeName = shipTypeName(shipType);
+  strncpy(vessel->shipType, typeName, sizeof(vessel->shipType) - 1);
+  vessel->shipType[sizeof(vessel->shipType) - 1] = 0;
+  const char *statusName = navStatusName(navStatus);
+  strncpy(vessel->navStatus, statusName, sizeof(vessel->navStatus) - 1);
+  vessel->navStatus[sizeof(vessel->navStatus) - 1] = 0;
+}
+
+void applyVesselPosition(VesselDisplay *vessel, double lat, double lon) {
+  if (lat == 0.0 && lon == 0.0) return;
+  vessel->latitude = lat;
+  vessel->longitude = lon;
+  vessel->distanceMiles = distanceMilesFromHome(lat, lon);
+}
+
+// data.aishub.net: https://www.aishub.net/api - a member-contributed AIS
+// exchange. Requires an AISHub account that shares your own receiver's data
+// with their network; the username alone (without a contributing receiver)
+// may return no data. Do not query more than once a minute - AISHub's
+// service returns nothing if called more frequently.
+void fetchAisHubVessels() {
+  if (!aisHubUsername.length()) return;
+  const double latRadius = marineRadiusNm / 60.0;
+  const double lonRadius = marineRadiusNm / (60.0 * max(0.1, cos(radians(homeLatitude))));
+  const String url = "https://data.aishub.net/ws.php?username=" + aisHubUsername +
+      "&format=1&output=json&compress=0" +
+      "&latmin=" + String(homeLatitude - latRadius, 5) +
+      "&latmax=" + String(homeLatitude + latRadius, 5) +
+      "&lonmin=" + String(homeLongitude - lonRadius, 5) +
+      "&lonmax=" + String(homeLongitude + lonRadius, 5);
+  WiFiClientSecure client;
+  applyTlsPolicy(client);
+  HTTPClient http;
+  http.setTimeout(9000);
+  if (!http.begin(client, url)) return;
+  http.addHeader("User-Agent", userAgent());
+  const int code = http.GET();
+  if (code == HTTP_CODE_OK) {
+    JsonDocument doc(&psramJsonAllocator);
+    const String payload = http.getString();
+    // AISHub's own success envelope is a 2-element array: [{meta}, [vessels]].
+    if (!deserializeJson(doc, payload) && doc[0]["ERROR"] == false) {
+      for (JsonObject v : doc[1].as<JsonArray>()) {
+        const uint32_t mmsi = v["MMSI"] | 0;
+        if (!mmsi) continue;
+        VesselDisplay *vessel = findOrCreateVessel(mmsi);
+        vessel->lastUpdateMs = millis();
+        applyVesselPosition(vessel, v["LATITUDE"] | 0.0, v["LONGITUDE"] | 0.0);
+        vessel->speedKnots = v["SOG"] | vessel->speedKnots;
+        vessel->courseOverGround = v["COG"] | vessel->courseOverGround;
+        const float heading = v["HEADING"] | 511.0f;
+        vessel->heading = heading < 360.0f ? heading : -1;
+        applyVesselTextFields(vessel, v["NAME"] | "", v["TYPE"] | -1, v["NAVSTAT"] | -1);
+      }
+      aisConnected = true;
+      aisLastMessageAt = millis();
+    } else {
+      aisConnected = false;
+    }
+  } else {
+    aisConnected = false;
+  }
+  http.end();
+}
+
+// api.myshiptracking.com/api/v2/vessel/zone - freemium REST, Bearer auth.
+void fetchMyShipTrackingVessels() {
+  if (!myShipTrackingApiKey.length()) return;
+  const double latRadius = marineRadiusNm / 60.0;
+  const double lonRadius = marineRadiusNm / (60.0 * max(0.1, cos(radians(homeLatitude))));
+  const String url = "https://api.myshiptracking.com/api/v2/vessel/zone?response=simple" +
+      String("&minlat=") + String(homeLatitude - latRadius, 5) +
+      "&maxlat=" + String(homeLatitude + latRadius, 5) +
+      "&minlon=" + String(homeLongitude - lonRadius, 5) +
+      "&maxlon=" + String(homeLongitude + lonRadius, 5);
+  WiFiClientSecure client;
+  applyTlsPolicy(client);
+  HTTPClient http;
+  http.setTimeout(9000);
+  if (!http.begin(client, url)) return;
+  http.addHeader("User-Agent", userAgent());
+  http.addHeader("Authorization", "Bearer " + myShipTrackingApiKey);
+  const int code = http.GET();
+  if (code == HTTP_CODE_OK) {
+    JsonDocument doc(&psramJsonAllocator);
+    const String payload = http.getString();
+    if (!deserializeJson(doc, payload) && doc["status"] == "success") {
+      for (JsonObject v : doc["data"].as<JsonArray>()) {
+        const uint32_t mmsi = v["mmsi"] | 0;
+        if (!mmsi) continue;
+        VesselDisplay *vessel = findOrCreateVessel(mmsi);
+        vessel->lastUpdateMs = millis();
+        applyVesselPosition(vessel, v["lat"] | 0.0, v["lng"] | 0.0);
+        vessel->speedKnots = v["speed"] | vessel->speedKnots;
+        vessel->courseOverGround = v["course"] | vessel->courseOverGround;
+        // This endpoint doesn't report true heading separately from course.
+        vessel->heading = -1;
+        applyVesselTextFields(vessel, v["vessel_name"] | "", v["vtype"] | -1, v["nav_status"] | -1);
+      }
+      aisConnected = true;
+      aisLastMessageAt = millis();
+    } else {
+      aisConnected = false;
+    }
+  } else {
+    aisConnected = false;
+  }
+  http.end();
+}
+
+// api.datalastic.com/api/v0/vessel_inradius - freemium REST, API-key query
+// param. Radius is capped at 50 nm by the API itself, tighter than the
+// 250 nm ceiling on the other providers' bounding boxes.
+void fetchDatalasticVessels() {
+  if (!datalasticApiKey.length()) return;
+  const uint16_t radius = min<uint16_t>(marineRadiusNm, 50);
+  const String url = "https://api.datalastic.com/api/v0/vessel_inradius?api-key=" + datalasticApiKey +
+      "&lat=" + String(homeLatitude, 5) +
+      "&lon=" + String(homeLongitude, 5) +
+      "&radius=" + String(radius);
+  WiFiClientSecure client;
+  applyTlsPolicy(client);
+  HTTPClient http;
+  http.setTimeout(9000);
+  if (!http.begin(client, url)) return;
+  http.addHeader("User-Agent", userAgent());
+  const int code = http.GET();
+  if (code == HTTP_CODE_OK) {
+    JsonDocument doc(&psramJsonAllocator);
+    const String payload = http.getString();
+    if (!deserializeJson(doc, payload) && !doc["data"].isNull()) {
+      for (JsonObject v : doc["data"]["vessels"].as<JsonArray>()) {
+        // Datalastic returns mmsi as a string field, not a number.
+        const uint32_t mmsi = atol(v["mmsi"] | "");
+        if (!mmsi) continue;
+        VesselDisplay *vessel = findOrCreateVessel(mmsi);
+        vessel->lastUpdateMs = millis();
+        applyVesselPosition(vessel, v["lat"] | 0.0, v["lon"] | 0.0);
+        vessel->speedKnots = v["speed"] | vessel->speedKnots;
+        vessel->courseOverGround = v["course"] | vessel->courseOverGround;
+        const float heading = v["heading"] | 511.0f;
+        vessel->heading = heading < 360.0f ? heading : -1;
+        // Datalastic's "type" is a text label (e.g. "Tanker"), not a numeric
+        // AIS code, so it's copied directly instead of going through
+        // shipTypeName()'s numeric-range lookup.
+        const char *typeText = v["type"] | "UNKNOWN";
+        strncpy(vessel->shipType, typeText, sizeof(vessel->shipType) - 1);
+        vessel->shipType[sizeof(vessel->shipType) - 1] = 0;
+        strcpy(vessel->navStatus, "UNKNOWN");
+      }
+      aisConnected = true;
+      aisLastMessageAt = millis();
+    } else {
+      aisConnected = false;
+    }
+  } else {
+    aisConnected = false;
+  }
+  http.end();
+}
+
+void fetchMarineRest() {
+  if (marineProvider == "aishub") fetchAisHubVessels();
+  else if (marineProvider == "myshiptracking") fetchMyShipTrackingVessels();
+  else if (marineProvider == "datalastic") fetchDatalasticVessels();
+}
+
 // AISstream.io pushes one JSON object per WebSocket text frame - a
 // PositionReport (course/speed/heading) or ShipStaticData (name/type),
 // keyed by MMSI. There is no polling: this is the entire live feed.
@@ -3275,7 +3484,7 @@ void onAisEvent(WStype_t type, uint8_t *payload, size_t length) {
 // September 2026 - if vessels start silently going stale after that date,
 // this is the first thing to check.
 void connectAisWebSocket() {
-  if (!aisApiKey.length()) return;
+  if (marineProvider != "aisstream" || !aisApiKey.length()) return;
 #if ADSB_TLS_INSECURE
   aisWebSocket.beginSSL("stream.aisstream.io", 443, "/v0/stream");
 #else
@@ -3310,6 +3519,12 @@ void setup() {
 #endif
   rapidApiKey = settingsStore.getString("rapid-key", "");
   aisApiKey = settingsStore.getString("ais-key", "");
+  aisHubUsername = settingsStore.getString("aishub-user", "");
+  myShipTrackingApiKey = settingsStore.getString("mst-key", "");
+  datalasticApiKey = settingsStore.getString("datalastic-key", "");
+  marineProvider = settingsStore.getString("marine-provider", "aisstream");
+  if (marineProvider != "aisstream" && marineProvider != "aishub" &&
+      marineProvider != "myshiptracking" && marineProvider != "datalastic") marineProvider = "aisstream";
   marineRadiusNm = constrain(settingsStore.getUShort("marine-radius", DEFAULT_MARINE_RADIUS_NM), 5, 250);
   homeLatitude = settingsStore.getFloat("home-lat", DEFAULT_HOME_LAT);
   homeLongitude = settingsStore.getFloat("home-lon", DEFAULT_HOME_LON);
@@ -3487,7 +3702,13 @@ void loop() {
     renderRadarPage();
     nextRadarFrameAt = millis() + 750;
   }
-  if (aisApiKey.length()) aisWebSocket.loop();
+  if (marineProvider == "aisstream") {
+    if (aisApiKey.length()) aisWebSocket.loop();
+  } else if (marineConfigured() && static_cast<int32_t>(millis() - nextMarineFetchAt) >= 0) {
+    fetchMarineRest();
+    nextMarineFetchAt = millis() + MARINE_REST_REFRESH_MS;
+    marineDataDirty = true;
+  }
   if (static_cast<int32_t>(millis() - nextMarinePruneAt) >= 0) {
     pruneStaleVessels();
     nextMarinePruneAt = millis() + 60000UL;

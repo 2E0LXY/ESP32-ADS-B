@@ -24,7 +24,7 @@ Current firmware: **v2.5.1**
 - **Route cache persistence**: resolved routes now survive a reboot, saved to SD (or LittleFS without a card) after each batch of new lookups and reloaded at boot, so a receiver that sees the same flights daily doesn't start every session cache-cold
 - **LCD Table/Overview route column**: distinguishes a route that's still queued for lookup (`---`) from one adsbdb was actually asked about and had nothing on file (`NO ROUTE` / `NO RTE`) - the latter is expected for most private/GA registrations, which have no scheduled route to look up
 - Adds `scripts/flash_remote.ps1`, which starts the `esp_rfc2217_server.py` serial-to-network bridge if it isn't already running, then builds and flashes over it — useful for driving a board's USB port from another machine on the network
-- **New Marine section and LCD page**: live AIS vessel tracking via [AISstream.io](https://aisstream.io)'s free WebSocket feed, centred on the receiver's saved position. Adds a new browser admin page (map, vessel table, AIS API key and radius settings) and a new physical LCD page in the Overview/Table/Map/Radar/Marine swipe cycle. There is no polling: vessel positions arrive as ships broadcast them over a persistent WebSocket connection. Adds the `links2004/WebSockets` library dependency
+- **New Marine section and LCD page**: live AIS vessel tracking, centred on the receiver's saved position. Adds a new browser admin page (provider selector, credential and radius settings, map, vessel table) and a new physical LCD page in the Overview/Table/Map/Radar/Marine swipe cycle. Selectable providers: [AISstream.io](https://aisstream.io) (free WebSocket push, no polling, the default), AISHub, MyShipTracking, and Datalastic (all three polled once a minute). Adds the `links2004/WebSockets` library dependency
 
 ### v2.5.1 correctness and hardening
 
@@ -132,7 +132,7 @@ Each sidebar entry opens a separate page. The footer on every page shows `Firmwa
 | Display | Active LCD page, brightness, alert state, and map-tile rebuild state | Map/Radar/Table, brightness, range presets, zero-mile alert, refresh | Yes |
 | Wi-Fi | SSID, signal quality, IP, gateway, DNS, and scan results | Scan, copy address, connect to a different network | Wi-Fi credentials |
 | Data API | Selected provider, request health, aircraft count, latency, and credential state | Select feed, edit/clear credentials, refresh test | Yes |
-| Marine | Live AIS vessel positions, connection state, vessel count | AIS API key, tracking radius, browser vessel map and table | Yes |
+| Marine | Live AIS vessel positions, connection state, vessel count | Provider selection, credential, tracking radius, browser vessel map and table | Yes |
 | Firmware | Installed/latest version, update availability, and release status | GitHub OTA, local `.bin` upload, installer/release recovery links | Firmware only |
 | Device | Identity, runtime, memory, network, display, and feed diagnostics | Password, diagnostic JSON, setup portal, reboot | Password |
 
@@ -174,7 +174,16 @@ Select an aircraft provider and replace or clear the credentials required by tha
 
 ### Marine
 
-Live ship positions from [AISstream.io](https://aisstream.io), centred on the same receiver position used for aircraft. Enter a free AISstream.io API key and a tracking radius (5-250 nm; typical VHF AIS coastal range is 20-40 nm), then save. The receiver holds a persistent WebSocket connection to AISstream.io and plots vessels as they broadcast - there is no polling interval to wait on. The page shows connection status, vessel count, time since the last message, a Leaflet map, and a searchable vessel table (name, MMSI, type, navigational status, speed, course, heading, distance).
+Live ship positions, centred on the same receiver position used for aircraft. Select a provider, enter its credential and a tracking radius (5-250 nm; typical VHF AIS coastal range is 20-40 nm), then save. The page shows connection status, vessel count, time since the last update, a Leaflet map, and a searchable vessel table (name, MMSI, type, navigational status, speed, course, heading, distance).
+
+| Provider | Credential | Access | Notes |
+| --- | --- | --- | --- |
+| AISstream.io | Free API key | Push (WebSocket) | Recommended default. No polling interval; vessels appear as they broadcast. |
+| AISHub | Username | Free, contribution-based | Requires an AISHub account that shares your own local AIS receiver's data with their network; the username alone, without a contributing receiver, may return nothing. Polled once a minute (AISHub rejects more frequent requests). |
+| MyShipTracking | API key | Freemium, billed per vessel returned | Polled once a minute. |
+| Datalastic | API key | Freemium, free trial | Radius is capped at 50 nm by the provider regardless of the value set here. Polled once a minute. |
+
+Two marine providers from common comparison lists are deliberately not offered: **NavAPI/Seametrix**'s public API covers ports, sea routes, and SECA zones only, with no vessel-position endpoint at all; **VesselFinder**'s area-based live feed ("LiveData") is a custom flat-fee subscription product requiring sales contact, not a self-service bounding-box API like the others.
 
 ### Firmware
 
