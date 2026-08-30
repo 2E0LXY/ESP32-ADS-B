@@ -295,7 +295,6 @@ bool aisConnected = false;
 uint32_t aisLastMessageAt = 0;
 uint16_t marineRadiusNm = DEFAULT_MARINE_RADIUS_NM;
 WebSocketsClient aisWebSocket;
-void connectAisWebSocket();  // defined near setup(); handleMarineCredentials() needs it earlier
 // Page order matches the swipe order on the panel: Overview is the first
 // screen, then swipe right advances Table -> Map -> Radar -> Marine and wraps.
 enum class DisplayPage : uint8_t { Overview = 0, Table = 1, Map = 2, Radar = 3, Marine = 4 };
@@ -3102,7 +3101,6 @@ void beginWebControl() {
   Serial.printf("Web control: http://%s/ or http://%s.local/\n",
                 WiFi.localIP().toString().c_str(), DEVICE_HOSTNAME);
 }
-}
 
 // AIS ship-type codes are a large ITU-defined table; this groups the ranges
 // that matter for a receiver display rather than reproducing it in full.
@@ -3276,6 +3274,8 @@ void connectAisWebSocket() {
 #endif
   aisWebSocket.onEvent(onAisEvent);
   aisWebSocket.setReconnectInterval(8000);
+}
+
 }
 
 void setup() {
