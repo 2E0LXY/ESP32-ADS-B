@@ -212,6 +212,11 @@ struct RouteCacheEntry {
   // full names.
   char originName[40] = {};
   char destinationName[40] = {};
+  // City/municipality names, used by the LCD Table and Overview pages: full
+  // airport names don't fit even on the wider WS7 panel, but a city pair
+  // ("LONDON -> MADRID") does and reads far better than raw ICAO codes.
+  char originCity[24] = {};
+  char destinationCity[24] = {};
   uint32_t resolvedAt = 0;
   uint32_t lastUsed = 0;
   bool occupied = false;
@@ -1108,6 +1113,12 @@ void airportName(JsonObject airport, char *output, size_t outSize) {
   output[outSize - 1] = 0;
 }
 
+void airportCity(JsonObject airport, char *output, size_t outSize) {
+  const char *city = airport["municipality"] | "";
+  strncpy(output, city, outSize - 1);
+  output[outSize - 1] = 0;
+}
+
 RouteCacheEntry *routeForCallsign(const char *rawCallsign, int &lookupsUsed,
                                   WiFiClientSecure &client, HTTPClient &http) {
   char callsign[9];
@@ -1166,6 +1177,8 @@ RouteCacheEntry *routeForCallsign(const char *rawCallsign, int &lookupsUsed,
   airportCode(route["destination"].as<JsonObject>(), slot->destination);
   airportName(route["origin"].as<JsonObject>(), slot->originName, sizeof(slot->originName));
   airportName(route["destination"].as<JsonObject>(), slot->destinationName, sizeof(slot->destinationName));
+  airportCity(route["origin"].as<JsonObject>(), slot->originCity, sizeof(slot->originCity));
+  airportCity(route["destination"].as<JsonObject>(), slot->destinationCity, sizeof(slot->destinationCity));
   slot->hasRoute = slot->origin[0] && slot->destination[0];
   if (slot->hasRoute) Serial.printf("Route %s %s>%s\n", callsign, slot->origin, slot->destination);
   return slot;
@@ -1390,13 +1403,18 @@ void renderTablePage() {
   for (int i=0; i<rows; ++i) {
     AircraftDisplay &display = latestAircraft[i];
     int y=49+i*40;
-    char distance[6], altitude[7], routeLabel[11];
+    char distance[6], altitude[7], routeLabel[52];
     snprintf(distance,sizeof(distance),"%d",static_cast<int>(lroundf(display.distanceMiles)));
     if (display.altitudeFt >= 0) snprintf(altitude,sizeof(altitude),"%d",display.altitudeFt);
     else strcpy(altitude,"--");
     RouteCacheEntry *route=cachedRoute(display.flight);
-    if (route && route->hasRoute) snprintf(routeLabel,sizeof(routeLabel),"%s>%s",route->origin,route->destination);
-    else strcpy(routeLabel,"---");
+    if (route && route->hasRoute) {
+      // City names read far better than raw codes and, unlike full airport
+      // names, actually fit this column's width - see RouteCacheEntry.
+      const char *originLabel = route->originCity[0] ? route->originCity : route->origin;
+      const char *destinationLabel = route->destinationCity[0] ? route->destinationCity : route->destination;
+      snprintf(routeLabel,sizeof(routeLabel),"%s>%s",originLabel,destinationLabel);
+    } else strcpy(routeLabel,"---");
     const char *identity=display.flight[0] ? display.flight : display.hex;
     if (display.positionSource == 2) drawMlatPlane(16,y+7,display.track);
     else drawOperatorBadge(16,y+7,display.flight,display.hex);
