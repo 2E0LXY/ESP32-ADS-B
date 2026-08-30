@@ -212,11 +212,16 @@ struct RouteCacheEntry {
   // full names.
   char originName[40] = {};
   char destinationName[40] = {};
-  // City/municipality names, used by the LCD Table and Overview pages: full
-  // airport names don't fit even on the wider WS7 panel, but a city pair
-  // ("LONDON -> MADRID") does and reads far better than raw ICAO codes.
+  // City/municipality names, used by the browser table fallback and as the
+  // input to the abbreviations below; full airport names don't fit even the
+  // wider WS7 panel, but a city pair ("LONDON -> MADRID") does.
   char originCity[24] = {};
   char destinationCity[24] = {};
+  // Departure-board-style abbreviation ("LON STAN"), used by the LCD Table
+  // page: a city code plus the first distinguishing word of the airport
+  // name. Computed once here rather than per frame.
+  char originAbbrev[10] = {};
+  char destinationAbbrev[10] = {};
   uint32_t resolvedAt = 0;
   uint32_t lastUsed = 0;
   bool occupied = false;
@@ -1119,6 +1124,48 @@ void airportCity(JsonObject airport, char *output, size_t outSize) {
   output[outSize - 1] = 0;
 }
 
+// Departure-board-style abbreviation, e.g. "LONDON" + "London Stansted
+// Airport" -> "LON STAN": the first 3 letters of the city plus the first
+// word of the airport name that isn't the city itself or a generic suffix
+// like "Airport"/"International". Best-effort - adsbdb has no canonical
+// short form, and this won't suit every naming convention worldwide.
+void abbreviateAirport(const char *cityName, const char *fullAirportName, char *output, size_t outSize) {
+  char cityPart[4] = {};
+  int ci = 0;
+  for (const char *p = cityName; *p && ci < 3; ++p)
+    if (isalpha(static_cast<unsigned char>(*p))) cityPart[ci++] = toupper(static_cast<unsigned char>(*p));
+  cityPart[ci] = 0;
+
+  char cityUpper[24] = {};
+  size_t cu = 0;
+  for (const char *p = cityName; *p && cu < sizeof(cityUpper) - 1; ++p) cityUpper[cu++] = toupper(static_cast<unsigned char>(*p));
+  cityUpper[cu] = 0;
+
+  static const char *skipWords[] = {"AIRPORT", "INTERNATIONAL", "INTL", "REGIONAL",
+                                     "FIELD", "AIRFIELD", "MUNICIPAL", "COUNTY", "AERODROME"};
+
+  char distinguishing[5] = {};
+  char word[32] = {};
+  size_t wi = 0;
+  for (const char *p = fullAirportName;; ++p) {
+    char c = *p;
+    bool boundary = (c == ' ' || c == '-' || c == 0);
+    if (!boundary && wi < sizeof(word) - 1) word[wi++] = toupper(static_cast<unsigned char>(c));
+    if (boundary) {
+      word[wi] = 0;
+      if (wi > 0 && !distinguishing[0] && strcmp(word, cityUpper)) {
+        bool skip = false;
+        for (const char *s : skipWords) if (!strcmp(word, s)) { skip = true; break; }
+        if (!skip) { strncpy(distinguishing, word, 4); distinguishing[4] = 0; }
+      }
+      wi = 0;
+      if (c == 0) break;
+    }
+  }
+  if (distinguishing[0]) snprintf(output, outSize, "%s %s", cityPart, distinguishing);
+  else snprintf(output, outSize, "%s", cityPart);
+}
+
 RouteCacheEntry *routeForCallsign(const char *rawCallsign, int &lookupsUsed,
                                   WiFiClientSecure &client, HTTPClient &http) {
   char callsign[9];
@@ -1179,6 +1226,10 @@ RouteCacheEntry *routeForCallsign(const char *rawCallsign, int &lookupsUsed,
   airportName(route["destination"].as<JsonObject>(), slot->destinationName, sizeof(slot->destinationName));
   airportCity(route["origin"].as<JsonObject>(), slot->originCity, sizeof(slot->originCity));
   airportCity(route["destination"].as<JsonObject>(), slot->destinationCity, sizeof(slot->destinationCity));
+  if (slot->originCity[0] && slot->originName[0])
+    abbreviateAirport(slot->originCity, slot->originName, slot->originAbbrev, sizeof(slot->originAbbrev));
+  if (slot->destinationCity[0] && slot->destinationName[0])
+    abbreviateAirport(slot->destinationCity, slot->destinationName, slot->destinationAbbrev, sizeof(slot->destinationAbbrev));
   slot->hasRoute = slot->origin[0] && slot->destination[0];
   if (slot->hasRoute) Serial.printf("Route %s %s>%s\n", callsign, slot->origin, slot->destination);
   return slot;
@@ -1375,25 +1426,28 @@ void renderMapPage() {
   present();
 }
 
-// Table column origins, expressed against the panel width. The 480 design
-// used 2/34/132/184/244/280/354; those ratios are preserved.
-constexpr int COL_LOGO = W * 2 / 480;
-constexpr int COL_CALLSIGN = W * 34 / 480;
-constexpr int COL_MILES = W * 132 / 480;
-constexpr int COL_SOURCE = W * 184 / 480;
-constexpr int COL_DIR = W * 244 / 480;
-constexpr int COL_ALT = W * 280 / 480;
-constexpr int COL_ROUTE = W * 354 / 480;
+// Table column origins, sized to the content they hold at the fixed scale-2
+// glyph width (12px/char) rather than scaled to the panel width - a wider
+// board should give its extra room to the ROUTE column, not stretch empty
+// gaps between narrow columns proportionally.
+constexpr int COL_LOGO = 2;
+constexpr int COL_CALLSIGN = 34;
+constexpr int COL_MILES = 144;
+constexpr int COL_SOURCE = 194;
+constexpr int COL_DIR = 220;
+constexpr int COL_ALT = 258;
+constexpr int COL_ROUTE = 332;
+
+constexpr uint16_t ROW_BAND_DARK = rgb(6, 16, 28);
+constexpr uint16_t ROW_BAND_LIGHT = rgb(14, 36, 58);
 
 void renderTablePage() {
   filledRect(0,0,W,H,rgb(2,10,18));
-  // Columns are fractions of the panel width so the 800px board spreads the
-  // table out instead of crowding it into the leftmost 480px.
   text5(layout::centreX - 96,7,"NEAREST AIRCRAFT",rgb(80,220,255),2);
   text5(COL_LOGO,31,"LOGO",rgb(170,190,205));
   text5(COL_CALLSIGN,31,"CALLSIGN",rgb(170,190,205));
   text5(COL_MILES,31,"MILES",rgb(170,190,205));
-  text5(COL_SOURCE,31,"SOURCE",rgb(170,190,205));
+  text5(COL_SOURCE,31,"S",rgb(170,190,205));
   text5(COL_DIR,31,"DIR",rgb(170,190,205));
   text5(COL_ALT,31,"ALT FT",rgb(170,190,205));
   text5(COL_ROUTE,31,"FROM TO",rgb(170,190,205));
@@ -1403,28 +1457,29 @@ void renderTablePage() {
   for (int i=0; i<rows; ++i) {
     AircraftDisplay &display = latestAircraft[i];
     int y=49+i*40;
-    char distance[6], altitude[7], routeLabel[52];
+    filledRect(0, y-7, W, 40, (i & 1) ? ROW_BAND_LIGHT : ROW_BAND_DARK);
+    char distance[6], altitude[7], routeLabel[24];
     snprintf(distance,sizeof(distance),"%d",static_cast<int>(lroundf(display.distanceMiles)));
     if (display.altitudeFt >= 0) snprintf(altitude,sizeof(altitude),"%d",display.altitudeFt);
     else strcpy(altitude,"--");
     RouteCacheEntry *route=cachedRoute(display.flight);
     if (route && route->hasRoute) {
-      // City names read far better than raw codes and, unlike full airport
-      // names, actually fit this column's width - see RouteCacheEntry.
-      const char *originLabel = route->originCity[0] ? route->originCity : route->origin;
-      const char *destinationLabel = route->destinationCity[0] ? route->destinationCity : route->destination;
+      // Departure-board-style abbreviations ("LON STAN>LON HEAT") fit this
+      // column far better than full airport names - see RouteCacheEntry.
+      const char *originLabel = route->originAbbrev[0] ? route->originAbbrev : route->origin;
+      const char *destinationLabel = route->destinationAbbrev[0] ? route->destinationAbbrev : route->destination;
       snprintf(routeLabel,sizeof(routeLabel),"%s>%s",originLabel,destinationLabel);
     } else strcpy(routeLabel,"---");
     const char *identity=display.flight[0] ? display.flight : display.hex;
-    if (display.positionSource == 2) drawMlatPlane(16,y+7,display.track);
+    const bool isMlat = display.positionSource == 2;
+    if (isMlat) drawMlatPlane(16,y+7,display.track);
     else drawOperatorBadge(16,y+7,display.flight,display.hex);
-    text5(COL_CALLSIGN,y,identity,rgb(255,255,255),2);
-    text5(COL_MILES,y,distance,rgb(255,220,80),2);
-    text5(COL_SOURCE,y,display.positionSource==2 ? "MLAT" : "ADSB",display.positionSource==2 ? rgb(255,65,65) : rgb(60,220,130),2);
+    text5(COL_CALLSIGN,y,identity,rgb(255,220,60),2);
+    text5(COL_MILES,y,distance,rgb(255,255,255),2);
+    text5(COL_SOURCE,y,isMlat ? "M" : "A",isMlat ? rgb(255,65,65) : rgb(60,220,130),2);
     text5(COL_DIR,y,compassDirection(display.track),rgb(255,255,255),2);
     text5(COL_ALT,y,altitude,rgb(255,255,255),2);
-    text5(COL_ROUTE,y,routeLabel,rgb(130,210,255),2);
-    line(3,y+25,W - 4,y+25,rgb(25,45,60));
+    text5(COL_ROUTE,y,routeLabel,rgb(255,255,255),2);
   }
   char footer[24];
   if (creditsRemaining >= 0)
