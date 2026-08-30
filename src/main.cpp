@@ -3721,7 +3721,16 @@ void loop() {
   }
   if (static_cast<int32_t>(millis()-nextFetchAt) >= 0) {
     const uint32_t fetchStartedAt = millis();
+    // The AIS WebSocket's persistent TLS session and this fetch's own TLS
+    // session compete for the same scarce internal RAM on this board - with
+    // both open at once, heapMinimum fell to a few hundred bytes and every
+    // aircraft/route request failed. Pausing the socket for the fetch's
+    // duration is the difference between the feed working at all and not;
+    // AISstream tolerates the brief reconnect (it re-subscribes on connect).
+    const bool pauseAis = marineProvider == "aisstream" && aisWebSocket.isConnected();
+    if (pauseAis) aisWebSocket.disconnect();
     fetchAircraft();
+    if (pauseAis) connectAisWebSocket();
     Serial.printf("fetchAircraft blocked the loop for %lu ms\n",
                   static_cast<unsigned long>(millis() - fetchStartedAt));
     if (openSkyAuthRetryPending) nextFetchAt = millis() + 1000UL;
