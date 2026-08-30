@@ -1438,8 +1438,8 @@ constexpr int COL_DIR = 220;
 constexpr int COL_ALT = 258;
 constexpr int COL_ROUTE = 332;
 
-constexpr uint16_t ROW_BAND_DARK = rgb(6, 16, 28);
-constexpr uint16_t ROW_BAND_LIGHT = rgb(14, 36, 58);
+const uint16_t ROW_BAND_DARK = rgb(6, 16, 28);
+const uint16_t ROW_BAND_LIGHT = rgb(14, 36, 58);
 
 void renderTablePage() {
   filledRect(0,0,W,H,rgb(2,10,18));
