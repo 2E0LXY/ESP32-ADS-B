@@ -5,7 +5,7 @@
 #   powershell -ExecutionPolicy Bypass -File scripts\flash_remote.ps1
 #
 # Common overrides:
-#   -SerialPort COM5          # default: COM28
+#   -SerialPort COM5          # override auto-detection and force a specific port
 #   -PioEnv ws_lcd_7_app       # default: ws_lcd_7_app (use waveshare_esp32_s3_lcd_4 for the WS4 board)
 #   -Monitor                  # skip the build/upload and just tail serial logs
 #   -SkipPull                 # don't run "git pull" first
@@ -15,7 +15,7 @@
 #   -UninstallStartupTask     # remove that task
 
 param(
-  [string]$SerialPort = "COM28",
+  [string]$SerialPort,
   [int]$TcpPort = 5555,
   [string]$PioEnv = "ws_lcd_7_app",
   [switch]$Monitor,
@@ -28,6 +28,33 @@ $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $repoRoot
 $taskName = "ESP32ADSB-SerialBridge"
+
+# COM port numbers drift (a different USB port/hub, another device grabbing
+# one first), so hunt for the actual USB-serial adapter instead of hardcoding
+# a port that stops matching reality. The WS7 board's UART bridge chip shows
+# up in Device Manager as one of these controller names.
+function Find-SerialPort {
+  $candidates = Get-CimInstance Win32_PnPEntity -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -match 'CH340|CH343|CH9102|CP210|FTDI|FT232|USB-SERIAL|USB Serial' -and $_.Name -match '\(COM(\d+)\)' } |
+    ForEach-Object {
+      if ($_.Name -match '\((COM\d+)\)') { [PSCustomObject]@{ Port = $matches[1]; Name = $_.Name } }
+    }
+  return @($candidates)
+}
+
+if (-not $SerialPort) {
+  $found = Find-SerialPort
+  if ($found.Count -eq 1) {
+    $SerialPort = $found[0].Port
+    Write-Host "Auto-detected serial port: $SerialPort ($($found[0].Name))"
+  } elseif ($found.Count -gt 1) {
+    Write-Host "Multiple USB-serial adapters found - pass -SerialPort to pick one:"
+    $found | ForEach-Object { Write-Host "  $($_.Port): $($_.Name)" }
+    throw "Ambiguous serial port; re-run with -SerialPort COMx"
+  } else {
+    throw "No USB-serial adapter auto-detected. Plug in the board, or check Device Manager > Ports (COM & LPT) and pass -SerialPort COMx explicitly."
+  }
+}
 
 if ($UninstallStartupTask) {
   schtasks /Delete /TN $taskName /F 2>$null
