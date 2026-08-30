@@ -1429,17 +1429,41 @@ void renderMapPage() {
 // Table column origins, sized to the content they hold at the fixed scale-2
 // glyph width (12px/char) rather than scaled to the panel width - a wider
 // board should give its extra room to the ROUTE column, not stretch empty
-// gaps between narrow columns proportionally.
+// gaps between narrow columns proportionally. Small columns get slightly
+// more even padding than the bare minimum so the row reads as a grid.
 constexpr int COL_LOGO = 2;
 constexpr int COL_CALLSIGN = 34;
-constexpr int COL_MILES = 144;
-constexpr int COL_SOURCE = 194;
-constexpr int COL_DIR = 220;
-constexpr int COL_ALT = 258;
-constexpr int COL_ROUTE = 332;
+constexpr int COL_MILES = 150;
+constexpr int COL_SOURCE = 210;
+constexpr int COL_DIR = 240;
+constexpr int COL_ALT = 280;
+constexpr int COL_ROUTE = 350;
 
 const uint16_t ROW_BAND_DARK = rgb(6, 16, 28);
 const uint16_t ROW_BAND_LIGHT = rgb(14, 36, 58);
+
+// Picks the richest origin/destination representation that fits maxChars,
+// falling back from full airport names to city names to the departure-board
+// abbreviation to raw codes - so a wide panel shows full names while a
+// narrow one still gets something readable instead of clipped garbage.
+void buildRouteLabel(const RouteCacheEntry *route, char *output, size_t outSize, int maxChars) {
+  if (!route || !route->hasRoute) { strncpy(output, "---", outSize); return; }
+  struct Option { const char *origin; const char *destination; };
+  const Option options[] = {
+    {route->originName[0] ? route->originName : nullptr, route->destinationName[0] ? route->destinationName : nullptr},
+    {route->originCity[0] ? route->originCity : nullptr, route->destinationCity[0] ? route->destinationCity : nullptr},
+    {route->originAbbrev[0] ? route->originAbbrev : nullptr, route->destinationAbbrev[0] ? route->destinationAbbrev : nullptr},
+    {route->origin, route->destination},
+  };
+  for (const Option &opt : options) {
+    if (!opt.origin || !opt.destination) continue;
+    int len = static_cast<int>(strlen(opt.origin) + 1 + strlen(opt.destination));
+    if (len <= maxChars) { snprintf(output, outSize, "%s>%s", opt.origin, opt.destination); return; }
+  }
+  // Nothing fit - an extremely narrow panel. Show the codes and let the
+  // panel edge clip them rather than show nothing.
+  snprintf(output, outSize, "%s>%s", route->origin, route->destination);
+}
 
 void renderTablePage() {
   filledRect(0,0,W,H,rgb(2,10,18));
@@ -1458,18 +1482,16 @@ void renderTablePage() {
     AircraftDisplay &display = latestAircraft[i];
     int y=49+i*40;
     filledRect(0, y-7, W, 40, (i & 1) ? ROW_BAND_LIGHT : ROW_BAND_DARK);
-    char distance[6], altitude[7], routeLabel[24];
+    char distance[6], altitude[7], routeLabel[84];
     snprintf(distance,sizeof(distance),"%d",static_cast<int>(lroundf(display.distanceMiles)));
     if (display.altitudeFt >= 0) snprintf(altitude,sizeof(altitude),"%d",display.altitudeFt);
     else strcpy(altitude,"--");
     RouteCacheEntry *route=cachedRoute(display.flight);
-    if (route && route->hasRoute) {
-      // Departure-board-style abbreviations ("LON STAN>LON HEAT") fit this
-      // column far better than full airport names - see RouteCacheEntry.
-      const char *originLabel = route->originAbbrev[0] ? route->originAbbrev : route->origin;
-      const char *destinationLabel = route->destinationAbbrev[0] ? route->destinationAbbrev : route->destination;
-      snprintf(routeLabel,sizeof(routeLabel),"%s>%s",originLabel,destinationLabel);
-    } else strcpy(routeLabel,"---");
+    // Drawn at scale 1 below (6px/char), not the scale-2 used elsewhere in
+    // this row - full airport names need roughly double the char budget
+    // scale 2 would allow in this column's width.
+    const int routeMaxChars = (W - 4 - COL_ROUTE) / 6;
+    buildRouteLabel(route, routeLabel, sizeof(routeLabel), routeMaxChars);
     const char *identity=display.flight[0] ? display.flight : display.hex;
     const bool isMlat = display.positionSource == 2;
     if (isMlat) drawMlatPlane(16,y+7,display.track);
@@ -1479,7 +1501,7 @@ void renderTablePage() {
     text5(COL_SOURCE,y,isMlat ? "M" : "A",isMlat ? rgb(255,65,65) : rgb(60,220,130),2);
     text5(COL_DIR,y,compassDirection(display.track),rgb(255,255,255),2);
     text5(COL_ALT,y,altitude,rgb(255,255,255),2);
-    text5(COL_ROUTE,y,routeLabel,rgb(255,255,255),2);
+    text5(COL_ROUTE,y+4,routeLabel,rgb(255,255,255));
   }
   char footer[24];
   if (creditsRemaining >= 0)
