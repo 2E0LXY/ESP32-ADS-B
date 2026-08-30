@@ -1393,7 +1393,10 @@ void renderOverviewPage() {
     text5(panelX + OVERVIEW_COL_ALT, y, altitude, rgb(150, 225, 190));
     RouteCacheEntry *route = cachedRoute(display.flight);
     char routeLabel[11];
+    // "---" means not looked up yet (still queued); "NO RTE" means adsbdb
+    // was asked and had nothing on file, usually a private/GA registration.
     if (route && route->hasRoute) snprintf(routeLabel, sizeof(routeLabel), "%s>%s", route->origin, route->destination);
+    else if (route) strcpy(routeLabel, "NO RTE");
     else strcpy(routeLabel, "---");
     text5(panelX + OVERVIEW_COL_ROUTE, y, routeLabel, rgb(130, 210, 255));
   }
@@ -1447,7 +1450,12 @@ const uint16_t ROW_BAND_LIGHT = rgb(14, 36, 58);
 // abbreviation to raw codes - so a wide panel shows full names while a
 // narrow one still gets something readable instead of clipped garbage.
 void buildRouteLabel(const RouteCacheEntry *route, char *output, size_t outSize, int maxChars) {
-  if (!route || !route->hasRoute) { strncpy(output, "---", outSize); return; }
+  // No cache entry yet: this callsign hasn't reached the front of the
+  // (throttled, two-per-refresh) lookup queue. A resolved entry with
+  // hasRoute false means adsbdb was actually asked and had nothing - most
+  // often a private/GA registration with no scheduled route on file.
+  if (!route) { snprintf(output, outSize, "---"); return; }
+  if (!route->hasRoute) { snprintf(output, outSize, maxChars >= 8 ? "NO ROUTE" : "---"); return; }
   struct Option { const char *origin; const char *destination; };
   const Option options[] = {
     {route->originName[0] ? route->originName : nullptr, route->destinationName[0] ? route->destinationName : nullptr},
