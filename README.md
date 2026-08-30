@@ -7,7 +7,21 @@
 
 Firmware for the **Waveshare ESP32-S3 Touch-LCD-4 Rev 4.0, 480 × 480, non-touch panel**. It retrieves nearby ADS-B and MLAT aircraft, plots them on an OpenStreetMap base map on the LCD, and provides a password-protected web administration interface on the local network.
 
+Also runs on the **Waveshare ESP32-S3-Touch-LCD-7 / -4.3, 800 × 480, GT911 touch** boards; see [Supported hardware](#supported-hardware).
+
 Current firmware: **v2.5.1**
+
+### Unreleased
+
+- **LCD Overview page**: adds a route (`RTE`) column next to the nearest-aircraft strip, sourced from the same route cache used by the Table and Map pages
+- **LCD Table page**: redesigned as an airport-departure-board style layout — alternating row colours, a yellow callsign, a single-letter green `A` / red `M` source instead of the word ADSB/MLAT, and tightened columns that give the freed width to the route column
+- **LCD Table page route column**: shows the richest airport name that fits the available width — full names, then city names, then a departure-board-style abbreviation (`LON STAN`), then raw ICAO/IATA codes — instead of only ever showing short codes
+- **Browser Aircraft/Overview tables**: the small logo-badge column is replaced by the operator's full name; the badge itself now appears in the map popup instead
+- **Browser Aircraft/Overview tables**: the FROM/TO column shows the full airport names (e.g. "London Heathrow Airport -> John F Kennedy International Airport") instead of raw codes
+- **Browser map**: clicking a marker now opens a popup with the complete aircraft detail set (operator badge, registration, altitude, speed, squawk, category, signal, country, emergency state, and more), not just a short summary
+- **Browser map**: clicking a row in the Aircraft/Overview table jumps to the map, zooms in on that aircraft, and opens its popup; click the same row again to stop tracking
+- **Browser map**: a "Show 5 min trails" checkbox draws each aircraft's recent track as a line, with the tracked aircraft's trail highlighted
+- Adds `scripts/flash_remote.ps1`, which starts the `esp_rfc2217_server.py` serial-to-network bridge if it isn't already running, then builds and flashes over it — useful for driving a board's USB port from another machine on the network
 
 ### v2.5.1 correctness and hardening
 
@@ -68,7 +82,8 @@ Current firmware: **v2.5.1**
 - Receiver latitude, longitude, and radius configurable from the web interface
 - Receiver changes applied to the browser map, LCD map, API query area, and distance calculations
 - Browser zoom saved to NVS and reused by the physical LCD map after reboot
-- Full Overview aircraft table with operator badges and all common provider fields
+- Full Overview aircraft table with operator names and all common provider fields
+- Click any aircraft row to jump to the browser map, zoom in, and track it; toggle 5-minute movement trails on the map
 - Selectable aircraft-data providers with editable API credentials
 - Wi-Fi network scanning and connection management
 - Local firmware upload plus automatic update checks from GitHub Releases
@@ -79,6 +94,15 @@ Current firmware: **v2.5.1**
 - Centred, wide-screen admin pages with receiver quick actions and live health summaries
 - One-click radar range presets, Wi-Fi quality meter, recovery links, and privacy-safe diagnostic export
 - Boot screen displays the management IP address after Wi-Fi connects
+
+## Supported hardware
+
+| Board | Panel | Touch | Backlight | PlatformIO env |
+| --- | --- | --- | --- | --- |
+| Waveshare ESP32-S3-Touch-LCD-4 Rev 4.0 | 480 × 480 | None | Full 0-255 PWM via the CH32 expander | `waveshare_esp32_s3_lcd_4` |
+| Waveshare ESP32-S3-Touch-LCD-7 / -4.3 | 800 × 480 | GT911, swipe to change page | On/off only via the CH422G expander (no PWM on this board) | `ws_lcd_7_app` |
+
+Panel geometry, pins, and the expander driver are all resolved from `src/board_config.h` and `src/boards/*.h`, so the same application source builds for either board. Set the environment's `board_build.*` and `-DADSB_BOARD_*` build flag in `platformio.ini` to switch boards; see the `## Build` section below for the exact commands.
 
 ## First login
 
@@ -100,8 +124,8 @@ Each sidebar entry opens a separate page. The footer on every page shows `Firmwa
 | Page | Live information | Main controls | Saved after reboot |
 | --- | --- | --- | --- |
 | Overview | Receiver health, traffic totals, provider, Wi-Fi, uptime, and full aircraft table | Refresh traffic, open Map/Radar, check updates | — |
-| Map | Receiver position, range, zoom, OpenStreetMap tiles, and aircraft | Position, radius, centre, zoom | Yes |
-| Aircraft | Every available aircraft field, operator badge, source, age, signal, and emergency | Search and source filter | — |
+| Map | Receiver position, range, zoom, OpenStreetMap tiles, and aircraft | Position, radius, centre, zoom, click-to-track, 5-minute trails | Yes |
+| Aircraft | Every available aircraft field, operator name, source, age, signal, and emergency | Search, source filter, click a row to track it on the map | — |
 | Display | Active LCD page, brightness, alert state, and map-tile rebuild state | Map/Radar/Table, brightness, range presets, zero-mile alert, refresh | Yes |
 | Wi-Fi | SSID, signal quality, IP, gateway, DNS, and scan results | Scan, copy address, connect to a different network | Wi-Fi credentials |
 | Data API | Selected provider, request health, aircraft count, latency, and credential state | Select feed, edit/clear credentials, refresh test | Yes |
@@ -116,13 +140,13 @@ Connection, aircraft, provider, display, and firmware status at a glance, follow
 
 ### Map
 
-Live OpenStreetMap view of the received aircraft. Save a new receiver position, radius, and current browser zoom here; the same values immediately control the LCD map, provider query bounds, and aircraft-distance calculations and remain stored after reboot.
+Live OpenStreetMap view of the received aircraft. Save a new receiver position, radius, and current browser zoom here; the same values immediately control the LCD map, provider query bounds, and aircraft-distance calculations and remain stored after reboot. Click a marker for its full detail popup, click a row on the Aircraft/Overview page to jump here and track that aircraft, or enable **Show 5 min trails** to draw each aircraft's recent track.
 
 ![Map page](docs/screenshots/map.png)
 
 ### Aircraft
 
-Searchable live table containing operator badge/name, ICAO address, callsign, registration, aircraft type, distance, coordinates, barometric/geometric altitude, speed, vertical rate, heading, squawk, category, ground state, data age, messages, signal, country, route, source, and emergency state.
+Searchable live table containing operator name, ICAO address, callsign, registration, aircraft type, distance, coordinates, barometric/geometric altitude, speed, vertical rate, heading, squawk, category, ground state, data age, messages, signal, country, full-name route, source, and emergency state. Click a row to jump to the Map page and track that aircraft.
 
 ![Aircraft page](docs/screenshots/aircraft.png)
 
@@ -194,11 +218,20 @@ Install [PlatformIO](https://platformio.org/), clone the repository, and run:
 pio run
 ```
 
+This builds the default `waveshare_esp32_s3_lcd_4` environment (the 480 × 480 WS4 board). For the 800 × 480 WS7 board, select its environment explicitly:
+
+```powershell
+pio run -e ws_lcd_7_app
+```
+
 The OTA image is generated at:
 
 ```text
 .pio/build/waveshare_esp32_s3_lcd_4/firmware.bin
+.pio/build/ws_lcd_7_app/firmware.bin
 ```
+
+To build, flash, and (optionally) keep a serial bridge running automatically from another machine on the network, see `scripts/flash_remote.ps1`.
 
 ## USB installation
 
@@ -226,11 +259,13 @@ If the board does not enter download mode, hold **BOOT**, tap **RESET**, begin t
 
 ## Physical display behaviour
 
-- Short BOOT-button press: cycles the LCD through Map, Radar, and Table and saves the selection
+- Short BOOT-button press (or a swipe on the WS7 touch panel): cycles the LCD through Overview, Table, Map, and Radar, and saves the selection
+- Overview page: map on the left with a compact nearest-aircraft strip (callsign, distance, altitude, route) on the right
+- Table page: airport-departure-board style list with operator badge, callsign, distance, source, direction, altitude, and the fullest airport name that fits the panel width
 - Aircraft data refresh: every 30 seconds or on demand
 - ADS-B aircraft: cyan/operator-coloured symbol
 - MLAT aircraft: violet/red symbol
-- Route lookup: public ADSBDB callsign endpoint, cached for six hours
+- Route lookup: public ADSBDB callsign endpoint, cached for six hours; the Table page shows the fullest name that fits (full name, then city, then a departure-board-style abbreviation, then the raw code), while the Overview and Map pages show the raw code
 - Zero-mile aircraft: optional 200 ms buzzer alert
 - OSM failure: falls back to the built-in radar-style map
 
