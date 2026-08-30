@@ -1623,6 +1623,10 @@ void renderTablePage() {
     if (isMlat) drawMlatPlane(16,y+7,display.track);
     else drawOperatorBadge(16,y+7,display.flight,display.hex);
     text5(COL_CALLSIGN,y,identity,rgb(255,220,60),2);
+    // Registration (tail number) is the airframe's fixed ID, distinct from
+    // the callsign above it which can vary flight to flight (e.g. QTR74X
+    // flown by A7-AOA, or a squadron callsign like REDARROW on XX221).
+    if (display.registration[0]) text5(COL_CALLSIGN,y+16,display.registration,rgb(150,180,200));
     text5(COL_MILES,y,distance,rgb(255,255,255),2);
     text5(COL_SOURCE,y,isMlat ? "M" : "A",isMlat ? rgb(255,65,65) : rgb(60,220,130),2);
     text5(COL_DIR,y,compassDirection(display.track),rgb(255,255,255),2);
@@ -3222,16 +3226,21 @@ void onAisEvent(WStype_t type, uint8_t *payload, size_t length) {
         strncpy(vessel->name, name, sizeof(vessel->name) - 1);
         vessel->name[sizeof(vessel->name) - 1] = 0;
       }
-      const double lat = meta["Latitude"] | 0.0;
-      const double lon = meta["Longitude"] | 0.0;
-      if (lat != 0.0 || lon != 0.0) {
-        vessel->latitude = lat;
-        vessel->longitude = lon;
-        vessel->distanceMiles = distanceMilesFromHome(lat, lon);
-      }
       if (!strcmp(messageType, "PositionReport")) {
         JsonObject report = doc["Message"]["PositionReport"].as<JsonObject>();
         if (!report.isNull()) {
+          // Despite the docs' inline example showing Latitude/Longitude on
+          // MetaData, AISstream's own example code (github.com/aisstream/
+          // example) reads position from the PositionReport message itself
+          // - MetaData's copy is unreliable and was silently leaving every
+          // vessel at 0,0.
+          const double lat = report["Latitude"] | 0.0;
+          const double lon = report["Longitude"] | 0.0;
+          if (lat != 0.0 || lon != 0.0) {
+            vessel->latitude = lat;
+            vessel->longitude = lon;
+            vessel->distanceMiles = distanceMilesFromHome(lat, lon);
+          }
           vessel->speedKnots = report["Sog"] | vessel->speedKnots;
           vessel->courseOverGround = report["Cog"] | vessel->courseOverGround;
           const float trueHeading = report["TrueHeading"] | 511.0f;
