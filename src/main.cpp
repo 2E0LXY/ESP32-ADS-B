@@ -23,6 +23,7 @@
 #define SDCARD SD
 #endif
 #include <PNGdec.h>
+#include <WebSocketsClient.h>
 #include <esp_heap_caps.h>
 #include <esp_system.h>
 #include <mbedtls/sha256.h>
@@ -110,6 +111,9 @@ constexpr uint16_t DEFAULT_RADIUS_NM = 60;
 constexpr char TOKEN_URL[] = "https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token";
 constexpr uint32_t REFRESH_MS = 30000;
 constexpr int MAX_AIRCRAFT = 250;
+constexpr int MAX_VESSELS = 250;
+constexpr uint16_t DEFAULT_MARINE_RADIUS_NM = 25;  // typical VHF AIS coastal range
+constexpr uint32_t MARINE_STALE_MS = 20UL * 60UL * 1000UL;  // AIS position reports are event-driven, not polled
 constexpr int ROUTE_CACHE_SIZE = 48;
 constexpr int MAX_ROUTE_LOOKUPS_PER_REFRESH = 2;
 constexpr uint32_t ROUTE_CACHE_MS = 6UL * 60UL * 60UL * 1000UL;
@@ -255,6 +259,22 @@ struct AircraftDisplay {
   char emergency[16];
 };
 
+struct VesselDisplay {
+  int x;
+  int y;
+  double latitude;
+  double longitude;
+  float speedKnots;
+  float courseOverGround;
+  float heading;  // -1 if not broadcast; AIS separates heading from course
+  float distanceMiles;
+  uint32_t mmsi;
+  uint32_t lastUpdateMs;
+  char name[24];
+  char shipType[24];
+  char navStatus[24];
+};
+
 uint16_t *framebuffer = nullptr;
 uint16_t *baseMap = nullptr;
 PNG pngDecoder;
@@ -268,13 +288,22 @@ int lastMlat = 0;
 long creditsRemaining = -1;
 RouteCacheEntry routeCache[ROUTE_CACHE_SIZE];
 AircraftDisplay *latestAircraft = nullptr;
+VesselDisplay *latestVessels = nullptr;
+int vesselCount = 0;
+String aisApiKey;
+bool aisConnected = false;
+uint32_t aisLastMessageAt = 0;
+uint16_t marineRadiusNm = DEFAULT_MARINE_RADIUS_NM;
+WebSocketsClient aisWebSocket;
 // Page order matches the swipe order on the panel: Overview is the first
-// screen, then swipe right advances Table -> Map -> Radar and wraps.
-enum class DisplayPage : uint8_t { Overview = 0, Table = 1, Map = 2, Radar = 3 };
-constexpr uint8_t DISPLAY_PAGE_COUNT = 4;
+// screen, then swipe right advances Table -> Map -> Radar -> Marine and wraps.
+enum class DisplayPage : uint8_t { Overview = 0, Table = 1, Map = 2, Radar = 3, Marine = 4 };
+constexpr uint8_t DISPLAY_PAGE_COUNT = 5;
 DisplayPage displayPage = DisplayPage::Overview;
 float radarSweepDegrees = 0.0f;
 uint32_t nextRadarFrameAt = 0;
+uint32_t nextMarineRenderAt = 0;
+uint32_t nextMarinePruneAt = 0;
 bool touchReady = false;
 uint8_t touchAddress = 0;
 uint32_t lastTouchAt = 0;
@@ -1486,6 +1515,35 @@ void renderMapPage() {
   present();
 }
 
+void drawVesselIcon(int x, int y, float course, uint16_t colour) {
+  const float a = radians(course - 90.0f);
+  const float cs = cosf(a), sn = sinf(a);
+  auto tx = [&](float px, float py) { return x + lroundf(px * cs - py * sn); };
+  auto ty = [&](float px, float py) { return y + lroundf(px * sn + py * cs); };
+  disc(x, y, 2, colour);
+  line(tx(9, 0), ty(9, 0), tx(-6, -4), ty(-6, -4), colour);
+  line(tx(9, 0), ty(9, 0), tx(-6, 4), ty(-6, 4), colour);
+  line(tx(-6, -4), ty(-6, -4), tx(-3, 0), ty(-3, 0), colour);
+  line(tx(-3, 0), ty(-3, 0), tx(-6, 4), ty(-6, 4), colour);
+}
+
+void renderMarinePage() {
+  restoreMap();
+  int plotted = 0;
+  for (int i = 0; i < vesselCount; ++i) {
+    VesselDisplay &vessel = latestVessels[i];
+    int x, y;
+    if (!mapPoint(vessel.latitude, vessel.longitude, x, y)) continue;
+    drawVesselIcon(x, y, vessel.courseOverGround, rgb(70, 200, 255));
+    ++plotted;
+  }
+  char count[28];
+  if (!aisApiKey.length()) snprintf(count, sizeof(count), "AIS NOT CONFIGURED");
+  else snprintf(count, sizeof(count), "%d SHIPS%s", plotted, aisConnected ? "" : " (OFFLINE)");
+  status(count, !aisApiKey.length() ? rgb(150,150,150) : aisConnected ? rgb(35,210,80) : rgb(220,60,60));
+  present();
+}
+
 // Table column origins, sized to the content they hold at the fixed scale-2
 // glyph width (12px/char) rather than scaled to the panel width - a wider
 // board should give its extra room to the ROUTE column, not stretch empty
@@ -1662,6 +1720,7 @@ const char *displayPageName() {
   if (displayPage == DisplayPage::Overview) return "overview";
   if (displayPage == DisplayPage::Table) return "table";
   if (displayPage == DisplayPage::Radar) return "radar";
+  if (displayPage == DisplayPage::Marine) return "marine";
   return "map";
 }
 
@@ -1669,6 +1728,7 @@ void renderCurrentPage() {
   if (displayPage == DisplayPage::Overview) renderOverviewPage();
   else if (displayPage == DisplayPage::Table) renderTablePage();
   else if (displayPage == DisplayPage::Radar) renderRadarPage();
+  else if (displayPage == DisplayPage::Marine) renderMarinePage();
   else renderMapPage();
 }
 
@@ -2494,6 +2554,13 @@ void handleStatusApi() {
   doc["temperatureC"] = temperatureRead();
   doc["aircraftCapacity"] = MAX_AIRCRAFT;
   doc["aircraftStorage"] = "PSRAM";
+  doc["aisConfigured"] = aisApiKey.length() > 0;
+  doc["aisConnected"] = aisConnected;
+  doc["vesselCount"] = vesselCount;
+  doc["vesselCapacity"] = MAX_VESSELS;
+  doc["marineRadiusNm"] = marineRadiusNm;
+  doc["aisLastMessageSeconds"] = aisLastMessageAt ?
+      static_cast<int32_t>((millis() - aisLastMessageAt) / 1000UL) : -1;
   doc["sdMounted"] = sdMounted;
   doc["sdStatus"] = sdStatus;
   doc["sdType"] = sdCardType;
@@ -2644,18 +2711,20 @@ void handlePageControl() {
   if (!requireWebAuthentication()) return;
   if (!requireCsrfToken()) return;
   const String page = webServer.arg("page");
-  if (page != "overview" && page != "map" && page != "table" && page != "radar") {
-    sendMessage(400, "Page must be overview, map, radar or table");
+  if (page != "overview" && page != "map" && page != "table" && page != "radar" && page != "marine") {
+    sendMessage(400, "Page must be overview, map, radar, table or marine");
     return;
   }
   displayPage = page == "overview" ? DisplayPage::Overview :
                 page == "table" ? DisplayPage::Table :
-                page == "radar" ? DisplayPage::Radar : DisplayPage::Map;
+                page == "radar" ? DisplayPage::Radar :
+                page == "marine" ? DisplayPage::Marine : DisplayPage::Map;
   settingsStore.putUChar("display-page", static_cast<uint8_t>(displayPage));
   renderCurrentPage();
   if (displayPage == DisplayPage::Overview) sendMessage(200, "Overview page selected");
   else if (displayPage == DisplayPage::Table) sendMessage(200, "Table page selected");
   else if (displayPage == DisplayPage::Radar) sendMessage(200, "Radar page selected");
+  else if (displayPage == DisplayPage::Marine) sendMessage(200, "Marine page selected");
   else sendMessage(200, "Map page selected");
 }
 
@@ -2813,6 +2882,64 @@ void handleProviderSettings() {
   sendMessage(200, "Aircraft data provider settings saved");
 }
 
+void handleMarineCredentials() {
+  if (!requireWebAuthentication()) return;
+  if (!requireCsrfToken()) return;
+  if (webServer.arg("apiKey").length() > 128) {
+    sendMessage(400, "AIS API key is too long");
+    return;
+  }
+  const bool hadKey = aisApiKey.length() > 0;
+  if (webServer.arg("clear") == "1") {
+    aisApiKey = "";
+    settingsStore.putString("ais-key", "");
+  } else if (webServer.hasArg("apiKey") && webServer.arg("apiKey").length()) {
+    aisApiKey = webServer.arg("apiKey");
+    settingsStore.putString("ais-key", aisApiKey);
+  }
+  if (webServer.hasArg("radius")) {
+    const long radius = webServer.arg("radius").toInt();
+    if (radius < 5 || radius > 250) {
+      sendMessage(400, "Marine radius must be 5 to 250 nautical miles");
+      return;
+    }
+    marineRadiusNm = static_cast<uint16_t>(radius);
+    settingsStore.putUShort("marine-radius", marineRadiusNm);
+  }
+  // A key change needs a fresh subscription (the bounding box or the key
+  // itself may differ), so always reconnect once one is configured.
+  if (aisApiKey.length()) {
+    if (hadKey) aisWebSocket.disconnect();
+    connectAisWebSocket();
+  } else if (hadKey) {
+    aisWebSocket.disconnect();
+    aisConnected = false;
+  }
+  sendMessage(200, "Marine settings saved");
+}
+
+void handleMarineVessels() {
+  if (!requireWebAuthentication()) return;
+  JsonDocument doc(&psramJsonAllocator);
+  JsonArray vessels = doc["vessels"].to<JsonArray>();
+  for (int i = 0; i < vesselCount; ++i) {
+    VesselDisplay &vessel = latestVessels[i];
+    JsonObject item = vessels.add<JsonObject>();
+    item["mmsi"] = vessel.mmsi;
+    item["name"] = vessel.name[0] ? vessel.name : String(vessel.mmsi);
+    item["latitude"] = vessel.latitude;
+    item["longitude"] = vessel.longitude;
+    item["speed"] = roundf(vessel.speedKnots * 10.0f) / 10.0f;
+    item["course"] = roundf(vessel.courseOverGround * 10.0f) / 10.0f;
+    item["heading"] = vessel.heading;
+    item["distance"] = roundf(vessel.distanceMiles * 10.0f) / 10.0f;
+    item["navStatus"] = vessel.navStatus[0] ? vessel.navStatus : "UNKNOWN";
+    item["shipType"] = vessel.shipType[0] ? vessel.shipType : "UNKNOWN";
+    item["age"] = roundf((millis() - vessel.lastUpdateMs) / 100.0f) / 10.0f;
+  }
+  sendJsonDocument(200, doc);
+}
+
 void handleFirmwareUpload() {
   if (!webServer.authenticate(WEB_USERNAME, managementPassword.c_str())) return;
   if (!csrfToken.length() || webServer.header("X-ADSB-Token") != csrfToken) {
@@ -2942,6 +3069,8 @@ void beginWebControl() {
     webServer.on("/api/wifi/connect", HTTP_POST, handleWifiConnect);
     webServer.on("/api/password", HTTP_POST, handlePasswordChange);
     webServer.on("/api/provider", HTTP_POST, handleProviderSettings);
+    webServer.on("/api/marine/credentials", HTTP_POST, handleMarineCredentials);
+    webServer.on("/api/marine/vessels", HTTP_GET, handleMarineVessels);
     webServer.on("/api/firmware", HTTP_POST, handleFirmwareResult, handleFirmwareUpload);
     webServer.on("/api/reboot", HTTP_POST, []() {
       if (!requireWebAuthentication()) return;
@@ -2974,6 +3103,180 @@ void beginWebControl() {
 }
 }
 
+// AIS ship-type codes are a large ITU-defined table; this groups the ranges
+// that matter for a receiver display rather than reproducing it in full.
+const char *shipTypeName(int type) {
+  if (type == 30) return "FISHING";
+  if (type == 36 || type == 37) return "PLEASURE/SAIL";
+  if (type >= 40 && type <= 49) return "HIGH SPEED";
+  if (type == 50) return "PILOT";
+  if (type == 51) return "SAR";
+  if (type == 52) return "TUG";
+  if (type >= 60 && type <= 69) return "PASSENGER";
+  if (type >= 70 && type <= 79) return "CARGO";
+  if (type >= 80 && type <= 89) return "TANKER";
+  if (type >= 90 && type <= 99) return "OTHER";
+  return "UNKNOWN";
+}
+
+const char *navStatusName(int status) {
+  switch (status) {
+    case 0: return "UNDERWAY";
+    case 1: return "AT ANCHOR";
+    case 2: return "NOT UNDER CMD";
+    case 3: return "RESTRICTED MANOEUVRE";
+    case 4: return "CONSTRAINED DRAUGHT";
+    case 5: return "MOORED";
+    case 6: return "AGROUND";
+    case 7: return "FISHING";
+    case 8: return "SAILING";
+    case 14: return "AIS-SART";
+    default: return "UNKNOWN";
+  }
+}
+
+VesselDisplay *findOrCreateVessel(uint32_t mmsi) {
+  for (int i = 0; i < vesselCount; ++i) {
+    if (latestVessels[i].mmsi == mmsi) return &latestVessels[i];
+  }
+  VesselDisplay *slot;
+  if (vesselCount < MAX_VESSELS) {
+    slot = &latestVessels[vesselCount++];
+  } else {
+    // Full: evict the longest-untouched vessel rather than dropping this one.
+    slot = &latestVessels[0];
+    for (int i = 1; i < vesselCount; ++i)
+      if (latestVessels[i].lastUpdateMs < slot->lastUpdateMs) slot = &latestVessels[i];
+  }
+  memset(slot, 0, sizeof(*slot));
+  slot->mmsi = mmsi;
+  slot->heading = -1;
+  return slot;
+}
+
+void pruneStaleVessels() {
+  const uint32_t now = millis();
+  int kept = 0;
+  for (int i = 0; i < vesselCount; ++i) {
+    if (now - latestVessels[i].lastUpdateMs <= MARINE_STALE_MS) {
+      if (kept != i) latestVessels[kept] = latestVessels[i];
+      ++kept;
+    }
+  }
+  vesselCount = kept;
+}
+
+bool marineDataDirty = false;
+
+// AISstream.io pushes one JSON object per WebSocket text frame - a
+// PositionReport (course/speed/heading) or ShipStaticData (name/type),
+// keyed by MMSI. There is no polling: this is the entire live feed.
+void onAisEvent(WStype_t type, uint8_t *payload, size_t length) {
+  switch (type) {
+    case WStype_CONNECTED: {
+      aisConnected = true;
+      Serial.println("AIS WebSocket connected; subscribing");
+      const double latRadius = marineRadiusNm / 60.0;
+      const double lonRadius = marineRadiusNm / (60.0 * max(0.1, cos(radians(homeLatitude))));
+      JsonDocument sub;
+      sub["APIKey"] = aisApiKey;
+      JsonArray boxes = sub["BoundingBoxes"].to<JsonArray>();
+      JsonArray box = boxes.add<JsonArray>();
+      JsonArray corner1 = box.add<JsonArray>();
+      corner1.add(homeLatitude - latRadius);
+      corner1.add(homeLongitude - lonRadius);
+      JsonArray corner2 = box.add<JsonArray>();
+      corner2.add(homeLatitude + latRadius);
+      corner2.add(homeLongitude + lonRadius);
+      JsonArray filters = sub["FilterMessageTypes"].to<JsonArray>();
+      filters.add("PositionReport");
+      filters.add("ShipStaticData");
+      String message;
+      serializeJson(sub, message);
+      aisWebSocket.sendTXT(message);
+      break;
+    }
+    case WStype_DISCONNECTED:
+      aisConnected = false;
+      Serial.println("AIS WebSocket disconnected");
+      break;
+    // AISstream.io documents that it always sends binary frames whose
+    // payload happens to be UTF-8 JSON, not text frames - handle both the
+    // same way rather than silently dropping every real message.
+    case WStype_TEXT:
+    case WStype_BIN: {
+      aisLastMessageAt = millis();
+      JsonDocument doc;
+      if (deserializeJson(doc, payload, length)) return;
+      const char *messageType = doc["MessageType"] | "";
+      JsonObject meta = doc["MetaData"].as<JsonObject>();
+      if (meta.isNull()) return;
+      const uint32_t mmsi = meta["MMSI"] | 0;
+      if (!mmsi) return;
+      VesselDisplay *vessel = findOrCreateVessel(mmsi);
+      vessel->lastUpdateMs = millis();
+      const char *name = meta["ShipName"] | "";
+      if (name[0]) {
+        strncpy(vessel->name, name, sizeof(vessel->name) - 1);
+        vessel->name[sizeof(vessel->name) - 1] = 0;
+      }
+      const double lat = meta["Latitude"] | 0.0;
+      const double lon = meta["Longitude"] | 0.0;
+      if (lat != 0.0 || lon != 0.0) {
+        vessel->latitude = lat;
+        vessel->longitude = lon;
+        vessel->distanceMiles = distanceMilesFromHome(lat, lon);
+      }
+      if (!strcmp(messageType, "PositionReport")) {
+        JsonObject report = doc["Message"]["PositionReport"].as<JsonObject>();
+        if (!report.isNull()) {
+          vessel->speedKnots = report["Sog"] | vessel->speedKnots;
+          vessel->courseOverGround = report["Cog"] | vessel->courseOverGround;
+          const float trueHeading = report["TrueHeading"] | 511.0f;
+          vessel->heading = trueHeading < 360.0f ? trueHeading : -1;
+          const int navStatus = report["NavigationalStatus"] | -1;
+          const char *statusName = navStatusName(navStatus);
+          strncpy(vessel->navStatus, statusName, sizeof(vessel->navStatus) - 1);
+          vessel->navStatus[sizeof(vessel->navStatus) - 1] = 0;
+        }
+      } else if (!strcmp(messageType, "ShipStaticData")) {
+        JsonObject staticData = doc["Message"]["ShipStaticData"].as<JsonObject>();
+        if (!staticData.isNull()) {
+          const int shipType = staticData["Type"] | -1;
+          const char *typeName = shipTypeName(shipType);
+          strncpy(vessel->shipType, typeName, sizeof(vessel->shipType) - 1);
+          vessel->shipType[sizeof(vessel->shipType) - 1] = 0;
+        }
+      }
+      if (displayPage == DisplayPage::Marine) marineDataDirty = true;
+      break;
+    }
+    default:
+      break;
+  }
+}
+
+// AISstream.io negotiates permessage-deflate (RFC 7692) when the client
+// requests it; the links2004/WebSockets library used here does not
+// implement that extension, so this connection runs uncompressed. Per
+// AISstream's own documentation, uncompressed connections become subject to
+// per-user bandwidth limits (with excess messages dropped) starting
+// September 2026 - if vessels start silently going stale after that date,
+// this is the first thing to check.
+void connectAisWebSocket() {
+  if (!aisApiKey.length()) return;
+#if ADSB_TLS_INSECURE
+  aisWebSocket.beginSSL("stream.aisstream.io", 443, "/v0/stream");
+#else
+  aisWebSocket.beginSslWithBundle(
+      "stream.aisstream.io", 443, "/v0/stream",
+      rootca_crt_bundle_start,
+      static_cast<size_t>(rootca_crt_bundle_end - rootca_crt_bundle_start));
+#endif
+  aisWebSocket.onEvent(onAisEvent);
+  aisWebSocket.setReconnectInterval(8000);
+}
+
 void setup() {
   Serial.begin(115200);
   if (!LittleFS.begin(true)) Serial.println("LittleFS map cache unavailable");
@@ -2993,6 +3296,8 @@ void setup() {
   openSkyClientSecret = settingsStore.getString("os-secret", "");
 #endif
   rapidApiKey = settingsStore.getString("rapid-key", "");
+  aisApiKey = settingsStore.getString("ais-key", "");
+  marineRadiusNm = constrain(settingsStore.getUShort("marine-radius", DEFAULT_MARINE_RADIUS_NM), 5, 250);
   homeLatitude = settingsStore.getFloat("home-lat", DEFAULT_HOME_LAT);
   homeLongitude = settingsStore.getFloat("home-lon", DEFAULT_HOME_LON);
   queryRadiusNm = constrain(settingsStore.getUShort("radius-nm", DEFAULT_RADIUS_NM), 5, 250);
@@ -3044,7 +3349,9 @@ void setup() {
   baseMap=(uint16_t*)heap_caps_malloc(W*H*sizeof(uint16_t),MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
   latestAircraft = static_cast<AircraftDisplay *>(heap_caps_calloc(
       MAX_AIRCRAFT, sizeof(AircraftDisplay), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-  if (!framebuffer || !baseMap || !latestAircraft) {
+  latestVessels = static_cast<VesselDisplay *>(heap_caps_calloc(
+      MAX_VESSELS, sizeof(VesselDisplay), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (!framebuffer || !baseMap || !latestAircraft || !latestVessels) {
     Serial.println("PSRAM display/aircraft buffers unavailable");
     while(true) delay(1000);
   }
@@ -3078,6 +3385,7 @@ void setup() {
   fetchAircraft();
   nextFetchAt=millis()+REFRESH_MS;
   nextGithubCheckAt=millis()+15000UL;
+  connectAisWebSocket();
 }
 
 void loop() {
@@ -3140,8 +3448,8 @@ void loop() {
   const TouchGesture gesture = touchGesture();
   const bool pressed = bootButtonTapped();
   int pageStep = 0;
-  // Swipe right advances Overview -> Table -> Map -> Radar and wraps; swipe
-  // left walks back. Tap and the boot button both advance.
+  // Swipe right advances Overview -> Table -> Map -> Radar -> Marine and
+  // wraps; swipe left walks back. Tap and the boot button both advance.
   if (gesture == TouchGesture::SwipeRight) pageStep = 1;
   else if (gesture == TouchGesture::SwipeLeft) pageStep = -1;
   else if (gesture == TouchGesture::Tap || pressed) pageStep = 1;
@@ -3165,6 +3473,17 @@ void loop() {
     if (radarSweepDegrees >= 360.0f) radarSweepDegrees -= 360.0f;
     renderRadarPage();
     nextRadarFrameAt = millis() + 750;
+  }
+  if (aisApiKey.length()) aisWebSocket.loop();
+  if (static_cast<int32_t>(millis() - nextMarinePruneAt) >= 0) {
+    pruneStaleVessels();
+    nextMarinePruneAt = millis() + 60000UL;
+  }
+  if (displayPage == DisplayPage::Marine && marineDataDirty &&
+      static_cast<int32_t>(millis() - nextMarineRenderAt) >= 0) {
+    marineDataDirty = false;
+    renderMarinePage();
+    nextMarineRenderAt = millis() + 2000;
   }
   if (static_cast<int32_t>(millis()-nextFetchAt) >= 0) {
     const uint32_t fetchStartedAt = millis();
