@@ -1275,6 +1275,13 @@ void renderBootScreen(const String &networkLine = "", uint16_t networkColour = R
 // under the table.
 constexpr int OVERVIEW_MAP_WIDTH = W * 5 / 8;
 
+// Offsets from panelX, expressed as fractions of W so the wider WS7 panel
+// gets proportionally more room instead of the WS4 pixel values overflowing
+// or crowding together.
+constexpr int OVERVIEW_COL_MILES = W * 66 / 480;
+constexpr int OVERVIEW_COL_ALT = W * 108 / 480;
+constexpr int OVERVIEW_COL_ROUTE = W * 144 / 480;
+
 void renderOverviewPage() {
   restoreMap();
   for (int i = 0; i < lastCount; ++i) {
@@ -1289,8 +1296,9 @@ void renderOverviewPage() {
   line(OVERVIEW_MAP_WIDTH, 0, OVERVIEW_MAP_WIDTH, H - 1, rgb(30, 90, 120));
   const int panelX = OVERVIEW_MAP_WIDTH + 8;
   text5(panelX, 8, "NEAREST", rgb(80, 220, 255));
-  text5(panelX + 66, 8, "MI", rgb(120, 170, 200));
-  text5(panelX + 108, 8, "ALT", rgb(120, 170, 200));
+  text5(panelX + OVERVIEW_COL_MILES, 8, "MI", rgb(120, 170, 200));
+  text5(panelX + OVERVIEW_COL_ALT, 8, "ALT", rgb(120, 170, 200));
+  text5(panelX + OVERVIEW_COL_ROUTE, 8, "RTE", rgb(120, 170, 200));
   line(panelX, 18, W - 6, 18, rgb(30, 90, 120));
 
   const int rows = min(lastCount, (H - 46) / 22);
@@ -1301,11 +1309,16 @@ void renderOverviewPage() {
     text5(panelX, y, callsign, rgb(190, 235, 255));
     char miles[8];
     snprintf(miles, sizeof(miles), "%d", static_cast<int>(display.distanceMiles + 0.5f));
-    text5(panelX + 66, y, miles, rgb(245, 205, 65));
+    text5(panelX + OVERVIEW_COL_MILES, y, miles, rgb(245, 205, 65));
     char altitude[10];
     if (display.altitudeFt > 0) snprintf(altitude, sizeof(altitude), "%d", display.altitudeFt);
     else snprintf(altitude, sizeof(altitude), "--");
-    text5(panelX + 108, y, altitude, rgb(150, 225, 190));
+    text5(panelX + OVERVIEW_COL_ALT, y, altitude, rgb(150, 225, 190));
+    RouteCacheEntry *route = cachedRoute(display.flight);
+    char routeLabel[11];
+    if (route && route->hasRoute) snprintf(routeLabel, sizeof(routeLabel), "%s>%s", route->origin, route->destination);
+    else strcpy(routeLabel, "---");
+    text5(panelX + OVERVIEW_COL_ROUTE, y, routeLabel, rgb(130, 210, 255));
   }
 
   char footer[24];
