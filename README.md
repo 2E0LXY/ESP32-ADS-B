@@ -21,6 +21,8 @@ Current firmware: **v2.5.1**
 - **Browser map**: clicking a marker now opens a popup with the complete aircraft detail set (operator badge, registration, altitude, speed, squawk, category, signal, country, emergency state, and more), not just a short summary
 - **Browser map**: clicking a row in the Aircraft/Overview table jumps to the map, zooms in on that aircraft, and opens its popup; click the same row again to stop tracking
 - **Browser map**: a "Show 5 min trails" checkbox draws each aircraft's recent track as a line, with the tracked aircraft's trail highlighted
+- **Route cache persistence**: resolved routes now survive a reboot, saved to SD (or LittleFS without a card) after each batch of new lookups and reloaded at boot, so a receiver that sees the same flights daily doesn't start every session cache-cold
+- **LCD Table/Overview route column**: distinguishes a route that's still queued for lookup (`---`) from one adsbdb was actually asked about and had nothing on file (`NO ROUTE` / `NO RTE`) - the latter is expected for most private/GA registrations, which have no scheduled route to look up
 - Adds `scripts/flash_remote.ps1`, which starts the `esp_rfc2217_server.py` serial-to-network bridge if it isn't already running, then builds and flashes over it — useful for driving a board's USB port from another machine on the network
 
 ### v2.5.1 correctness and hardening
@@ -265,7 +267,7 @@ If the board does not enter download mode, hold **BOOT**, tap **RESET**, begin t
 - Aircraft data refresh: every 30 seconds or on demand
 - ADS-B aircraft: cyan/operator-coloured symbol
 - MLAT aircraft: violet/red symbol
-- Route lookup: public ADSBDB callsign endpoint, cached for six hours; the Table page shows the fullest name that fits (full name, then city, then a departure-board-style abbreviation, then the raw code), while the Overview and Map pages show the raw code
+- Route lookup: public ADSBDB callsign endpoint, cached for six hours and persisted to SD (or LittleFS without a card) so a reboot doesn't start cold; the Table page shows the fullest name that fits (full name, then city, then a departure-board-style abbreviation, then the raw code), while the Overview and Map pages show the raw code. `NO ROUTE` / `NO RTE` means adsbdb was asked and had nothing on file (typically a private/GA registration), distinct from `---` which means still queued
 - Zero-mile aircraft: optional 200 ms buzzer alert
 - OSM failure: falls back to the built-in radar-style map
 

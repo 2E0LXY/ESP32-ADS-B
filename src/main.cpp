@@ -1244,6 +1244,63 @@ RouteCacheEntry *cachedRoute(const char *rawCallsign) {
   return nullptr;
 }
 
+// Persists the route cache across reboots - the callsigns seen near a fixed
+// receiver location repeat daily, so this avoids re-querying adsbdb for
+// routes it already resolved last time the device was on. Raw struct dump:
+// this file is only ever read back by the exact build that wrote it, so a
+// version mismatch (from a firmware update changing RouteCacheEntry) just
+// means starting cache-cold again rather than reading garbage.
+constexpr uint32_t ROUTE_CACHE_FILE_MAGIC = 0x52435341; // "ASCR"
+constexpr uint8_t ROUTE_CACHE_FILE_VERSION = 1;
+
+const char *routeCacheFilePath() {
+  return sdMounted ? "/adsb/route_cache.bin" : "/route_cache.bin";
+}
+
+void saveRouteCacheToStorage() {
+  fs::FS &storage = sdMounted ? static_cast<fs::FS &>(SDCARD) : static_cast<fs::FS &>(LittleFS);
+  File file = storage.open(routeCacheFilePath(), FILE_WRITE);
+  if (!file) return;
+  file.write(reinterpret_cast<const uint8_t *>(&ROUTE_CACHE_FILE_MAGIC), sizeof(ROUTE_CACHE_FILE_MAGIC));
+  file.write(&ROUTE_CACHE_FILE_VERSION, sizeof(ROUTE_CACHE_FILE_VERSION));
+  uint8_t count = 0;
+  for (auto &entry : routeCache) if (entry.occupied) ++count;
+  file.write(&count, sizeof(count));
+  for (auto &entry : routeCache) {
+    if (!entry.occupied) continue;
+    file.write(reinterpret_cast<const uint8_t *>(&entry), sizeof(entry));
+  }
+  file.close();
+}
+
+void loadRouteCacheFromStorage() {
+  fs::FS &storage = sdMounted ? static_cast<fs::FS &>(SDCARD) : static_cast<fs::FS &>(LittleFS);
+  File file = storage.open(routeCacheFilePath(), FILE_READ);
+  if (!file) return;
+  uint32_t magic = 0;
+  uint8_t version = 0, count = 0;
+  bool headerOk = file.read(reinterpret_cast<uint8_t *>(&magic), sizeof(magic)) == sizeof(magic) &&
+                  magic == ROUTE_CACHE_FILE_MAGIC &&
+                  file.read(&version, sizeof(version)) == sizeof(version) &&
+                  version == ROUTE_CACHE_FILE_VERSION &&
+                  file.read(&count, sizeof(count)) == sizeof(count);
+  int loaded = 0;
+  if (headerOk) {
+    RouteCacheEntry entry;
+    while (loaded < count && loaded < ROUTE_CACHE_SIZE &&
+           file.read(reinterpret_cast<uint8_t *>(&entry), sizeof(entry)) == sizeof(entry)) {
+      // millis() resets to near-zero at boot, so a persisted timestamp from
+      // the previous session would otherwise read as impossibly stale;
+      // treat every loaded entry as freshly resolved right now instead.
+      entry.resolvedAt = millis();
+      entry.lastUsed = millis();
+      routeCache[loaded++] = entry;
+    }
+  }
+  file.close();
+  if (loaded) Serial.printf("Loaded %d cached routes from %s\n", loaded, routeCacheFilePath());
+}
+
 uint16_t operatorColour(const char *code) {
   if (!strncmp(code,"BAW",3)) return rgb(20,45,125);
   if (!strncmp(code,"EZY",3)) return rgb(255,85,0);
@@ -1808,6 +1865,7 @@ void fetchAdsbV2Aircraft() {
   }
   routeHttp.end();
   }
+  if (routeLookups > 0) saveRouteCacheToStorage();
   if (aircraftAtZeroMiles) beepAlert();
   lastFetchCompletedAt = millis();
   finishFeedAttempt("OK", responseCode);
@@ -1955,6 +2013,7 @@ void fetchAircraft() {
   }
   routeHttp.end();
   }
+  if (routeLookups > 0) saveRouteCacheToStorage();
   if (aircraftAtZeroMiles) beepAlert();
   lastFetchCompletedAt = millis();
   finishFeedAttempt("OK", HTTP_CODE_OK);
@@ -2990,6 +3049,7 @@ void setup() {
     while(true) delay(1000);
   }
   mountSdCard();
+  loadRouteCacheFromStorage();
   restoreMap(); status("SETUP",rgb(245,150,0)); present();
   WiFi.setHostname(DEVICE_HOSTNAME);
   WiFi.mode(WIFI_STA);
