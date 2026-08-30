@@ -207,6 +207,11 @@ struct RouteCacheEntry {
   char callsign[9] = {};
   char origin[5] = {};
   char destination[5] = {};
+  // Full airport names, used by the browser Aircraft/Overview table; the LCD
+  // pages keep the short codes above since the on-panel font has no room for
+  // full names.
+  char originName[40] = {};
+  char destinationName[40] = {};
   uint32_t resolvedAt = 0;
   uint32_t lastUsed = 0;
   bool occupied = false;
@@ -1097,6 +1102,12 @@ void airportCode(JsonObject airport, char output[5]) {
   output[4] = 0;
 }
 
+void airportName(JsonObject airport, char *output, size_t outSize) {
+  const char *name = airport["name"] | "";
+  strncpy(output, name, outSize - 1);
+  output[outSize - 1] = 0;
+}
+
 RouteCacheEntry *routeForCallsign(const char *rawCallsign, int &lookupsUsed,
                                   WiFiClientSecure &client, HTTPClient &http) {
   char callsign[9];
@@ -1153,6 +1164,8 @@ RouteCacheEntry *routeForCallsign(const char *rawCallsign, int &lookupsUsed,
   if (route.isNull()) return slot;
   airportCode(route["origin"].as<JsonObject>(), slot->origin);
   airportCode(route["destination"].as<JsonObject>(), slot->destination);
+  airportName(route["origin"].as<JsonObject>(), slot->originName, sizeof(slot->originName));
+  airportName(route["destination"].as<JsonObject>(), slot->destinationName, sizeof(slot->destinationName));
   slot->hasRoute = slot->origin[0] && slot->destination[0];
   if (slot->hasRoute) Serial.printf("Route %s %s>%s\n", callsign, slot->origin, slot->destination);
   return slot;
@@ -2377,8 +2390,14 @@ void handleAircraftApi() {
     item["messages"] = display.messages;
     item["signal"] = display.signalDb;
     RouteCacheEntry *route = cachedRoute(display.flight);
-    if (route && route->hasRoute) item["route"] = String(route->origin) + ">" + route->destination;
-    else item["route"] = "";
+    if (route && route->hasRoute) {
+      item["route"] = String(route->origin) + ">" + route->destination;
+      item["routeFull"] = String(route->originName[0] ? route->originName : route->origin) +
+                           " -> " + (route->destinationName[0] ? route->destinationName : route->destination);
+    } else {
+      item["route"] = "";
+      item["routeFull"] = "";
+    }
   }
   sendJsonDocument(200, doc);
 }
