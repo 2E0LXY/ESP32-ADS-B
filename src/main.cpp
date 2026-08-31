@@ -381,21 +381,6 @@ bool webServerReady = false;
 bool restartPending = false;
 bool setupPortalPending = false;
 uint32_t restartAt = 0;
-// mbedTLS needs a large contiguous internal-RAM block per TLS handshake, and
-// on this board the first fetch's route lookups permanently fragment the
-// heap just enough to sit under that threshold forever - confirmed on
-// hardware: fetch #1 succeeds, then every fetch after it fails with
-// "-32512 SSL - Memory allocation failed" for as long as the board stays up,
-// because nothing in the runtime ever coalesces the heap back into one
-// large-enough piece on its own. There's no buffer-size API on this
-// arduino-esp32 version to shrink what mbedTLS asks for (checked against the
-// actual NetworkClientSecure header), and the sdkconfig that controls it is
-// baked into prebuilt libs this project can't rebuild. A reboot is the one
-// thing that reliably clears it - a fresh boot starts with the heap
-// uncontended - so this is a deliberate workaround for a constraint outside
-// the app's control, not a fix for the fragmentation itself.
-uint8_t consecutiveFeedFailures = 0;
-constexpr uint8_t FEED_FAILURE_REBOOT_THRESHOLD = 6;
 uint32_t lastFetchCompletedAt = 0;
 uint32_t feedRequestStartedAt = 0;
 uint32_t feedRequestDurationMs = 0;
@@ -691,21 +676,6 @@ void finishFeedAttempt(const char *statusText, int httpCode = 0) {
   feedStatus = statusText;
   feedHttpCode = httpCode;
   feedRequestDurationMs = feedRequestStartedAt ? millis() - feedRequestStartedAt : 0;
-  // Only "Connection failed"/"HTTP error" match the heap-fragmentation
-  // signature this counts toward a self-reboot - "Rate limited",
-  // "Authentication failed", "API key required" etc. are configuration or
-  // provider issues a reboot can't fix and would just loop forever on.
-  if (!strcmp(statusText, "OK")) {
-    consecutiveFeedFailures = 0;
-  } else if (!strcmp(statusText, "Connection failed") || !strcmp(statusText, "HTTP error")) {
-    if (++consecutiveFeedFailures >= FEED_FAILURE_REBOOT_THRESHOLD && !restartPending) {
-      Serial.printf("%u consecutive aircraft-feed connection failures - restarting "
-                    "to clear likely internal-heap fragmentation\n",
-                    static_cast<unsigned>(consecutiveFeedFailures));
-      restartPending = true;
-      restartAt = millis() + 2000;
-    }
-  }
 }
 
 bool parseStrictDouble(const String &rawValue, double &result) {
