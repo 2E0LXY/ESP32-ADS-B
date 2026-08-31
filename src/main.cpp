@@ -491,6 +491,16 @@ void applyTlsPolicy(WiFiClientSecure &client) {
       rootca_crt_bundle_start,
       static_cast<size_t>(rootca_crt_bundle_end - rootca_crt_bundle_start));
 #endif
+  // mbedTLS defaults to 16KB in + 16KB out record buffers, each needing one
+  // contiguous internal-RAM block. That's the actual cause of the recurring
+  // "-32512 SSL - Memory allocation failed": the board's internal heap gets
+  // fragmented (web server, LCD driver, WiFi stack all carve out of the same
+  // pool) long before it runs low in total, so a 32KB *contiguous* ask fails
+  // even with plenty of free heap left. None of this app's HTTPS responses
+  // or request bodies are anywhere near 16KB per TLS record, so shrinking
+  // both buffers costs nothing functionally and makes the allocation ask
+  // small enough to actually succeed under fragmentation.
+  client.setBufferSizes(4096, 1024);
 }
 
 // One User-Agent for every outbound request, always matching the running
