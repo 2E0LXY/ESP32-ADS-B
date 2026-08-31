@@ -2,6 +2,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/semphr.h>
+#include <esp_task_wdt.h>
 
 // Board capability macros. Must come before anything that tests them,
 // notably the SD backend selection below.
@@ -3867,6 +3868,23 @@ void networkTask(void *) {
 
 void setup() {
   Serial.begin(115200);
+  // The default Task Watchdog Timer (5s, watching the idle task on both
+  // cores) reboots the whole chip if any task occupies a core without
+  // yielding for that long. Pinning network I/O to its own core means the
+  // various already-deliberate HTTPClient timeouts in this file (up to
+  // 15000ms, e.g. the firmware download path) can now legitimately exceed
+  // that 5s window on a slow response or a weak Wi-Fi link - a live test
+  // reproduced exactly this, crashing on an ordinary slow adsb.fi fetch, not
+  // a real hang. Widen it well past the longest configured timeout instead
+  // of shortening those timeouts (they were sized for real, already-observed
+  // slow-network conditions on this board); a genuinely stuck task still
+  // gets caught and rebooted, just with more headroom for legitimate waits.
+  esp_task_wdt_config_t watchdogConfig = {
+      .timeout_ms = 30000,
+      .idle_core_mask = (1 << 0) | (1 << 1),
+      .trigger_panic = true,
+  };
+  esp_task_wdt_reconfigure(&watchdogConfig);
   dataMutex = xSemaphoreCreateRecursiveMutex();
   if (!LittleFS.begin(true)) Serial.println("LittleFS map cache unavailable");
   settingsStore.begin("adsb-web", false);
