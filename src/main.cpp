@@ -1061,6 +1061,15 @@ bool refreshPhysicalBaseMap() {
   mapRebuildActive = true;
   mapRebuildDone = 0;
   mapRebuildTotal = 0;
+  // Same contention that broke the aircraft feed: a full rebuild (especially
+  // right after a cache clear, which has to re-fetch every tile instead of
+  // just the missing ones) is a burst of sequential HTTPS requests that
+  // competes with the AIS WebSocket's persistent TLS session for the same
+  // scarce internal RAM - a user report of heapMinimum dropping to ~200
+  // bytes and the LCD going solid black during exactly this rebuild
+  // confirmed it. Pause it for the duration, same as the periodic fetch does.
+  const bool pauseAisForMapRebuild = marineProvider == "aisstream" && aisWebSocket.isConnected();
+  if (pauseAisForMapRebuild) aisWebSocket.disconnect();
   drawLocationFallback();
   const double centerX = osmWorldX(homeLongitude, physicalMapZoom);
   const double centerY = osmWorldY(homeLatitude, physicalMapZoom);
@@ -1121,6 +1130,7 @@ bool refreshPhysicalBaseMap() {
                     mapRebuildMissingTiles, static_cast<unsigned>(freeInternalHeap));
     mapRebuildRetryCount = 0;
   }
+  if (pauseAisForMapRebuild) connectAisWebSocket();
   return tilesDrawn > 0;
 }
 
