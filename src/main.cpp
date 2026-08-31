@@ -420,6 +420,9 @@ uint32_t pageSaveAt = 0;
 // without the network task touching the display itself.
 SemaphoreHandle_t dataMutex = nullptr;
 volatile bool needsRedraw = false;
+constexpr uint32_t NETWORK_TASK_STACK_BYTES = 12288;
+StackType_t *networkTaskStack = nullptr;
+StaticTask_t networkTaskBuffer;
 
 // RAII lock: guarantees the mutex is released on every return path, even
 // through the many early returns inside fetchAircraft()/fetchAdsbV2Aircraft()
@@ -3983,7 +3986,25 @@ void setup() {
   // on its own task on the other core, so a slow fetch can't freeze touch
   // input and rendering in loop() below. See the dataMutex comment above for
   // how the two tasks share the aircraft/vessel/map buffers safely.
-  xTaskCreatePinnedToCore(networkTask, "network", 12288, nullptr, 1, nullptr, 0);
+  //
+  // The stack for that task has to come from somewhere, and a plain
+  // xTaskCreatePinnedToCore() takes it from the same scarce internal RAM
+  // that mbedTLS/WiFi are already starved for on this board - a live test
+  // showed the AIS socket's TLS handshake failing outright
+  // ("-32512 SSL - Memory allocation failed") immediately after adding this
+  // task, which never happened before it existed. Give it a PSRAM-backed
+  // stack via the static task API instead, the same fix already applied to
+  // every other large buffer in this file (framebuffer, baseMap,
+  // latestAircraft, latestVessels, the JSON allocator).
+  networkTaskStack = static_cast<StackType_t *>(
+      heap_caps_malloc(NETWORK_TASK_STACK_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (networkTaskStack) {
+    xTaskCreateStaticPinnedToCore(networkTask, "network", NETWORK_TASK_STACK_BYTES,
+                                   nullptr, 1, networkTaskStack, &networkTaskBuffer, 0);
+  } else {
+    Serial.println("PSRAM stack for the network task unavailable; falling back to internal RAM");
+    xTaskCreatePinnedToCore(networkTask, "network", NETWORK_TASK_STACK_BYTES, nullptr, 1, nullptr, 0);
+  }
 }
 
 void loop() {
