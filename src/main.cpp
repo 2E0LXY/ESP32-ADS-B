@@ -308,6 +308,16 @@ bool aisConnected = false;
 uint32_t aisLastMessageAt = 0;
 uint32_t nextMarineFetchAt = 0;
 uint16_t marineRadiusNm = DEFAULT_MARINE_RADIUS_NM;
+// AIS's TLS handshake competes for the same tight internal RAM as the
+// aircraft fetch; retrying every few seconds after a real failure just
+// keeps hammering an already-fragmented heap. Back off exponentially
+// (8s/16s/32s/60s cap) instead, reset on an actual successful connect.
+// aisIntentionalDisconnect distinguishes that from the deliberate pause
+// around each aircraft fetch, which isn't a failure and shouldn't be
+// penalised.
+uint32_t aisNextRetryAt = 0;
+uint8_t aisConsecutiveFailures = 0;
+bool aisIntentionalDisconnect = false;
 WebSocketsClient aisWebSocket;
 // Defined near setup(), inside this same anonymous namespace, but
 // handleMarineCredentials() below needs to call it earlier in the file.
@@ -3682,6 +3692,7 @@ void onAisEvent(WStype_t type, uint8_t *payload, size_t length) {
   switch (type) {
     case WStype_CONNECTED: {
       aisConnected = true;
+      aisConsecutiveFailures = 0;
       Serial.println("AIS WebSocket connected; subscribing");
       const double latRadius = marineRadiusNm / 60.0;
       const double lonRadius = marineRadiusNm / (60.0 * max(0.1, cos(radians(homeLatitude))));
@@ -3705,7 +3716,19 @@ void onAisEvent(WStype_t type, uint8_t *payload, size_t length) {
     }
     case WStype_DISCONNECTED:
       aisConnected = false;
-      Serial.println("AIS WebSocket disconnected");
+      if (aisIntentionalDisconnect) {
+        aisIntentionalDisconnect = false;
+        Serial.println("AIS WebSocket paused for aircraft fetch");
+      } else {
+        // A real failure (usually the SSL alloc error logged just above by
+        // the library) - back off instead of retrying every few seconds
+        // and hammering an already-tight heap.
+        const uint32_t backoffMs = min<uint32_t>(60000UL, 8000UL << min<uint8_t>(aisConsecutiveFailures, 3));
+        aisNextRetryAt = millis() + backoffMs;
+        if (aisConsecutiveFailures < 250) ++aisConsecutiveFailures;
+        Serial.printf("AIS WebSocket disconnected; retrying in %lu ms (failure #%u)\n",
+                      static_cast<unsigned long>(backoffMs), aisConsecutiveFailures);
+      }
       break;
     // AISstream.io documents that it always sends binary frames whose
     // payload happens to be UTF-8 JSON, not text frames - handle both the
@@ -3790,7 +3813,11 @@ void connectAisWebSocket() {
       static_cast<size_t>(rootca_crt_bundle_end - rootca_crt_bundle_start));
 #endif
   aisWebSocket.onEvent(onAisEvent);
-  aisWebSocket.setReconnectInterval(8000);
+  // Reconnect timing is driven explicitly (aisNextRetryAt, in networkTask)
+  // so our own exponential backoff actually controls retry frequency;
+  // leave the library's own timer effectively disabled rather than have it
+  // race a second reconnect attempt against ours.
+  aisWebSocket.setReconnectInterval(3600000UL);
 }
 
 }
@@ -3850,7 +3877,13 @@ void networkTask(void *) {
       ESP.restart();
     }
     if (marineProvider == "aisstream") {
-      if (aisApiKey.length()) { MutexGuard guard(dataMutex); aisWebSocket.loop(); }
+      if (aisApiKey.length()) {
+        MutexGuard guard(dataMutex);
+        aisWebSocket.loop();
+        if (!aisWebSocket.isConnected() && static_cast<int32_t>(millis() - aisNextRetryAt) >= 0) {
+          connectAisWebSocket();
+        }
+      }
     } else if (marineConfigured() && static_cast<int32_t>(millis() - nextMarineFetchAt) >= 0) {
       { MutexGuard guard(dataMutex); fetchMarineRest(); }
       nextMarineFetchAt = millis() + MARINE_REST_REFRESH_MS;
@@ -3869,8 +3902,11 @@ void networkTask(void *) {
       // duration is the difference between the feed working at all and not;
       // AISstream tolerates the brief reconnect (it re-subscribes on connect).
       const bool pauseAis = marineProvider == "aisstream" && aisWebSocket.isConnected();
-      if (pauseAis) aisWebSocket.disconnect();
+      if (pauseAis) { aisIntentionalDisconnect = true; aisWebSocket.disconnect(); }
       { MutexGuard guard(dataMutex); fetchAircraft(); }
+      // This was a known-good, already-connected session we paused ourselves,
+      // not a failure - reconnect immediately rather than waiting on the
+      // failure backoff, which doesn't apply here.
       if (pauseAis) connectAisWebSocket();
       Serial.printf("fetchAircraft blocked the network task for %lu ms\n",
                     static_cast<unsigned long>(millis() - fetchStartedAt));
