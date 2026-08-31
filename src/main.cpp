@@ -1204,6 +1204,17 @@ bool refreshPhysicalBaseMap() {
       // Each tile is a separate HTTPS round trip. Service the admin interface
       // between them so the UI stays responsive and can show progress.
       if (webServerReady) webServer.handleClient();
+      // This loop runs long enough on this core to starve the RGB panel's
+      // DMA of PSRAM bandwidth (the tile cache and framebuffer both live in
+      // PSRAM, and the panel continuously DMA-reads the framebuffer to
+      // refresh the screen) - that's the pre-existing "table/map top rolls
+      // to bottom" bug. It isn't a data race dataMutex can fix; the DMA
+      // controller is just losing its bus turn to the CPU's own PSRAM
+      // traffic. present() already retries this once per frame; nudging it
+      // here too gives it a chance to resynchronise mid-loop instead of only
+      // once the whole operation is done. See the other call sites of
+      // restartAtNextVsync() in the fetch route-lookup loops for the same fix.
+      rgbpanel->restartAtNextVsync();
     }
   }
   filledRect(0, H - 15, 17 * 6 + 4, 15, rgb(0, 0, 0));
@@ -2298,8 +2309,14 @@ void fetchAdsbV2Aircraft() {
       // single-threaded web server. Service pending admin requests around it
       // so the browser does not fill the listen backlog and get RST.
       if (webServerReady) webServer.handleClient();
+      // Nudges the panel to resync mid-loop against PSRAM-DMA starvation -
+      // see the tile-rebuild loop's comment on restartAtNextVsync() above.
+      rgbpanel->restartAtNextVsync();
       routeForCallsign(display.flight, routeLookups, routeClient, routeHttp);
       if (webServerReady) webServer.handleClient();
+      // Nudges the panel to resync mid-loop against PSRAM-DMA starvation -
+      // see the tile-rebuild loop's comment on restartAtNextVsync() above.
+      rgbpanel->restartAtNextVsync();
     }
   }
   routeHttp.end();
@@ -2448,8 +2465,14 @@ void fetchAircraft() {
       ++lastMlat;
     } else {
       if (webServerReady) webServer.handleClient();
+      // Nudges the panel to resync mid-loop against PSRAM-DMA starvation -
+      // see the tile-rebuild loop's comment on restartAtNextVsync() above.
+      rgbpanel->restartAtNextVsync();
       routeForCallsign(display.flight, routeLookups, routeClient, routeHttp);
       if (webServerReady) webServer.handleClient();
+      // Nudges the panel to resync mid-loop against PSRAM-DMA starvation -
+      // see the tile-rebuild loop's comment on restartAtNextVsync() above.
+      rgbpanel->restartAtNextVsync();
     }
   }
   routeHttp.end();
