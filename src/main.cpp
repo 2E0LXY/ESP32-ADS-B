@@ -1069,12 +1069,21 @@ bool refreshPhysicalBaseMap() {
   Serial.printf("Physical map %d/%d tiles at %.5f, %.5f radius %u nm zoom %u\n",
                 tilesDrawn, mapRebuildTotal, homeLatitude,
                 homeLongitude, queryRadiusNm, physicalMapZoom);
-  if (mapRebuildMissingTiles > 0 && mapRebuildRetryCount < 3) {
+  // A retry re-fetches every tile in view over HTTPS, not just the missing
+  // ones - real network load on top of whatever else (the web server, the
+  // AIS socket) is competing for the same scarce internal RAM. Skip it while
+  // memory is already tight rather than making a low-memory situation worse;
+  // a manual rescan from the admin page still works once things recover.
+  const size_t freeInternalHeap = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (mapRebuildMissingTiles > 0 && mapRebuildRetryCount < 3 && freeInternalHeap > 20000) {
     ++mapRebuildRetryCount;
     nextMapRetryAt = millis() + 15000UL;
     Serial.printf("Map rebuild missing %d tiles; retry %u/3 in 15s\n",
                   mapRebuildMissingTiles, mapRebuildRetryCount);
   } else {
+    if (mapRebuildMissingTiles > 0)
+      Serial.printf("Map rebuild missing %d tiles but free heap is %u; not auto-retrying\n",
+                    mapRebuildMissingTiles, static_cast<unsigned>(freeInternalHeap));
     mapRebuildRetryCount = 0;
   }
   return tilesDrawn > 0;
