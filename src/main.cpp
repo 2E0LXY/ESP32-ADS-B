@@ -428,10 +428,17 @@ volatile bool needsRedraw = false;
 // disabled region. A PSRAM-backed stack was tried here to ease internal-RAM
 // pressure and instead crashed reliably on the very next NVS write
 // ("esp_task_stack_is_sane_cache_disabled()" assert) - ESP-IDF's own sanity
-// check catching exactly this. 8192 matches the original single loop task's
-// stack, which ran this same code successfully for the whole session before
-// the two-task split; no evidence a larger one is needed.
-constexpr uint32_t NETWORK_TASK_STACK_BYTES = 8192;
+// check catching exactly this.
+//
+// 8192 (a guess at what the original single loop task used, never actually
+// verified) was then tried here and reliably stack-overflowed instead
+// ("Stack canary watchpoint triggered (network)"), consistently inside
+// mbedTLS certificate parsing - TLS handshakes have a genuinely deep,
+// stack-hungry call chain. 12288 is the same size that ran this exact
+// workload without any stack-overflow symptom when it was (briefly, and for
+// the unrelated reason above) in PSRAM, so it's a size known to be
+// sufficient, just moved back to the RAM tier that's actually safe here.
+constexpr uint32_t NETWORK_TASK_STACK_BYTES = 12288;
 
 // RAII lock: guarantees the mutex is released on every return path, even
 // through the many early returns inside fetchAircraft()/fetchAdsbV2Aircraft()
