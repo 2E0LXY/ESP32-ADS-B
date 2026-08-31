@@ -493,6 +493,20 @@ void applyTlsPolicy(WiFiClientSecure &client) {
 #endif
 }
 
+// Diagnostic for the recurring "-32512 SSL - Memory allocation failed":
+// mbedTLS needs one contiguous internal-RAM block per handshake, and total
+// free heap alone doesn't say whether that block is available - fragmented
+// heap can fail this allocation with plenty of free bytes left. Logging both
+// numbers around each fetch cycle will show whether the largest block keeps
+// shrinking cycle over cycle (a leak somewhere) or is already pinned at a
+// low ceiling from the very first cycle (something else holding it, e.g.
+// the web server's own connections or WiFiManager's leftover state).
+void logHeapDiagnostics(const char *tag) {
+  Serial.printf("heap[%s]: free=%u largestInternal=%u\n", tag,
+                static_cast<unsigned>(ESP.getFreeHeap()),
+                static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)));
+}
+
 // One User-Agent for every outbound request, always matching the running
 // build. OpenStreetMap's tile policy requires an identifying, accurate UA.
 const String &userAgent() {
@@ -1872,14 +1886,24 @@ void renderTablePage() {
     snprintf(distance,sizeof(distance),"%d",static_cast<int>(lroundf(display.distanceMiles)));
     if (display.altitudeFt >= 0) snprintf(altitude,sizeof(altitude),"%d",display.altitudeFt);
     else strcpy(altitude,"--");
-    RouteCacheEntry *route=cachedRoute(display.flight);
-    // Drawn at scale 1 below (6px/char), not the scale-2 used elsewhere in
-    // this row - full airport names need roughly double the char budget
-    // scale 2 would allow in this column's width.
-    const int routeMaxChars = (W - 4 - COL_ROUTE) / 6;
-    buildRouteLabel(route, routeLabel, sizeof(routeLabel), routeMaxChars);
     const char *identity=display.flight[0] ? display.flight : display.hex;
     const bool isMlat = display.positionSource == 2;
+    // MLAT-derived aircraft never get a route lookup (fetchAircraft/
+    // fetchAdsbV2Aircraft skip them - it's a multilateration estimate, not a
+    // real callsign an ADS-B route API would recognise), so cachedRoute()
+    // for one is always empty. Say why instead of showing "---", which reads
+    // as a lookup that's still pending or failed.
+    if (isMlat) {
+      strncpy(routeLabel, "MLAT TRIANGULATION", sizeof(routeLabel) - 1);
+      routeLabel[sizeof(routeLabel) - 1] = 0;
+    } else {
+      RouteCacheEntry *route=cachedRoute(display.flight);
+      // Drawn at scale 1 below (6px/char), not the scale-2 used elsewhere in
+      // this row - full airport names need roughly double the char budget
+      // scale 2 would allow in this column's width.
+      const int routeMaxChars = (W - 4 - COL_ROUTE) / 6;
+      buildRouteLabel(route, routeLabel, sizeof(routeLabel), routeMaxChars);
+    }
     if (isMlat) drawMlatPlane(16,y+7,display.track);
     else drawOperatorBadge(16,y+7,display.flight,display.hex);
     text5(COL_CALLSIGN,y,identity,rgb(255,220,60),2);
@@ -2096,6 +2120,7 @@ void sortAircraftByDistance() {
 }
 
 void fetchAdsbV2Aircraft() {
+  logHeapDiagnostics("fetch-start");
   String url;
   const String latitude = String(homeLatitude, 5);
   const String longitude = String(homeLongitude, 5);
@@ -2256,6 +2281,7 @@ void fetchAdsbV2Aircraft() {
   }
   routeHttp.end();
   }
+  logHeapDiagnostics("fetch-end");
   if (routeLookups > 0) saveRouteCacheToStorage();
   if (aircraftAtZeroMiles) beepAlert();
   lastFetchCompletedAt = millis();
@@ -2265,6 +2291,7 @@ void fetchAdsbV2Aircraft() {
 }
 
 void fetchAircraft() {
+  logHeapDiagnostics("fetch-start");
   const bool retriedAuth = openSkyAuthRetryPending;
   openSkyAuthRetryPending = false;
   feedRequestStartedAt = millis();
@@ -2404,6 +2431,7 @@ void fetchAircraft() {
   }
   routeHttp.end();
   }
+  logHeapDiagnostics("fetch-end");
   if (routeLookups > 0) saveRouteCacheToStorage();
   if (aircraftAtZeroMiles) beepAlert();
   lastFetchCompletedAt = millis();
