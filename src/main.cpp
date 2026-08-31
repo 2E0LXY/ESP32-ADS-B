@@ -381,6 +381,14 @@ String csrfToken;
 bool mapRebuildActive = false;
 int mapRebuildDone = 0;
 int mapRebuildTotal = 0;
+// A tile that fails to fetch/decode leaves the pre-tile dark ring pattern
+// from drawLocationFallback() showing through that square permanently, since
+// the finished framebuffer is unconditionally snapshotted into baseMap. Track
+// misses so a failed rebuild retries itself instead of leaving that patch
+// baked into the persisted map until someone notices and forces a rescan.
+int mapRebuildMissingTiles = 0;
+uint8_t mapRebuildRetryCount = 0;
+uint32_t nextMapRetryAt = 0;
 bool openSkyAuthRetryPending = false;
 bool pageSavePending = false;
 uint32_t pageSaveAt = 0;
@@ -1035,8 +1043,14 @@ bool refreshPhysicalBaseMap() {
     for (int tileX = firstTileX; tileX <= lastTileX; ++tileX) {
       const int wrappedX = (tileX % tilesPerAxis + tilesPerAxis) % tilesPerAxis;
       const String path = osmTilePath(physicalMapZoom, wrappedX, tileY);
-      const bool cached = cacheOsmTile(physicalMapZoom, wrappedX, tileY, path);
-      const bool drawn = cached && drawCachedOsmTile(path, tileX * 256 - left, tileY * 256 - top);
+      // A single failed fetch/decode used to leave that tile's square showing
+      // the dark ring fallback pattern for good; a couple of quick retries
+      // clears most transient network blips without a full manual rescan.
+      bool cached = false, drawn = false;
+      for (int attempt = 0; attempt < 3 && !drawn; ++attempt) {
+        cached = cacheOsmTile(physicalMapZoom, wrappedX, tileY, path);
+        drawn = cached && drawCachedOsmTile(path, tileX * 256 - left, tileY * 256 - top);
+      }
       if (drawn) ++tilesDrawn;
       Serial.printf("tile %d/%d at %d,%d cached=%d drawn=%d\n", wrappedX, tileY,
                     tileX * 256 - left, tileY * 256 - top, cached, drawn);
@@ -1051,9 +1065,18 @@ bool refreshPhysicalBaseMap() {
   memcpy(baseMap, framebuffer, W * H * sizeof(uint16_t));
   physicalMapReady = true;
   mapRebuildActive = false;
+  mapRebuildMissingTiles = mapRebuildTotal - tilesDrawn;
   Serial.printf("Physical map %d/%d tiles at %.5f, %.5f radius %u nm zoom %u\n",
                 tilesDrawn, mapRebuildTotal, homeLatitude,
                 homeLongitude, queryRadiusNm, physicalMapZoom);
+  if (mapRebuildMissingTiles > 0 && mapRebuildRetryCount < 3) {
+    ++mapRebuildRetryCount;
+    nextMapRetryAt = millis() + 15000UL;
+    Serial.printf("Map rebuild missing %d tiles; retry %u/3 in 15s\n",
+                  mapRebuildMissingTiles, mapRebuildRetryCount);
+  } else {
+    mapRebuildRetryCount = 0;
+  }
   return tilesDrawn > 0;
 }
 
@@ -1375,19 +1398,6 @@ void drawMlatPlane(int x, int y, float heading) {
   pixel(x,y,white);
 }
 
-void drawAdsbLogo(int x, int y, float heading, const char *flight, const char *hex) {
-  char code[4] = {'?','?','?',0};
-  const char *src = (flight && strlen(flight)>=3) ? flight : hex;
-  for (int i=0;i<3 && src && src[i];++i) code[i]=toupper(static_cast<unsigned char>(src[i]));
-  uint16_t brand=operatorColour(code), white=rgb(255,255,255), dark=rgb(5,15,20);
-  disc(x,y,11,dark); disc(x,y,10,brand);
-  text5(x-8,y-3,code,white,1);
-  float a=radians(heading-90.0f);
-  int nx=x+lroundf(cosf(a)*15), ny=y+lroundf(sinf(a)*15);
-  line(x,y,nx,ny,white);
-  disc(nx,ny,2,white);
-}
-
 void drawOperatorBadge(int x, int y, const char *flight, const char *hex) {
   char code[4] = {'?','?','?',0};
   const char *src = (flight && strlen(flight)>=3) ? flight : hex;
@@ -1395,6 +1405,88 @@ void drawOperatorBadge(int x, int y, const char *flight, const char *hex) {
   disc(x,y,11,rgb(5,15,20));
   disc(x,y,10,operatorColour(code));
   text5(x-8,y-3,code,rgb(255,255,255));
+}
+
+// The ADS-B emitter category (A0-A7/B0-B7/C0-C7) picks a recognisable
+// silhouette instead of every aircraft drawing as the same blob; an empty or
+// unrecognised category (common on feeds that omit it) falls back to the
+// airliner shape since that's the majority of what's actually in the air.
+enum class PlaneShape : uint8_t { Jet, Light, Helicopter, Military };
+
+PlaneShape planeShapeForCategory(const char *category) {
+  if (!category || !category[0]) return PlaneShape::Jet;
+  if (!strcmp(category, "A7")) return PlaneShape::Helicopter;
+  if (!strcmp(category, "A6")) return PlaneShape::Military;
+  if (!strcmp(category, "A1") || !strcmp(category, "A2") ||
+      !strcmp(category, "B1") || !strcmp(category, "B2") ||
+      !strcmp(category, "B3") || !strcmp(category, "B4")) return PlaneShape::Light;
+  return PlaneShape::Jet;
+}
+
+// Every shape is a handful of line segments rotated about (x,y) - the same
+// technique the old MLAT-only dart icon used - since the primitive drawing
+// layer here has no filled-polygon call, only line/disc/pixel/filledRect.
+void drawPlaneIcon(int x, int y, float heading, PlaneShape shape, uint16_t colour) {
+  const float a = radians(heading - 90.0f), cs = cosf(a), sn = sinf(a);
+  auto tx = [&](float px, float py) { return x + lroundf(px * cs - py * sn); };
+  auto ty = [&](float px, float py) { return y + lroundf(px * sn + py * cs); };
+  const uint16_t white = rgb(255, 255, 255);
+  switch (shape) {
+    case PlaneShape::Helicopter: {
+      // The rotor spins independent of track; a short tail boom still shows
+      // which way the aircraft is actually heading.
+      static float rotorAngle = 0.0f;
+      rotorAngle += 35.0f;
+      if (rotorAngle >= 360.0f) rotorAngle -= 360.0f;
+      const float ra = radians(rotorAngle);
+      disc(x, y, 3, colour);
+      line(x + lroundf(cosf(ra) * 13), y + lroundf(sinf(ra) * 13),
+           x - lroundf(cosf(ra) * 13), y - lroundf(sinf(ra) * 13), colour);
+      line(x, y, tx(-11, 0), ty(-11, 0), colour);
+      pixel(x, y, white);
+      break;
+    }
+    case PlaneShape::Military:
+      // Narrower and more sharply swept than the standard jet silhouette.
+      disc(x, y, 2, colour);
+      line(tx(13,0), ty(13,0), tx(-6,-4), ty(-6,-4), colour);
+      line(tx(13,0), ty(13,0), tx(-6,4), ty(-6,4), colour);
+      line(tx(-6,-4), ty(-6,-4), tx(-10,0), ty(-10,0), colour);
+      line(tx(-10,0), ty(-10,0), tx(-6,4), ty(-6,4), colour);
+      pixel(x, y, white);
+      break;
+    case PlaneShape::Light:
+      // Straight, unswept wings and a thin fuselage - a small prop aircraft.
+      line(tx(10,0), ty(10,0), tx(-10,0), ty(-10,0), colour);
+      line(tx(0,-8), ty(0,-8), tx(0,8), ty(0,8), colour);
+      line(tx(-7,-3), ty(-7,-3), tx(-10,0), ty(-10,0), colour);
+      line(tx(-7,3), ty(-7,3), tx(-10,0), ty(-10,0), colour);
+      pixel(x, y, white);
+      break;
+    case PlaneShape::Jet:
+    default:
+      // Swept-wing airliner silhouette - what every icon used to look like.
+      disc(x, y, 2, colour);
+      line(tx(12,0), ty(12,0), tx(-9,-5), ty(-9,-5), colour);
+      line(tx(12,0), ty(12,0), tx(-9,5), ty(-9,5), colour);
+      line(tx(-9,-5), ty(-9,-5), tx(-5,0), ty(-5,0), colour);
+      line(tx(-5,0), ty(-5,0), tx(-9,5), ty(-9,5), colour);
+      pixel(x, y, white);
+      break;
+  }
+}
+
+// Replaces the old drawAdsbLogo/drawMlatPlane pair: shape identifies the
+// aircraft type from its ADS-B category, colour flags MLAT (estimated,
+// non-ADS-B) position in red the same way the table's A/M source column
+// already does, and falls back to the operator's brand colour otherwise.
+void drawAircraftIcon(int x, int y, float heading, const char *flight,
+                       const char *hex, const char *category, bool isMlat) {
+  char code[4] = {'?','?','?',0};
+  const char *src = (flight && strlen(flight) >= 3) ? flight : hex;
+  for (int i = 0; i < 3 && src && src[i]; ++i) code[i] = toupper(static_cast<unsigned char>(src[i]));
+  const uint16_t colour = isMlat ? rgb(245, 30, 35) : operatorColour(code);
+  drawPlaneIcon(x, y, heading, planeShapeForCategory(category), colour);
 }
 
 void drawRouteLabel(int x, int y, const RouteCacheEntry *route) {
@@ -1471,8 +1563,8 @@ void renderOverviewPage() {
     AircraftDisplay &display = latestAircraft[i];
     if (display.x < 0 || display.x >= OVERVIEW_MAP_WIDTH - 10) continue;
     if (display.y < 0 || display.y >= H) continue;
-    if (display.positionSource == 2) drawMlatPlane(display.x, display.y, display.track);
-    else drawAdsbLogo(display.x, display.y, display.track, display.flight, display.hex);
+    drawAircraftIcon(display.x, display.y, display.track, display.flight, display.hex,
+                      display.category, display.positionSource == 2);
   }
 
   filledRect(OVERVIEW_MAP_WIDTH, 0, W - OVERVIEW_MAP_WIDTH, H, rgb(2, 10, 18));
@@ -1521,10 +1613,9 @@ void renderMapPage() {
   for (int i=0; i<lastCount; ++i) {
     AircraftDisplay &display = latestAircraft[i];
     if (display.x < 0 || display.x >= W || display.y < 0 || display.y >= H) continue;
-    if (display.positionSource == 2) {
-      drawMlatPlane(display.x,display.y,display.track);
-    } else {
-      drawAdsbLogo(display.x,display.y,display.track,display.flight,display.hex);
+    drawAircraftIcon(display.x, display.y, display.track, display.flight, display.hex,
+                      display.category, display.positionSource == 2);
+    if (display.positionSource != 2) {
       drawRouteLabel(display.x,display.y,cachedRoute(display.flight));
     }
   }
@@ -1721,10 +1812,9 @@ void renderRadarPage() {
     const int y = centreY + lroundf(sinf(bearing) * radius);
     if (outside) {
       disc(x, y, 3, rgb(255, 65, 65));
-    } else if (aircraft.positionSource == 2) {
-      drawMlatPlane(x, y, aircraft.track);
     } else {
-      drawAdsbLogo(x, y, aircraft.track, aircraft.flight, aircraft.hex);
+      drawAircraftIcon(x, y, aircraft.track, aircraft.flight, aircraft.hex,
+                        aircraft.category, aircraft.positionSource == 2);
     }
     if (outside) continue;
     if (plotted < 10) {
@@ -3650,6 +3740,10 @@ void loop() {
     physicalMapRefreshPending = false;
     refreshPhysicalBaseMap();
     renderCurrentPage();
+  }
+  if (nextMapRetryAt && static_cast<int32_t>(millis() - nextMapRetryAt) >= 0) {
+    nextMapRetryAt = 0;
+    physicalMapRefreshPending = true;
   }
   if (setupPortalPending) {
     setupPortalPending = false;
