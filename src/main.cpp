@@ -358,6 +358,11 @@ IconHit iconHits[MAX_AIRCRAFT];
 int iconHitCount = 0;
 int detailAircraftIndex = -1;
 uint32_t detailShownAt = 0;
+// How many rows into latestAircraft (sorted nearest-first) the table page's
+// visible window starts. Reset whenever the page is left so it always
+// re-opens at the nearest aircraft rather than wherever it was scrolled to.
+int tableScrollOffset = 0;
+constexpr int TABLE_VISIBLE_ROWS = 10;
 volatile bool bootButtonPending = false;
 WebServer webServer(80);
 Preferences settingsStore;
@@ -782,10 +787,13 @@ bool beginTouch() {
 #endif
 }
 
-enum class TouchGesture : uint8_t { None, Tap, SwipeLeft, SwipeRight };
+enum class TouchGesture : uint8_t { None, Tap, SwipeLeft, SwipeRight, SwipeUp, SwipeDown };
 
-// A swipe must travel this far horizontally, stay mostly horizontal, and
-// finish inside the time limit. Anything shorter that lifts cleanly is a tap.
+// A swipe must travel this far in its dominant axis, stay mostly on that
+// axis, and finish inside the time limit. Anything shorter that lifts
+// cleanly is a tap - and anything that doesn't clear the 2:1 dominance ratio
+// on either axis falls through to a tap too, which used to silently double
+// as "advance page" for a vertical drag that missed being a clean swipe.
 constexpr int SWIPE_MIN_PIXELS = 70;
 constexpr uint32_t SWIPE_MAX_MS = 700;
 
@@ -842,6 +850,15 @@ TouchGesture touchGesture() {
   if (heldFor <= SWIPE_MAX_MS && abs(deltaX) >= SWIPE_MIN_PIXELS &&
       abs(deltaX) > abs(deltaY) * 2) {
     return deltaX < 0 ? TouchGesture::SwipeLeft : TouchGesture::SwipeRight;
+  }
+  // A vertical drag that missed a clean horizontal swipe used to fall all
+  // the way through to a tap, which - on any page where the release point
+  // didn't land on an aircraft icon - advanced the page exactly like a
+  // horizontal swipe would. Table scrolling needs this recognised as its
+  // own gesture instead.
+  if (heldFor <= SWIPE_MAX_MS && abs(deltaY) >= SWIPE_MIN_PIXELS &&
+      abs(deltaY) > abs(deltaX) * 2) {
+    return deltaY < 0 ? TouchGesture::SwipeUp : TouchGesture::SwipeDown;
   }
   lastTapX = lastX;
   lastTapY = lastY;
@@ -1877,9 +1894,13 @@ void renderTablePage() {
   text5(COL_ROUTE,31,"FROM TO",rgb(170,190,205));
   line(3,41,W - 4,41,rgb(55,85,105));
 
-  int rows = min(lastCount, 10);
+  // Clamped here (not just where the scroll gesture changes it) because
+  // lastCount shrinks on every fetch as aircraft leave range, which can
+  // strand the offset past the end of a now-shorter list.
+  tableScrollOffset = constrain(tableScrollOffset, 0, max(0, lastCount - TABLE_VISIBLE_ROWS));
+  const int rows = min(lastCount - tableScrollOffset, TABLE_VISIBLE_ROWS);
   for (int i=0; i<rows; ++i) {
-    AircraftDisplay &display = latestAircraft[i];
+    AircraftDisplay &display = latestAircraft[tableScrollOffset + i];
     int y=49+i*40;
     filledRect(0, y-7, W, 40, (i & 1) ? ROW_BAND_LIGHT : ROW_BAND_DARK);
     char distance[6], altitude[7], routeLabel[84];
@@ -1921,12 +1942,14 @@ void renderTablePage() {
     text5(COL_ALT,y,altitude,rgb(255,255,255),2);
     text5(COL_ROUTE,y+4,routeLabel,rgb(255,255,255));
   }
-  char footer[24];
+  char footer[36];
+  const char *scrollHint = (lastCount > TABLE_VISIBLE_ROWS) ? " - SWIPE UP/DOWN" : "";
+  const int rangeStart = rows > 0 ? tableScrollOffset + 1 : 0;
   if (creditsRemaining >= 0)
-    snprintf(footer,sizeof(footer),"%d AIRCRAFT  C%ld",lastCount,creditsRemaining);
+    snprintf(footer,sizeof(footer),"%d-%d OF %d  C%ld%s",rangeStart,tableScrollOffset+rows,lastCount,creditsRemaining,scrollHint);
   else
-    snprintf(footer,sizeof(footer),"%d AIRCRAFT",lastCount);
-  text5(layout::centreX - 70,layout::footerY,footer,rgb(130,160,180));
+    snprintf(footer,sizeof(footer),"%d-%d OF %d%s",rangeStart,tableScrollOffset+rows,lastCount,scrollHint);
+  text5(layout::centreX - 110,layout::footerY,footer,rgb(130,160,180));
   present();
 }
 
@@ -4163,6 +4186,14 @@ void loop() {
     pageStep = 1;
   } else if (gesture == TouchGesture::SwipeLeft) {
     pageStep = -1;
+  } else if (displayPage == DisplayPage::Table &&
+             (gesture == TouchGesture::SwipeUp || gesture == TouchGesture::SwipeDown)) {
+    // Content follows the finger: dragging up brings later rows into view
+    // (scroll forward through the list), dragging down goes back toward the
+    // nearest aircraft.
+    tableScrollOffset += gesture == TouchGesture::SwipeUp ? TABLE_VISIBLE_ROWS : -TABLE_VISIBLE_ROWS;
+    tableScrollOffset = constrain(tableScrollOffset, 0, max(0, lastCount - TABLE_VISIBLE_ROWS));
+    { MutexGuard guard(dataMutex); renderCurrentPage(); }
   } else if (gesture == TouchGesture::Tap) {
     const int hitIndex = findAircraftIconAt(lastTapX, lastTapY);
     if (hitIndex >= 0) {
@@ -4180,6 +4211,7 @@ void loop() {
     const int pageCount = DISPLAY_PAGE_COUNT;
     displayPage = static_cast<DisplayPage>(
         (static_cast<int>(displayPage) + pageStep + pageCount) % pageCount);
+    tableScrollOffset = 0;
     pageSavePending = true;
     pageSaveAt = millis() + 5000UL;
     { MutexGuard guard(dataMutex); renderCurrentPage(); }
