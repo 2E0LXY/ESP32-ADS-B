@@ -114,7 +114,10 @@ if (Test-BridgeUp) {
 $uploadPort = "rfc2217://127.0.0.1:$TcpPort`?ign_set_control"
 
 if ($Monitor) {
-  pio device monitor -p $uploadPort -b 115200
+  # Decodes raw backtrace addresses (as seen in a watchdog/crash dump) into
+  # actual function names and line numbers using this environment's just-built
+  # .elf - without it a crash log is a wall of hex nobody can read.
+  pio device monitor -p $uploadPort -b 115200 -e $PioEnv --filter esp32_exception_decoder
   exit $LASTEXITCODE
 }
 
