@@ -3829,7 +3829,15 @@ void connectAisWebSocket() {
 // wrapped in dataMutex; see its declaration for the full rationale.
 void networkTask(void *) {
   for (;;) {
-    webServer.handleClient();
+    // Several admin API handlers (handleAircraftApi in particular) build a
+    // sizeable PSRAM-backed JSON document from latestAircraft on every call -
+    // real, non-trivial PSRAM traffic that ran unguarded here despite
+    // present()'s full-frame PSRAM->DMA copy needing the same mutex. The two
+    // running at once is exactly the condition that can starve the RGB
+    // panel's DMA and roll a frame (see the vsync-restart comment in
+    // present()); serialize all HTTP handling against rendering the same way
+    // the fetches already are, not just the ones known to touch PSRAM.
+    { MutexGuard guard(dataMutex); webServer.handleClient(); }
     if (githubInstallPending) {
       githubInstallPending = false;
       installGithubUpdate();
