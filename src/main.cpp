@@ -327,6 +327,18 @@ uint32_t nextMarinePruneAt = 0;
 bool touchReady = false;
 uint8_t touchAddress = 0;
 uint32_t lastTouchAt = 0;
+int lastTapX = 0;
+int lastTapY = 0;
+
+// Screen positions of the aircraft icons drawn on the current frame, so a
+// tap can be matched back to a specific aircraft. Rebuilt on every render of
+// a page that plots icons (Overview, Map, Radar); MAX_AIRCRAFT is already
+// the hard cap on how many can exist at once.
+struct IconHit { int16_t x, y; int16_t aircraftIndex; };
+IconHit iconHits[MAX_AIRCRAFT];
+int iconHitCount = 0;
+int detailAircraftIndex = -1;
+uint32_t detailShownAt = 0;
 volatile bool bootButtonPending = false;
 WebServer webServer(80);
 Preferences settingsStore;
@@ -746,6 +758,8 @@ TouchGesture touchGesture() {
       abs(deltaX) > abs(deltaY) * 2) {
     return deltaX < 0 ? TouchGesture::SwipeLeft : TouchGesture::SwipeRight;
   }
+  lastTapX = lastX;
+  lastTapY = lastY;
   return TouchGesture::Tap;
 }
 
@@ -790,6 +804,27 @@ void disc(int cx, int cy, int r, uint16_t c) {
 void filledRect(int x, int y, int width, int height, uint16_t c) {
   for (int yy = y; yy < y + height; ++yy)
     for (int xx = x; xx < x + width; ++xx) pixel(xx, yy, c);
+}
+
+// Standard sorted-scanline triangle fill - the only solid-shape primitive
+// available besides disc()/filledRect(), used to build bold aircraft
+// silhouettes instead of the thin wireframe outlines a plain line() gives.
+void filledTriangle(int x0, int y0, int x1, int y1, int x2, int y2, uint16_t c) {
+  auto swapInt = [](int &a, int &b) { const int t = a; a = b; b = t; };
+  if (y0 > y1) { swapInt(x0, x1); swapInt(y0, y1); }
+  if (y0 > y2) { swapInt(x0, x2); swapInt(y0, y2); }
+  if (y1 > y2) { swapInt(x1, x2); swapInt(y1, y2); }
+  auto edge = [](int ya, int xa, int yb, int xb, int y) {
+    if (yb == ya) return static_cast<float>(xa);
+    return xa + (xb - xa) * static_cast<float>(y - ya) / (yb - ya);
+  };
+  for (int y = y0; y <= y2; ++y) {
+    const float xLeftFull = edge(y0, x0, y2, x2, y);
+    const float xOther = (y < y1) ? edge(y0, x0, y1, x1, y) : edge(y1, x1, y2, x2, y);
+    int xa = lroundf(xLeftFull), xb = lroundf(xOther);
+    if (xa > xb) swapInt(xa, xb);
+    for (int x = xa; x <= xb; ++x) pixel(x, y, c);
+  }
 }
 
 const uint8_t *glyph(char ch) {
@@ -1432,9 +1467,10 @@ PlaneShape planeShapeForCategory(const char *category) {
   return PlaneShape::Jet;
 }
 
-// Every shape is a handful of line segments rotated about (x,y) - the same
-// technique the old MLAT-only dart icon used - since the primitive drawing
-// layer here has no filled-polygon call, only line/disc/pixel/filledRect.
+// Every shape is built from filledTriangle()/disc() - solid, not outlined -
+// so it actually reads as a plane silhouette on the panel instead of a faint
+// wireframe; a thin line() outline (the original version of this function)
+// all but disappeared against the map at normal viewing distance.
 void drawPlaneIcon(int x, int y, float heading, PlaneShape shape, uint16_t colour) {
   const float a = radians(heading - 90.0f), cs = cosf(a), sn = sinf(a);
   auto tx = [&](float px, float py) { return x + lroundf(px * cs - py * sn); };
@@ -1443,43 +1479,42 @@ void drawPlaneIcon(int x, int y, float heading, PlaneShape shape, uint16_t colou
   switch (shape) {
     case PlaneShape::Helicopter: {
       // The rotor spins independent of track; a short tail boom still shows
-      // which way the aircraft is actually heading.
+      // which way the aircraft is actually heading. A real rotor blade is
+      // thin, so this is the one shape that stays as lines (doubled for
+      // weight) rather than a fill.
       static float rotorAngle = 0.0f;
       rotorAngle += 35.0f;
       if (rotorAngle >= 360.0f) rotorAngle -= 360.0f;
       const float ra = radians(rotorAngle);
-      disc(x, y, 3, colour);
-      line(x + lroundf(cosf(ra) * 13), y + lroundf(sinf(ra) * 13),
-           x - lroundf(cosf(ra) * 13), y - lroundf(sinf(ra) * 13), colour);
+      const int r1x = x + lroundf(cosf(ra) * 13), r1y = y + lroundf(sinf(ra) * 13);
+      const int r2x = x - lroundf(cosf(ra) * 13), r2y = y - lroundf(sinf(ra) * 13);
+      disc(x, y, 4, colour);
+      line(r1x, r1y, r2x, r2y, colour);
+      line(r1x, r1y + 1, r2x, r2y + 1, colour);
       line(x, y, tx(-11, 0), ty(-11, 0), colour);
       pixel(x, y, white);
       break;
     }
     case PlaneShape::Military:
       // Narrower and more sharply swept than the standard jet silhouette.
-      disc(x, y, 2, colour);
-      line(tx(13,0), ty(13,0), tx(-6,-4), ty(-6,-4), colour);
-      line(tx(13,0), ty(13,0), tx(-6,4), ty(-6,4), colour);
-      line(tx(-6,-4), ty(-6,-4), tx(-10,0), ty(-10,0), colour);
-      line(tx(-10,0), ty(-10,0), tx(-6,4), ty(-6,4), colour);
+      filledTriangle(tx(13,0), ty(13,0), tx(-6,-4), ty(-6,-4), tx(-10,0), ty(-10,0), colour);
+      filledTriangle(tx(13,0), ty(13,0), tx(-10,0), ty(-10,0), tx(-6,4), ty(-6,4), colour);
       pixel(x, y, white);
       break;
     case PlaneShape::Light:
-      // Straight, unswept wings and a thin fuselage - a small prop aircraft.
-      line(tx(10,0), ty(10,0), tx(-10,0), ty(-10,0), colour);
-      line(tx(0,-8), ty(0,-8), tx(0,8), ty(0,8), colour);
-      line(tx(-7,-3), ty(-7,-3), tx(-10,0), ty(-10,0), colour);
-      line(tx(-7,3), ty(-7,3), tx(-10,0), ty(-10,0), colour);
+      // Straight, unswept wings crossing a slim fuselage - a small prop
+      // aircraft, not the swept dart shape used for everything else.
+      filledTriangle(tx(10,0), ty(10,0), tx(-10,-2), ty(-10,-2), tx(-10,2), ty(-10,2), colour);
+      filledTriangle(tx(2,0), ty(2,0), tx(0,-8), ty(0,-8), tx(-2,0), ty(-2,0), colour);
+      filledTriangle(tx(2,0), ty(2,0), tx(-2,0), ty(-2,0), tx(0,8), ty(0,8), colour);
       pixel(x, y, white);
       break;
     case PlaneShape::Jet:
     default:
-      // Swept-wing airliner silhouette - what every icon used to look like.
-      disc(x, y, 2, colour);
-      line(tx(12,0), ty(12,0), tx(-9,-5), ty(-9,-5), colour);
-      line(tx(12,0), ty(12,0), tx(-9,5), ty(-9,5), colour);
-      line(tx(-9,-5), ty(-9,-5), tx(-5,0), ty(-5,0), colour);
-      line(tx(-5,0), ty(-5,0), tx(-9,5), ty(-9,5), colour);
+      // Swept-wing airliner dart - the same outline every icon used to draw,
+      // now filled solid via its two diagonal-split triangles.
+      filledTriangle(tx(12,0), ty(12,0), tx(-9,-5), ty(-9,-5), tx(-5,0), ty(-5,0), colour);
+      filledTriangle(tx(12,0), ty(12,0), tx(-5,0), ty(-5,0), tx(-9,5), ty(-9,5), colour);
       pixel(x, y, white);
       break;
   }
@@ -1496,6 +1531,28 @@ void drawAircraftIcon(int x, int y, float heading, const char *flight,
   for (int i = 0; i < 3 && src && src[i]; ++i) code[i] = toupper(static_cast<unsigned char>(src[i]));
   const uint16_t colour = isMlat ? rgb(245, 30, 35) : operatorColour(code);
   drawPlaneIcon(x, y, heading, planeShapeForCategory(category), colour);
+}
+
+// Records where an icon was just drawn against which entry in latestAircraft,
+// so a later tap can be matched back to a specific aircraft. Call sites reset
+// iconHitCount to 0 before their draw loop and call this once per icon drawn.
+void recordIconHit(int x, int y, int aircraftIndex) {
+  if (iconHitCount >= MAX_AIRCRAFT) return;
+  iconHits[iconHitCount].x = static_cast<int16_t>(x);
+  iconHits[iconHitCount].y = static_cast<int16_t>(y);
+  iconHits[iconHitCount].aircraftIndex = static_cast<int16_t>(aircraftIndex);
+  ++iconHitCount;
+}
+
+int findAircraftIconAt(int x, int y) {
+  int best = -1;
+  long bestDistSq = 22 * 22;  // generous finger-sized hit radius
+  for (int i = 0; i < iconHitCount; ++i) {
+    const long dx = iconHits[i].x - x, dy = iconHits[i].y - y;
+    const long distSq = dx * dx + dy * dy;
+    if (distSq <= bestDistSq) { bestDistSq = distSq; best = iconHits[i].aircraftIndex; }
+  }
+  return best;
 }
 
 void drawRouteLabel(int x, int y, const RouteCacheEntry *route) {
@@ -1568,12 +1625,14 @@ constexpr int OVERVIEW_COL_ROUTE = W * 144 / 480;
 
 void renderOverviewPage() {
   restoreMap();
+  iconHitCount = 0;
   for (int i = 0; i < lastCount; ++i) {
     AircraftDisplay &display = latestAircraft[i];
     if (display.x < 0 || display.x >= OVERVIEW_MAP_WIDTH - 10) continue;
     if (display.y < 0 || display.y >= H) continue;
     drawAircraftIcon(display.x, display.y, display.track, display.flight, display.hex,
                       display.category, display.positionSource == 2);
+    recordIconHit(display.x, display.y, i);
   }
 
   filledRect(OVERVIEW_MAP_WIDTH, 0, W - OVERVIEW_MAP_WIDTH, H, rgb(2, 10, 18));
@@ -1619,11 +1678,13 @@ void renderOverviewPage() {
 
 void renderMapPage() {
   restoreMap();
+  iconHitCount = 0;
   for (int i=0; i<lastCount; ++i) {
     AircraftDisplay &display = latestAircraft[i];
     if (display.x < 0 || display.x >= W || display.y < 0 || display.y >= H) continue;
     drawAircraftIcon(display.x, display.y, display.track, display.flight, display.hex,
                       display.category, display.positionSource == 2);
+    recordIconHit(display.x, display.y, i);
     if (display.positionSource != 2) {
       drawRouteLabel(display.x,display.y,cachedRoute(display.flight));
     }
@@ -1810,6 +1871,7 @@ void renderRadarPage() {
   }
 
   int plotted = 0;
+  iconHitCount = 0;
   for (int i = 0; i < lastCount; ++i) {
     AircraftDisplay &aircraft = latestAircraft[i];
     if (!isfinite(aircraft.latitude) || !isfinite(aircraft.longitude)) continue;
@@ -1824,6 +1886,7 @@ void renderRadarPage() {
     } else {
       drawAircraftIcon(x, y, aircraft.track, aircraft.flight, aircraft.hex,
                         aircraft.category, aircraft.positionSource == 2);
+      recordIconHit(x, y, i);
     }
     if (outside) continue;
     if (plotted < 10) {
@@ -1840,6 +1903,65 @@ void renderRadarPage() {
   char countLabel[18];
   snprintf(countLabel, sizeof(countLabel), "%d TRACKED", plotted);
   text5(W - 86, H - 12, countLabel, rgb(90, 235, 185));
+  present();
+}
+
+// A tap that hits a plotted aircraft icon (Overview/Map/Radar) shows this
+// instead of advancing the page, giving the touchscreen the same
+// "tap a marker for full detail" behaviour the browser map already has.
+void renderAircraftDetailCard(int aircraftIndex) {
+  if (aircraftIndex < 0 || aircraftIndex >= lastCount) return;
+  AircraftDisplay &a = latestAircraft[aircraftIndex];
+  const int cardW = min(360, W - 16);
+  const int cardH = min(230, H - 16);
+  const int cx = (W - cardW) / 2, cy = (H - cardH) / 2;
+  const uint16_t frame = rgb(80, 220, 255);
+  filledRect(cx, cy, cardW, cardH, rgb(4, 12, 20));
+  filledRect(cx, cy, cardW, 2, frame);
+  filledRect(cx, cy + cardH - 2, cardW, 2, frame);
+  filledRect(cx, cy, 2, cardH, frame);
+  filledRect(cx + cardW - 2, cy, 2, cardH, frame);
+
+  const char *identity = a.flight[0] ? a.flight : a.hex;
+  text5(cx + 10, cy + 9, identity, rgb(255, 220, 60), 2);
+  const bool isMlat = a.positionSource == 2;
+  text5(cx + cardW - 66, cy + 12, isMlat ? "MLAT" : "ADS-B",
+        isMlat ? rgb(255, 65, 65) : rgb(60, 220, 130));
+
+  int row = cy + 30;
+  const int lineHeight = 12;
+  auto line5 = [&](const char *text, uint16_t colour) {
+    text5(cx + 10, row, text, colour);
+    row += lineHeight;
+  };
+  char buf[64];
+  line5(a.operatorName[0] ? a.operatorName : "Unknown operator", rgb(190, 220, 240));
+  snprintf(buf, sizeof(buf), "REG %s  HEX %s  %s", a.registration[0] ? a.registration : "--",
+           a.hex, a.aircraftType[0] ? a.aircraftType : "TYPE UNKNOWN");
+  line5(buf, rgb(200, 210, 220));
+  if (a.altitudeFt >= 0)
+    snprintf(buf, sizeof(buf), "ALT %d FT  V/S %+d FPM", a.altitudeFt, static_cast<int>(lroundf(a.verticalRateFpm)));
+  else
+    snprintf(buf, sizeof(buf), "ALT --  V/S %+d FPM", static_cast<int>(lroundf(a.verticalRateFpm)));
+  line5(buf, rgb(255, 255, 255));
+  snprintf(buf, sizeof(buf), "SPD %d KT  HDG %03d %s", static_cast<int>(lroundf(a.speedKnots)),
+           ((static_cast<int>(a.track) % 360) + 360) % 360, compassDirection(a.track));
+  line5(buf, rgb(255, 255, 255));
+  snprintf(buf, sizeof(buf), "DIST %d MI  SQUAWK %s  CAT %s", static_cast<int>(lroundf(a.distanceMiles)),
+           a.squawk[0] ? a.squawk : "--", a.category[0] ? a.category : "--");
+  line5(buf, rgb(255, 255, 255));
+  snprintf(buf, sizeof(buf), "LAT %.4f  LON %.4f", a.latitude, a.longitude);
+  line5(buf, rgb(255, 255, 255));
+  RouteCacheEntry *route = cachedRoute(a.flight);
+  char routeLabel[40];
+  buildRouteLabel(route, routeLabel, sizeof(routeLabel), (cardW - 20) / 6);
+  snprintf(buf, sizeof(buf), "ROUTE %s", routeLabel);
+  line5(buf, rgb(130, 210, 255));
+  if (a.emergency[0] && strcmp(a.emergency, "none")) {
+    snprintf(buf, sizeof(buf), "EMERGENCY: %s", a.emergency);
+    line5(buf, rgb(255, 65, 65));
+  }
+  text5(cx + 10, cy + cardH - 13, "TAP ANYWHERE TO CLOSE", rgb(130, 160, 180));
   present();
 }
 
@@ -3788,10 +3910,33 @@ void loop() {
   const bool pressed = bootButtonTapped();
   int pageStep = 0;
   // Swipe right advances Overview -> Table -> Map -> Radar -> Marine and
-  // wraps; swipe left walks back. Tap and the boot button both advance.
-  if (gesture == TouchGesture::SwipeRight) pageStep = 1;
-  else if (gesture == TouchGesture::SwipeLeft) pageStep = -1;
-  else if (gesture == TouchGesture::Tap || pressed) pageStep = 1;
+  // wraps; swipe left walks back. A tap either opens a detail card over the
+  // aircraft icon it hit, or - if it missed every icon - advances the page,
+  // same as before. The boot button also advances. All of that is swallowed
+  // while a detail card is showing: any touch just dismisses it back to
+  // whichever page was already active, and it times out on its own too, so
+  // it can't be left open indefinitely if nobody taps again.
+  if (detailAircraftIndex >= 0) {
+    if (gesture != TouchGesture::None || pressed || millis() - detailShownAt > 8000) {
+      detailAircraftIndex = -1;
+      renderCurrentPage();
+    }
+  } else if (gesture == TouchGesture::SwipeRight) {
+    pageStep = 1;
+  } else if (gesture == TouchGesture::SwipeLeft) {
+    pageStep = -1;
+  } else if (gesture == TouchGesture::Tap) {
+    const int hitIndex = findAircraftIconAt(lastTapX, lastTapY);
+    if (hitIndex >= 0) {
+      detailAircraftIndex = hitIndex;
+      detailShownAt = millis();
+      renderAircraftDetailCard(hitIndex);
+    } else {
+      pageStep = 1;
+    }
+  } else if (pressed) {
+    pageStep = 1;
+  }
   if (pageStep) {
     const int pageCount = DISPLAY_PAGE_COUNT;
     displayPage = static_cast<DisplayPage>(
@@ -3805,7 +3950,8 @@ void loop() {
                   : gesture == TouchGesture::Tap        ? "tap"
                                                         : "button");
   }
-  if (displayPage == DisplayPage::Radar && static_cast<int32_t>(millis() - nextRadarFrameAt) >= 0) {
+  if (displayPage == DisplayPage::Radar && detailAircraftIndex < 0 &&
+      static_cast<int32_t>(millis() - nextRadarFrameAt) >= 0) {
     // Full-screen PSRAM copies faster than this can starve the RGB DMA and
     // momentarily wrap the bottom scan lines to the top of the panel.
     radarSweepDegrees += 18.0f;
@@ -3824,7 +3970,7 @@ void loop() {
     pruneStaleVessels();
     nextMarinePruneAt = millis() + 60000UL;
   }
-  if (displayPage == DisplayPage::Marine && marineDataDirty &&
+  if (displayPage == DisplayPage::Marine && marineDataDirty && detailAircraftIndex < 0 &&
       static_cast<int32_t>(millis() - nextMarineRenderAt) >= 0) {
     marineDataDirty = false;
     renderMarinePage();
