@@ -129,17 +129,12 @@ if ($uploadExitCode -eq 0) {
   # ign_set_control (needed above to stop the bridge dropping the connection
   # mid-sync) also stops esptool's normal DTR/RTS reset pulse from reaching
   # the board, so a successful upload can leave it sitting in the ROM
-  # bootloader instead of running the new firmware. Try a plain reset - no
-  # flashing, just the reset pulse - over a connection that allows control
-  # lines; if the bridge still won't carry them, this is a no-op and you'll
-  # need to power-cycle the board by hand, same as before this existed.
-  Write-Host "Upload succeeded; attempting to reset the board..."
-  try {
-    python -m esptool --chip esp32s3 --port "rfc2217://127.0.0.1:$TcpPort" --before default_reset --after hard_reset chip_id 2>&1 | Out-Null
-    Write-Host "Reset attempted. If the screen is still blank, power-cycle the board."
-  } catch {
-    Write-Host "Reset attempt failed ($($_.Exception.Message)); power-cycle the board to run the new firmware."
-  }
+  # bootloader instead of running the new firmware. A second esptool
+  # connection to try a bare reset was tried here and reliably left the
+  # bridge unable to answer the *next* connection's RFC2217 handshake
+  # ("Remote does not seem to support RFC2217"), which is worse than the
+  # problem it was meant to solve - so this is a manual step for now.
+  Write-Host "Upload succeeded. Power-cycle the board to run the new firmware."
 }
 
 exit $uploadExitCode
