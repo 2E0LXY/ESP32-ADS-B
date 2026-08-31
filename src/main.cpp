@@ -133,7 +133,6 @@ constexpr char WEB_USERNAME[] = "admin";
 constexpr char GITHUB_OWNER[] = "2E0LXY";
 constexpr char GITHUB_REPOSITORY[] = "ESP32-ADS-B";
 constexpr char GITHUB_RELEASE_API[] = "https://api.github.com/repos/2E0LXY/ESP32-ADS-B/releases/latest";
-constexpr uint32_t UPDATE_CHECK_MS = 6UL * 60UL * 60UL * 1000UL;
 // Sized for RSA-4096 so rotating the signing key does not silently disable
 // every OTA path. verifyFirmwareSignature() checks the actual length.
 constexpr size_t MAX_SIGNATURE_BYTES = 512;
@@ -299,6 +298,12 @@ RouteCacheEntry routeCache[ROUTE_CACHE_SIZE];
 AircraftDisplay *latestAircraft = nullptr;
 VesselDisplay *latestVessels = nullptr;
 int vesselCount = 0;
+// The aircraft feed and marine tracking both need a persistent TLS session
+// (AIS) or frequent HTTPS fetches (REST providers), competing for the same
+// tight internal RAM - running both at once was the root of the recurring
+// SSL alloc failures. Off by default; enabling it stops the aircraft feed
+// entirely rather than share the budget between two live feeds.
+bool marineTrackingEnabled = false;
 String marineProvider = "aisstream";
 String aisApiKey;
 String aisHubUsername;
@@ -393,7 +398,6 @@ size_t githubFirmwareSize = 0;
 uint8_t githubSignature[MAX_SIGNATURE_BYTES] = {};
 size_t githubSignatureSize = 0;
 String githubUpdateStatus = "Not checked";
-uint32_t nextGithubCheckAt = 0;
 bool sdMounted = false;
 String sdStatus = "Not checked";
 String sdCardType = "None";
@@ -1796,7 +1800,8 @@ void renderMarinePage() {
     ++plotted;
   }
   char count[28];
-  if (!marineConfigured()) snprintf(count, sizeof(count), "AIS NOT CONFIGURED");
+  if (!marineTrackingEnabled) snprintf(count, sizeof(count), "MARINE TRACKING OFF");
+  else if (!marineConfigured()) snprintf(count, sizeof(count), "AIS NOT CONFIGURED");
   else snprintf(count, sizeof(count), "%d SHIPS%s", plotted, aisConnected ? "" : " (OFFLINE)");
   status(count, !marineConfigured() ? rgb(150,150,150) : aisConnected ? rgb(35,210,80) : rgb(220,60,60));
   present();
@@ -2880,6 +2885,7 @@ void handleStatusApi() {
   doc["temperatureC"] = temperatureRead();
   doc["aircraftCapacity"] = MAX_AIRCRAFT;
   doc["aircraftStorage"] = "PSRAM";
+  doc["marineTrackingEnabled"] = marineTrackingEnabled;
   doc["marineProvider"] = marineProvider;
   doc["aisConfigured"] = marineConfigured();
   doc["hasAisApiKey"] = aisApiKey.length() > 0;
@@ -3250,14 +3256,23 @@ void handleMarineCredentials() {
   }
   marineProvider = provider;
   settingsStore.putString("marine-provider", marineProvider);
-  // Any provider, key, or radius change needs a clean slate: the old
-  // vessels came from a different source/area and would otherwise linger
-  // stale on the map until MARINE_STALE_MS quietly drops them.
+  if (webServer.hasArg("enabled")) {
+    marineTrackingEnabled = webServer.arg("enabled") == "1";
+    settingsStore.putBool("marine-enabled", marineTrackingEnabled);
+    // Mutually exclusive with the aircraft feed: switching this on should
+    // stop competing with it for the same TLS/heap budget, and switching it
+    // off should let the aircraft feed resume immediately rather than wait
+    // out whatever fetch interval was already in flight.
+    if (!marineTrackingEnabled) nextFetchAt = 0;
+  }
+  // Any provider, key, radius, or enabled change needs a clean slate: the
+  // old vessels came from a different source/area/state and would
+  // otherwise linger stale on the map until MARINE_STALE_MS drops them.
   aisWebSocket.disconnect();
   aisConnected = false;
   vesselCount = 0;
   nextMarineFetchAt = 0;
-  if (marineProvider == "aisstream" && aisApiKey.length()) connectAisWebSocket();
+  if (marineTrackingEnabled && marineProvider == "aisstream" && aisApiKey.length()) connectAisWebSocket();
   sendMessage(200, "Marine settings saved");
 }
 
@@ -3803,7 +3818,7 @@ void onAisEvent(WStype_t type, uint8_t *payload, size_t length) {
 // September 2026 - if vessels start silently going stale after that date,
 // this is the first thing to check.
 void connectAisWebSocket() {
-  if (marineProvider != "aisstream" || !aisApiKey.length()) return;
+  if (!marineTrackingEnabled || marineProvider != "aisstream" || !aisApiKey.length()) return;
 #if ADSB_TLS_INSECURE
   aisWebSocket.beginSSL("stream.aisstream.io", 443, "/v0/stream");
 #else
@@ -3842,10 +3857,13 @@ void networkTask(void *) {
       githubInstallPending = false;
       installGithubUpdate();
     }
-    if (githubCheckPending || static_cast<int32_t>(millis() - nextGithubCheckAt) >= 0) {
+    // Only ever checks when the admin page's "Check for updates" button asks
+    // for it (githubCheckPending) - this used to also run automatically
+    // every UPDATE_CHECK_MS, one more background HTTPS/TLS session this
+    // board didn't need adding to its already-tight memory budget.
+    if (githubCheckPending) {
       githubCheckPending = false;
       checkGithubUpdate();
-      nextGithubCheckAt = millis() + UPDATE_CHECK_MS;
     }
     if (physicalMapRefreshPending) {
       physicalMapRefreshPending = false;
@@ -3884,24 +3902,29 @@ void networkTask(void *) {
       delay(100);
       ESP.restart();
     }
-    if (marineProvider == "aisstream") {
-      if (aisApiKey.length()) {
-        MutexGuard guard(dataMutex);
-        aisWebSocket.loop();
-        if (!aisWebSocket.isConnected() && static_cast<int32_t>(millis() - aisNextRetryAt) >= 0) {
-          connectAisWebSocket();
+    // Marine tracking and the aircraft feed are mutually exclusive - both
+    // need a persistent TLS session or frequent HTTPS fetches, and running
+    // both at once was the root of the recurring SSL alloc failures. Only
+    // one of these two blocks ever does anything at a time.
+    if (marineTrackingEnabled) {
+      if (marineProvider == "aisstream") {
+        if (aisApiKey.length()) {
+          MutexGuard guard(dataMutex);
+          aisWebSocket.loop();
+          if (!aisWebSocket.isConnected() && static_cast<int32_t>(millis() - aisNextRetryAt) >= 0) {
+            connectAisWebSocket();
+          }
         }
+      } else if (marineConfigured() && static_cast<int32_t>(millis() - nextMarineFetchAt) >= 0) {
+        { MutexGuard guard(dataMutex); fetchMarineRest(); }
+        nextMarineFetchAt = millis() + MARINE_REST_REFRESH_MS;
+        marineDataDirty = true;
       }
-    } else if (marineConfigured() && static_cast<int32_t>(millis() - nextMarineFetchAt) >= 0) {
-      { MutexGuard guard(dataMutex); fetchMarineRest(); }
-      nextMarineFetchAt = millis() + MARINE_REST_REFRESH_MS;
-      marineDataDirty = true;
-    }
-    if (static_cast<int32_t>(millis() - nextMarinePruneAt) >= 0) {
-      { MutexGuard guard(dataMutex); pruneStaleVessels(); }
-      nextMarinePruneAt = millis() + 60000UL;
-    }
-    if (static_cast<int32_t>(millis() - nextFetchAt) >= 0) {
+      if (static_cast<int32_t>(millis() - nextMarinePruneAt) >= 0) {
+        { MutexGuard guard(dataMutex); pruneStaleVessels(); }
+        nextMarinePruneAt = millis() + 60000UL;
+      }
+    } else if (static_cast<int32_t>(millis() - nextFetchAt) >= 0) {
       const uint32_t fetchStartedAt = millis();
       // The AIS WebSocket's persistent TLS session and this fetch's own TLS
       // session compete for the same scarce internal RAM on this board - with
@@ -3966,6 +3989,7 @@ void setup() {
   aisHubUsername = settingsStore.getString("aishub-user", "");
   myShipTrackingApiKey = settingsStore.getString("mst-key", "");
   datalasticApiKey = settingsStore.getString("datalastic-key", "");
+  marineTrackingEnabled = settingsStore.getBool("marine-enabled", false);
   marineProvider = settingsStore.getString("marine-provider", "aisstream");
   if (marineProvider != "aisstream" && marineProvider != "aishub" &&
       marineProvider != "myshiptracking" && marineProvider != "datalastic") marineProvider = "aisstream";
@@ -4056,7 +4080,6 @@ void setup() {
   Serial.printf("Web login username: %s\n", WEB_USERNAME);
   { MutexGuard guard(dataMutex); fetchAircraft(); }
   nextFetchAt=millis()+REFRESH_MS;
-  nextGithubCheckAt=millis()+15000UL;
   connectAisWebSocket();
   // Everything network-bound (aircraft/marine fetches, the map tile rebuild,
   // the AIS socket, the admin web server, OTA/Wi-Fi/SD housekeeping) now runs
