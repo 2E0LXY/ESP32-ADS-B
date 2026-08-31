@@ -1,4 +1,7 @@
 #include <Arduino.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/semphr.h>
 
 // Board capability macros. Must come before anything that tests them,
 // notably the SD backend selection below.
@@ -404,6 +407,41 @@ uint32_t nextMapRetryAt = 0;
 bool openSkyAuthRetryPending = false;
 bool pageSavePending = false;
 uint32_t pageSaveAt = 0;
+
+// Network I/O (aircraft/marine fetches, the map tile rebuild, the AIS
+// WebSocket) runs on its own FreeRTOS task pinned to the other core, so a
+// slow fetch or a weak Wi-Fi signal can no longer freeze touch polling and
+// page rendering on the UI side - previously everything shared one loop(),
+// and a multi-second blocking HTTP call meant swipes were missed outright.
+// Both tasks still touch the same buffers (latestAircraft, latestVessels,
+// baseMap, framebuffer), so every access on either side is wrapped in this
+// mutex. needsRedraw lets the network task ask the UI task to repaint the
+// current page after data it owns (mainly the physical map) changes,
+// without the network task touching the display itself.
+SemaphoreHandle_t dataMutex = nullptr;
+volatile bool needsRedraw = false;
+
+// RAII lock: guarantees the mutex is released on every return path, even
+// through the many early returns inside fetchAircraft()/fetchAdsbV2Aircraft()
+// and friends. Wrapping the call site with this instead of hand-threading
+// xSemaphoreGive() through every branch removes an entire class of
+// forgot-to-unlock deadlock risk.
+class MutexGuard {
+ public:
+  // Recursive, not a plain mutex: refreshPhysicalBaseMap() (called under this
+  // guard) calls webServer.handleClient() between tiles to stay responsive,
+  // and that can dispatch a handler - handlePageControl() does - that takes
+  // this same mutex on the same task. A plain mutex would deadlock there;
+  // recursive re-entry by the same task is a no-op until the outermost
+  // guard releases.
+  explicit MutexGuard(SemaphoreHandle_t m) : mutex(m) { xSemaphoreTakeRecursive(mutex, portMAX_DELAY); }
+  ~MutexGuard() { xSemaphoreGiveRecursive(mutex); }
+  MutexGuard(const MutexGuard &) = delete;
+  MutexGuard &operator=(const MutexGuard &) = delete;
+ private:
+  SemaphoreHandle_t mutex;
+};
+
 String previousWifiSsid;
 String previousWifiPassword;
 uint32_t wifiRollbackAt = 0;
@@ -2984,7 +3022,7 @@ void handlePageControl() {
                 page == "radar" ? DisplayPage::Radar :
                 page == "marine" ? DisplayPage::Marine : DisplayPage::Map;
   settingsStore.putUChar("display-page", static_cast<uint8_t>(displayPage));
-  renderCurrentPage();
+  { MutexGuard guard(dataMutex); renderCurrentPage(); }
   if (displayPage == DisplayPage::Overview) sendMessage(200, "Overview page selected");
   else if (displayPage == DisplayPage::Table) sendMessage(200, "Table page selected");
   else if (displayPage == DisplayPage::Radar) sendMessage(200, "Radar page selected");
@@ -3738,8 +3776,95 @@ void connectAisWebSocket() {
 
 }
 
+// Everything that talks to the network or the SD/flash filesystem for admin
+// housekeeping lives here, running on its own core so a slow or failing
+// fetch never blocks touch input or rendering in loop(). Calls that touch
+// the buffers loop() also reads (aircraft/vessel data, the physical map) are
+// wrapped in dataMutex; see its declaration for the full rationale.
+void networkTask(void *) {
+  for (;;) {
+    webServer.handleClient();
+    if (githubInstallPending) {
+      githubInstallPending = false;
+      installGithubUpdate();
+    }
+    if (githubCheckPending || static_cast<int32_t>(millis() - nextGithubCheckAt) >= 0) {
+      githubCheckPending = false;
+      checkGithubUpdate();
+      nextGithubCheckAt = millis() + UPDATE_CHECK_MS;
+    }
+    if (physicalMapRefreshPending) {
+      physicalMapRefreshPending = false;
+      { MutexGuard guard(dataMutex); refreshPhysicalBaseMap(); }
+      needsRedraw = true;
+    }
+    if (nextMapRetryAt && static_cast<int32_t>(millis() - nextMapRetryAt) >= 0) {
+      nextMapRetryAt = 0;
+      physicalMapRefreshPending = true;
+    }
+    if (setupPortalPending) {
+      setupPortalPending = false;
+      delay(250);
+      webServer.stop();
+      MDNS.end();
+      WiFiManager wm;
+      wm.setWiFiAPChannel(6);
+      wm.setConfigPortalTimeout(900);
+      wm.startConfigPortal("ADSBMAP", "aircraft");
+      beginWebControl();
+    }
+    if (pageSavePending && static_cast<int32_t>(millis() - pageSaveAt) >= 0) {
+      pageSavePending = false;
+      settingsStore.putUChar("display-page", static_cast<uint8_t>(displayPage));
+    }
+    if (wifiRollbackAt && static_cast<int32_t>(millis() - wifiRollbackAt) >= 0) {
+      wifiRollbackAt = 0;
+      if (WiFi.status() != WL_CONNECTED && previousWifiSsid.length()) {
+        Serial.println("New Wi-Fi credentials failed; restoring the previous network");
+        WiFi.begin(previousWifiSsid.c_str(), previousWifiPassword.c_str());
+      }
+      previousWifiSsid = "";
+      previousWifiPassword = "";
+    }
+    if (restartPending && static_cast<int32_t>(millis() - restartAt) >= 0) {
+      delay(100);
+      ESP.restart();
+    }
+    if (marineProvider == "aisstream") {
+      if (aisApiKey.length()) { MutexGuard guard(dataMutex); aisWebSocket.loop(); }
+    } else if (marineConfigured() && static_cast<int32_t>(millis() - nextMarineFetchAt) >= 0) {
+      { MutexGuard guard(dataMutex); fetchMarineRest(); }
+      nextMarineFetchAt = millis() + MARINE_REST_REFRESH_MS;
+      marineDataDirty = true;
+    }
+    if (static_cast<int32_t>(millis() - nextMarinePruneAt) >= 0) {
+      { MutexGuard guard(dataMutex); pruneStaleVessels(); }
+      nextMarinePruneAt = millis() + 60000UL;
+    }
+    if (static_cast<int32_t>(millis() - nextFetchAt) >= 0) {
+      const uint32_t fetchStartedAt = millis();
+      // The AIS WebSocket's persistent TLS session and this fetch's own TLS
+      // session compete for the same scarce internal RAM on this board - with
+      // both open at once, heapMinimum fell to a few hundred bytes and every
+      // aircraft/route request failed. Pausing the socket for the fetch's
+      // duration is the difference between the feed working at all and not;
+      // AISstream tolerates the brief reconnect (it re-subscribes on connect).
+      const bool pauseAis = marineProvider == "aisstream" && aisWebSocket.isConnected();
+      if (pauseAis) aisWebSocket.disconnect();
+      { MutexGuard guard(dataMutex); fetchAircraft(); }
+      if (pauseAis) connectAisWebSocket();
+      Serial.printf("fetchAircraft blocked the network task for %lu ms\n",
+                    static_cast<unsigned long>(millis() - fetchStartedAt));
+      if (openSkyAuthRetryPending) nextFetchAt = millis() + 1000UL;
+      else if (static_cast<int32_t>(millis() - nextFetchAt) >= 0) nextFetchAt = millis() + REFRESH_MS;
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
 void setup() {
   Serial.begin(115200);
+  dataMutex = xSemaphoreCreateRecursiveMutex();
   if (!LittleFS.begin(true)) Serial.println("LittleFS map cache unavailable");
   settingsStore.begin("adsb-web", false);
   managementPassword = settingsStore.getString("password", "aircraft");
@@ -3842,17 +3967,23 @@ void setup() {
   if (WiFi.status() == WL_CONNECTED) {
     renderBootScreen("Wi-Fi connected: " + WiFi.localIP().toString(), rgb(55,215,110));
     delay(5000);
-    refreshPhysicalBaseMap();
+    { MutexGuard guard(dataMutex); refreshPhysicalBaseMap(); }
     restoreMap();
     status("MAP", rgb(53,169,244));
     present();
   }
   beginWebControl();
   Serial.printf("Web login username: %s\n", WEB_USERNAME);
-  fetchAircraft();
+  { MutexGuard guard(dataMutex); fetchAircraft(); }
   nextFetchAt=millis()+REFRESH_MS;
   nextGithubCheckAt=millis()+15000UL;
   connectAisWebSocket();
+  // Everything network-bound (aircraft/marine fetches, the map tile rebuild,
+  // the AIS socket, the admin web server, OTA/Wi-Fi/SD housekeeping) now runs
+  // on its own task on the other core, so a slow fetch can't freeze touch
+  // input and rendering in loop() below. See the dataMutex comment above for
+  // how the two tasks share the aircraft/vessel/map buffers safely.
+  xTaskCreatePinnedToCore(networkTask, "network", 12288, nullptr, 1, nullptr, 0);
 }
 
 void loop() {
@@ -3867,52 +3998,15 @@ void loop() {
   delay(20);
   return;
 #endif
-  webServer.handleClient();
-  if (githubInstallPending) {
-    githubInstallPending = false;
-    installGithubUpdate();
-  }
-  if (githubCheckPending || static_cast<int32_t>(millis() - nextGithubCheckAt) >= 0) {
-    githubCheckPending = false;
-    checkGithubUpdate();
-    nextGithubCheckAt = millis() + UPDATE_CHECK_MS;
-  }
-  if (physicalMapRefreshPending) {
-    physicalMapRefreshPending = false;
-    refreshPhysicalBaseMap();
+  // Everything network-bound now lives in networkTask() on the other core.
+  // This loop only ever touches shared data through dataMutex, and even then
+  // just for the length of a render call (milliseconds), never for the
+  // length of a network request - that's what keeps touch and rendering
+  // responsive regardless of what the network is doing.
+  if (needsRedraw) {
+    needsRedraw = false;
+    MutexGuard guard(dataMutex);
     renderCurrentPage();
-  }
-  if (nextMapRetryAt && static_cast<int32_t>(millis() - nextMapRetryAt) >= 0) {
-    nextMapRetryAt = 0;
-    physicalMapRefreshPending = true;
-  }
-  if (setupPortalPending) {
-    setupPortalPending = false;
-    delay(250);
-    webServer.stop();
-    MDNS.end();
-    WiFiManager wm;
-    wm.setWiFiAPChannel(6);
-    wm.setConfigPortalTimeout(900);
-    wm.startConfigPortal("ADSBMAP", "aircraft");
-    beginWebControl();
-  }
-  if (pageSavePending && static_cast<int32_t>(millis() - pageSaveAt) >= 0) {
-    pageSavePending = false;
-    settingsStore.putUChar("display-page", static_cast<uint8_t>(displayPage));
-  }
-  if (wifiRollbackAt && static_cast<int32_t>(millis() - wifiRollbackAt) >= 0) {
-    wifiRollbackAt = 0;
-    if (WiFi.status() != WL_CONNECTED && previousWifiSsid.length()) {
-      Serial.println("New Wi-Fi credentials failed; restoring the previous network");
-      WiFi.begin(previousWifiSsid.c_str(), previousWifiPassword.c_str());
-    }
-    previousWifiSsid = "";
-    previousWifiPassword = "";
-  }
-  if (restartPending && static_cast<int32_t>(millis() - restartAt) >= 0) {
-    delay(100);
-    ESP.restart();
   }
   // Evaluate both: short-circuiting used to leave bootButtonPending set, which
   // advanced the page twice on the following pass.
@@ -3929,6 +4023,7 @@ void loop() {
   if (detailAircraftIndex >= 0) {
     if (gesture != TouchGesture::None || pressed || millis() - detailShownAt > 8000) {
       detailAircraftIndex = -1;
+      MutexGuard guard(dataMutex);
       renderCurrentPage();
     }
   } else if (gesture == TouchGesture::SwipeRight) {
@@ -3940,6 +4035,7 @@ void loop() {
     if (hitIndex >= 0) {
       detailAircraftIndex = hitIndex;
       detailShownAt = millis();
+      MutexGuard guard(dataMutex);
       renderAircraftDetailCard(hitIndex);
     } else {
       pageStep = 1;
@@ -3953,7 +4049,7 @@ void loop() {
         (static_cast<int>(displayPage) + pageStep + pageCount) % pageCount);
     pageSavePending = true;
     pageSaveAt = millis() + 5000UL;
-    renderCurrentPage();
+    { MutexGuard guard(dataMutex); renderCurrentPage(); }
     Serial.printf("Page: %s (%s)\n", displayPageName(),
                   gesture == TouchGesture::SwipeLeft    ? "swipe left"
                   : gesture == TouchGesture::SwipeRight ? "swipe right"
@@ -3966,42 +4062,14 @@ void loop() {
     // momentarily wrap the bottom scan lines to the top of the panel.
     radarSweepDegrees += 18.0f;
     if (radarSweepDegrees >= 360.0f) radarSweepDegrees -= 360.0f;
-    renderRadarPage();
+    { MutexGuard guard(dataMutex); renderRadarPage(); }
     nextRadarFrameAt = millis() + 750;
-  }
-  if (marineProvider == "aisstream") {
-    if (aisApiKey.length()) aisWebSocket.loop();
-  } else if (marineConfigured() && static_cast<int32_t>(millis() - nextMarineFetchAt) >= 0) {
-    fetchMarineRest();
-    nextMarineFetchAt = millis() + MARINE_REST_REFRESH_MS;
-    marineDataDirty = true;
-  }
-  if (static_cast<int32_t>(millis() - nextMarinePruneAt) >= 0) {
-    pruneStaleVessels();
-    nextMarinePruneAt = millis() + 60000UL;
   }
   if (displayPage == DisplayPage::Marine && marineDataDirty && detailAircraftIndex < 0 &&
       static_cast<int32_t>(millis() - nextMarineRenderAt) >= 0) {
     marineDataDirty = false;
-    renderMarinePage();
+    { MutexGuard guard(dataMutex); renderMarinePage(); }
     nextMarineRenderAt = millis() + 2000;
   }
-  if (static_cast<int32_t>(millis()-nextFetchAt) >= 0) {
-    const uint32_t fetchStartedAt = millis();
-    // The AIS WebSocket's persistent TLS session and this fetch's own TLS
-    // session compete for the same scarce internal RAM on this board - with
-    // both open at once, heapMinimum fell to a few hundred bytes and every
-    // aircraft/route request failed. Pausing the socket for the fetch's
-    // duration is the difference between the feed working at all and not;
-    // AISstream tolerates the brief reconnect (it re-subscribes on connect).
-    const bool pauseAis = marineProvider == "aisstream" && aisWebSocket.isConnected();
-    if (pauseAis) aisWebSocket.disconnect();
-    fetchAircraft();
-    if (pauseAis) connectAisWebSocket();
-    Serial.printf("fetchAircraft blocked the loop for %lu ms\n",
-                  static_cast<unsigned long>(millis() - fetchStartedAt));
-    if (openSkyAuthRetryPending) nextFetchAt = millis() + 1000UL;
-    else if (static_cast<int32_t>(millis()-nextFetchAt) >= 0) nextFetchAt=millis()+REFRESH_MS;
-  }
-  delay(50);
+  delay(15);
 }
