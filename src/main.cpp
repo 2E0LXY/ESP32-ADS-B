@@ -1219,6 +1219,14 @@ bool refreshPhysicalBaseMap() {
   }
   filledRect(0, H - 15, 17 * 6 + 4, 15, rgb(0, 0, 0));
   text5(3, H - 12, "(C) OPENSTREETMAP", rgb(255, 255, 255));
+  // The tile loop above is the single heaviest PSRAM/SD-bus contention
+  // window of the whole rebuild - whatever page calls restoreMap() next
+  // (right after this function returns, in setup()) is the first thing
+  // presented after that window closes, exactly the moment a DMA
+  // desync from that contention is most likely to still be in effect.
+  // One more nudge here, on top of the per-tile ones above, before that
+  // handoff.
+  rgbpanel->restartAtNextVsync();
   memcpy(baseMap, framebuffer, W * H * sizeof(uint16_t));
   physicalMapReady = true;
   mapRebuildActive = false;
