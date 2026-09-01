@@ -1461,10 +1461,19 @@ RouteCacheEntry *routeForCallsign(const char *rawCallsign, int &lookupsUsed,
     http.end();
     return slot;
   }
-  String payload = http.getString();
+  // Every other JSON parse in this file keeps its allocations in PSRAM via
+  // psramJsonAllocator/PsramSink - this one didn't, and getString()+a
+  // default JsonDocument put both the response body and the whole parsed
+  // tree in internal RAM instead. Called on every route lookup (up to
+  // MAX_ROUTE_LOOKUPS_PER_REFRESH times per fetch), that's the actual
+  // culprit behind the internal-heap fragmentation that permanently breaks
+  // the aircraft feed's own TLS connections after the first fetch - not a
+  // hardware ceiling, just this one call site allocating in the wrong pool.
+  PsramSink body;
+  http.writeToStream(&body);
   http.end();
-  JsonDocument routeDoc;
-  if (deserializeJson(routeDoc, payload)) return slot;
+  JsonDocument routeDoc(&psramJsonAllocator);
+  if (deserializeJson(routeDoc, body.data(), body.size())) return slot;
   JsonObject route = routeDoc["response"]["flightroute"].as<JsonObject>();
   if (route.isNull()) return slot;
   airportCode(route["origin"].as<JsonObject>(), slot->origin);
@@ -3654,9 +3663,10 @@ void fetchAisHubVessels() {
   const int code = http.GET();
   if (code == HTTP_CODE_OK) {
     JsonDocument doc(&psramJsonAllocator);
-    const String payload = http.getString();
+    PsramSink body;
+    http.writeToStream(&body);
     // AISHub's own success envelope is a 2-element array: [{meta}, [vessels]].
-    if (!deserializeJson(doc, payload) && doc[0]["ERROR"] == false) {
+    if (!deserializeJson(doc, body.data(), body.size()) && doc[0]["ERROR"] == false) {
       for (JsonObject v : doc[1].as<JsonArray>()) {
         const uint32_t mmsi = v["MMSI"] | 0;
         if (!mmsi) continue;
@@ -3700,8 +3710,9 @@ void fetchMyShipTrackingVessels() {
   const int code = http.GET();
   if (code == HTTP_CODE_OK) {
     JsonDocument doc(&psramJsonAllocator);
-    const String payload = http.getString();
-    if (!deserializeJson(doc, payload) && doc["status"] == "success") {
+    PsramSink body;
+    http.writeToStream(&body);
+    if (!deserializeJson(doc, body.data(), body.size()) && doc["status"] == "success") {
       for (JsonObject v : doc["data"].as<JsonArray>()) {
         const uint32_t mmsi = v["mmsi"] | 0;
         if (!mmsi) continue;
@@ -3744,8 +3755,9 @@ void fetchDatalasticVessels() {
   const int code = http.GET();
   if (code == HTTP_CODE_OK) {
     JsonDocument doc(&psramJsonAllocator);
-    const String payload = http.getString();
-    if (!deserializeJson(doc, payload) && !doc["data"].isNull()) {
+    PsramSink body;
+    http.writeToStream(&body);
+    if (!deserializeJson(doc, body.data(), body.size()) && !doc["data"].isNull()) {
       for (JsonObject v : doc["data"]["vessels"].as<JsonArray>()) {
         // Datalastic returns mmsi as a string field, not a number.
         const uint32_t mmsi = atol(v["mmsi"] | "");
