@@ -4055,8 +4055,20 @@ void setup() {
   // of shortening those timeouts (they were sized for real, already-observed
   // slow-network conditions on this board); a genuinely stuck task still
   // gets caught and rebooted, just with more headroom for legitimate waits.
+  //
+  // 30s wasn't enough either: a later live test hit this same abort on
+  // ordinary aircraft fetches (http.setTimeout is only 9000ms) every single
+  // boot. HTTPClient::writeToStreamDataBlock has no overall deadline of its
+  // own - each individual read is capped at 9s, but if the far end keeps
+  // trickling a few bytes through just before each of those caps, the loop
+  // never gives up and never yields long enough for the idle task to run,
+  // so several such reads in a row can add up past whatever this is set to
+  // without any single call ever looking "stuck". Doubled to 60s to buy more
+  // margin; this doesn't fix that unbounded retry loop (nothing in this
+  // file's control can, short of vendoring a patched HTTPClient), so a
+  // connection degraded enough could still trip it.
   esp_task_wdt_config_t watchdogConfig = {
-      .timeout_ms = 30000,
+      .timeout_ms = 60000,
       .idle_core_mask = (1 << 0) | (1 << 1),
       .trigger_panic = true,
   };
