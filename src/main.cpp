@@ -1447,10 +1447,9 @@ RouteCacheEntry *routeForCallsign(const char *rawCallsign, int &lookupsUsed,
   slot->occupied = true;
   slot->resolvedAt = slot->lastUsed = millis();
 
-  // client and http are owned by the caller and reused across the whole batch:
-  // api.adsbdb.com is the same host every time, so keeping the TLS session
-  // open turns N handshakes into one and cuts the window in which loop() -
-  // and therefore the web server - is blocked.
+  // client and http are owned by the caller, one fresh pair per lookup - see
+  // the caller's comment on why this no longer reuses one keep-alive
+  // connection across the whole batch.
   String url = "https://api.adsbdb.com/v0/callsign/" + String(callsign);
   if (!http.begin(client, url)) return slot;
   http.addHeader("Accept-Encoding", "identity");
@@ -2326,12 +2325,6 @@ void fetchAdsbV2Aircraft() {
   }
   sortAircraftByDistance();
   int routeLookups = 0;
-  {
-  WiFiClientSecure routeClient;
-  applyTlsPolicy(routeClient);
-  HTTPClient routeHttp;
-  routeHttp.setReuse(true);
-  routeHttp.setTimeout(6000);
   for (int i = 0; i < lastCount; ++i) {
     AircraftDisplay &display = latestAircraft[i];
     if (display.positionSource == 2) ++lastMlat;
@@ -2343,24 +2336,30 @@ void fetchAdsbV2Aircraft() {
       // Nudges the panel to resync mid-loop against PSRAM-DMA starvation -
       // see the tile-rebuild loop's comment on restartAtNextVsync() above.
       rgbpanel->restartAtNextVsync();
+      // A prior version kept one keep-alive connection open across every
+      // lookup in this loop (HTTPClient::setReuse(true)) to save handshakes.
+      // Every watchdog reboot logged after switching provider away from
+      // adsb.fi traced back to a hang on the very next fetch cycle's own,
+      // completely unrelated connection - always right after this loop had
+      // run - and persisted even after explicitly stop()-ing the reused
+      // connection at the end of the batch. Whatever state that reuse left
+      // behind, closing it afterwards wasn't enough to undo it. Falling back
+      // to one fresh connection per lookup, the same pattern every other
+      // HTTPS call in this file already uses without issue, trades a little
+      // latency for not touching whatever that reuse path corrupts.
+      WiFiClientSecure routeClient;
+      applyTlsPolicy(routeClient);
+      HTTPClient routeHttp;
+      routeHttp.setTimeout(6000);
+      routeHttp.setConnectTimeout(6000);
       routeForCallsign(display.flight, routeLookups, routeClient, routeHttp);
+      routeHttp.end();
+      routeClient.stop();
       if (webServerReady) webServer.handleClient();
       // Nudges the panel to resync mid-loop against PSRAM-DMA starvation -
       // see the tile-rebuild loop's comment on restartAtNextVsync() above.
       rgbpanel->restartAtNextVsync();
     }
-  }
-  routeHttp.end();
-  // routeHttp.setReuse(true) deliberately keeps this connection's socket
-  // open across the loop above for keep-alive efficiency, but routeClient
-  // still goes out of scope right after this block - relying on its
-  // destructor to close a socket that was explicitly left open for reuse
-  // is exactly the kind of edge case that leaks a socket/mbedtls context
-  // instead. That leak was the likely cause of every watchdog reboot seen
-  // after switching provider away from adsb.fi: the very next fetch cycle
-  // (a brand new WiFiClientSecure) hung forever inside lwIP's own socket
-  // table lock, which only happens when something else never released it.
-  routeClient.stop();
   }
   logHeapDiagnostics("fetch-end");
   if (routeLookups > 0) saveRouteCacheToStorage();
@@ -2494,12 +2493,6 @@ void fetchAircraft() {
   doc.clear();
   }
   int routeLookups = 0;
-  {
-  WiFiClientSecure routeClient;
-  applyTlsPolicy(routeClient);
-  HTTPClient routeHttp;
-  routeHttp.setReuse(true);
-  routeHttp.setTimeout(6000);
   for (int i=0; i<lastCount; ++i) {
     AircraftDisplay &display = latestAircraft[i];
     if (display.positionSource == 2) {
@@ -2509,24 +2502,30 @@ void fetchAircraft() {
       // Nudges the panel to resync mid-loop against PSRAM-DMA starvation -
       // see the tile-rebuild loop's comment on restartAtNextVsync() above.
       rgbpanel->restartAtNextVsync();
+      // A prior version kept one keep-alive connection open across every
+      // lookup in this loop (HTTPClient::setReuse(true)) to save handshakes.
+      // Every watchdog reboot logged after switching provider away from
+      // adsb.fi traced back to a hang on the very next fetch cycle's own,
+      // completely unrelated connection - always right after this loop had
+      // run - and persisted even after explicitly stop()-ing the reused
+      // connection at the end of the batch. Whatever state that reuse left
+      // behind, closing it afterwards wasn't enough to undo it. Falling back
+      // to one fresh connection per lookup, the same pattern every other
+      // HTTPS call in this file already uses without issue, trades a little
+      // latency for not touching whatever that reuse path corrupts.
+      WiFiClientSecure routeClient;
+      applyTlsPolicy(routeClient);
+      HTTPClient routeHttp;
+      routeHttp.setTimeout(6000);
+      routeHttp.setConnectTimeout(6000);
       routeForCallsign(display.flight, routeLookups, routeClient, routeHttp);
+      routeHttp.end();
+      routeClient.stop();
       if (webServerReady) webServer.handleClient();
       // Nudges the panel to resync mid-loop against PSRAM-DMA starvation -
       // see the tile-rebuild loop's comment on restartAtNextVsync() above.
       rgbpanel->restartAtNextVsync();
     }
-  }
-  routeHttp.end();
-  // routeHttp.setReuse(true) deliberately keeps this connection's socket
-  // open across the loop above for keep-alive efficiency, but routeClient
-  // still goes out of scope right after this block - relying on its
-  // destructor to close a socket that was explicitly left open for reuse
-  // is exactly the kind of edge case that leaks a socket/mbedtls context
-  // instead. That leak was the likely cause of every watchdog reboot seen
-  // after switching provider away from adsb.fi: the very next fetch cycle
-  // (a brand new WiFiClientSecure) hung forever inside lwIP's own socket
-  // table lock, which only happens when something else never released it.
-  routeClient.stop();
   }
   logHeapDiagnostics("fetch-end");
   if (routeLookups > 0) saveRouteCacheToStorage();
