@@ -573,7 +573,7 @@ bool downloadFirmwareSignature() {
   WiFiClientSecure client;
   applyTlsPolicy(client);
   HTTPClient http;
-  http.setTimeout(12000);
+  http.setTimeout(12000); http.setConnectTimeout(12000);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   if (!http.begin(client, githubSignatureUrl)) return false;
   http.addHeader("User-Agent", userAgent());
@@ -1091,7 +1091,7 @@ bool cacheOsmTile(uint8_t zoom, int tileX, int tileY, const String &path) {
   WiFiClientSecure client;
   applyTlsPolicy(client);
   HTTPClient http;
-  http.setTimeout(12000);
+  http.setTimeout(12000); http.setConnectTimeout(12000);
   const String url = "https://tile.openstreetmap.org/" + String(zoom) + "/" + String(tileX) + "/" + String(tileY) + ".png";
   if (!http.begin(client, url)) {
     Serial.printf("OSM tile %d/%d/%d begin() failed\n", zoom, tileX, tileY);
@@ -1305,7 +1305,7 @@ bool requestAccessToken() {
   WiFiClientSecure client;
   applyTlsPolicy(client);
   HTTPClient http;
-  http.setTimeout(8000);
+  http.setTimeout(8000); http.setConnectTimeout(8000);
   if (!http.begin(client, TOKEN_URL)) return false;
   http.addHeader("Content-Type", "application/x-www-form-urlencoded");
   String body = "grant_type=client_credentials&client_id=" + urlEncode(openSkyClientId.c_str()) +
@@ -2207,7 +2207,21 @@ void fetchAdsbV2Aircraft() {
   WiFiClientSecure client;
   applyTlsPolicy(client);
   HTTPClient http;
-  http.setTimeout(9000);
+  // HTTPClient::setTimeout(), called here before http.begin() ever connects,
+  // is a no-op on this arduino-esp32 version: it only forwards to the live
+  // socket once connected() is already true, and even then it lands on
+  // Stream::setTimeout() - a member NetworkClientSecure's SO_RCVTIMEO/
+  // SO_SNDTIMEO logic never reads. That logic is instead keyed off
+  // NetworkClient's own _timeout, which only gets set once, inside
+  // connect(), from HTTPClient's separate _connectTimeout (default 5000ms,
+  // never previously set here). So every read on this socket has always
+  // been bounded by an unconfigured 5s default rather than the timeout this
+  // file believed it was setting. setConnectTimeout() below is what actually
+  // reaches that value. Confirmed independent of provider (adsb.fi and
+  // airplanes.live both hit the same watchdog abort mid-read), so this
+  // closes a real gap even though it may not be the sole cause of a stall
+  // long enough to still trip the 60s watchdog.
+  http.setTimeout(9000); http.setConnectTimeout(9000);
   if (!http.begin(client, url)) {
     finishFeedAttempt("Connection failed");
     status("API", rgb(245,30,35));
@@ -2372,7 +2386,7 @@ void fetchAircraft() {
   // the optional per-callsign HTTPS route lookups.
   {
   WiFiClientSecure client; applyTlsPolicy(client);
-  HTTPClient http; http.setTimeout(7000);
+  HTTPClient http; http.setTimeout(7000); http.setConnectTimeout(7000);
   const float latDelta = queryRadiusNm / 60.0f;
   const float lonDelta = queryRadiusNm / max(1.0f, 60.0f * cosf(radians(homeLatitude)));
   const String statesUrl = "https://opensky-network.org/api/states/all?lamin=" +
@@ -2536,7 +2550,7 @@ String fetchPublishedSha256(const String &url, const String &wantedName) {
   WiFiClientSecure client;
   applyTlsPolicy(client);
   HTTPClient http;
-  http.setTimeout(12000);
+  http.setTimeout(12000); http.setConnectTimeout(12000);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   if (!http.begin(client, url)) return "";
   http.addHeader("User-Agent", userAgent());
@@ -2576,7 +2590,7 @@ bool checkGithubUpdate() {
   WiFiClientSecure client;
   applyTlsPolicy(client);
   HTTPClient http;
-  http.setTimeout(12000);
+  http.setTimeout(12000); http.setConnectTimeout(12000);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   if (!http.begin(client, GITHUB_RELEASE_API)) {
     githubUpdateStatus = "GitHub connection failed";
@@ -2658,7 +2672,7 @@ bool downloadGithubUpdateToSd() {
   WiFiClientSecure client;
   applyTlsPolicy(client);
   HTTPClient http;
-  http.setTimeout(15000);
+  http.setTimeout(15000); http.setConnectTimeout(15000);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   if (!http.begin(client, githubFirmwareUrl)) {
     file.close();
@@ -2808,7 +2822,7 @@ bool installGithubUpdate() {
   WiFiClientSecure client;
   applyTlsPolicy(client);
   HTTPClient http;
-  http.setTimeout(15000);
+  http.setTimeout(15000); http.setConnectTimeout(15000);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   if (!http.begin(client, githubFirmwareUrl)) {
     githubUpdateStatus = "Firmware download failed";
@@ -3657,7 +3671,7 @@ void fetchAisHubVessels() {
   WiFiClientSecure client;
   applyTlsPolicy(client);
   HTTPClient http;
-  http.setTimeout(9000);
+  http.setTimeout(9000); http.setConnectTimeout(9000);
   if (!http.begin(client, url)) return;
   http.addHeader("User-Agent", userAgent());
   const int code = http.GET();
@@ -3703,7 +3717,7 @@ void fetchMyShipTrackingVessels() {
   WiFiClientSecure client;
   applyTlsPolicy(client);
   HTTPClient http;
-  http.setTimeout(9000);
+  http.setTimeout(9000); http.setConnectTimeout(9000);
   if (!http.begin(client, url)) return;
   http.addHeader("User-Agent", userAgent());
   http.addHeader("Authorization", "Bearer " + myShipTrackingApiKey);
@@ -3749,7 +3763,7 @@ void fetchDatalasticVessels() {
   WiFiClientSecure client;
   applyTlsPolicy(client);
   HTTPClient http;
-  http.setTimeout(9000);
+  http.setTimeout(9000); http.setConnectTimeout(9000);
   if (!http.begin(client, url)) return;
   http.addHeader("User-Agent", userAgent());
   const int code = http.GET();
