@@ -2351,6 +2351,16 @@ void fetchAdsbV2Aircraft() {
     }
   }
   routeHttp.end();
+  // routeHttp.setReuse(true) deliberately keeps this connection's socket
+  // open across the loop above for keep-alive efficiency, but routeClient
+  // still goes out of scope right after this block - relying on its
+  // destructor to close a socket that was explicitly left open for reuse
+  // is exactly the kind of edge case that leaks a socket/mbedtls context
+  // instead. That leak was the likely cause of every watchdog reboot seen
+  // after switching provider away from adsb.fi: the very next fetch cycle
+  // (a brand new WiFiClientSecure) hung forever inside lwIP's own socket
+  // table lock, which only happens when something else never released it.
+  routeClient.stop();
   }
   logHeapDiagnostics("fetch-end");
   if (routeLookups > 0) saveRouteCacheToStorage();
@@ -2507,6 +2517,16 @@ void fetchAircraft() {
     }
   }
   routeHttp.end();
+  // routeHttp.setReuse(true) deliberately keeps this connection's socket
+  // open across the loop above for keep-alive efficiency, but routeClient
+  // still goes out of scope right after this block - relying on its
+  // destructor to close a socket that was explicitly left open for reuse
+  // is exactly the kind of edge case that leaks a socket/mbedtls context
+  // instead. That leak was the likely cause of every watchdog reboot seen
+  // after switching provider away from adsb.fi: the very next fetch cycle
+  // (a brand new WiFiClientSecure) hung forever inside lwIP's own socket
+  // table lock, which only happens when something else never released it.
+  routeClient.stop();
   }
   logHeapDiagnostics("fetch-end");
   if (routeLookups > 0) saveRouteCacheToStorage();
