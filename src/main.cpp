@@ -386,6 +386,29 @@ uint32_t feedRequestStartedAt = 0;
 uint32_t feedRequestDurationMs = 0;
 int feedHttpCode = 0;
 String feedStatus = "Not fetched";
+// HTTPClient::writeToStreamDataBlock() (arduino-esp32 3.3.11) has no overall
+// deadline of its own once headers are in: its body-read loop is just
+// `while (connected()) { if (available()) read-and-copy; else delay(1); }`
+// forever, with no millis()-based timeout unlike the header-reading loop
+// above it. If a provider accepts the connection, sends a partial response,
+// then stalls without closing the socket - a dead NAT/firewall state is
+// enough, no cooperation from the far end required - that loop spins on
+// core 0 until the task watchdog panics and reboots the whole board. That
+// is the exact, source-confirmed cause of every "IDLE0 starved on CPU 0:
+// network" reboot logged in this project: every backtrace bottoms out in
+// this one loop, just caught at whichever inner call happened to be running
+// when the watchdog sampled it. It can't be fixed by any HTTPClient/
+// WiFiClientSecure timeout setter - none of them are consulted here - and
+// rewriting the body read ourselves would lose HTTPClient's own chunked-
+// transfer decoding (see PsramSink's comment above on why that matters).
+// The only lever available from outside the vendored library is closing
+// the underlying socket out from under it: loop() on core 1 is never
+// blocked by this (every crash log shows CPU 1/IDLE1 running fine), so it
+// polls activeFetchDeadlineMs and force-stops activeFetchClient if a body
+// read has run too long, which unblocks the stuck read with a clean error
+// instead of a 60-second hang ending in a full reboot.
+NetworkClientSecure *volatile activeFetchClient = nullptr;
+volatile uint32_t activeFetchDeadlineMs = 0;
 float homeLatitude = DEFAULT_HOME_LAT;
 float homeLongitude = DEFAULT_HOME_LON;
 uint16_t queryRadiusNm = DEFAULT_RADIUS_NM;
@@ -2261,7 +2284,14 @@ void fetchAdsbV2Aircraft() {
   for (const char *field : fields) aircraftFilter[field] = true;
   JsonDocument doc(&psramJsonAllocator);
   PsramSink body;
+  // See the activeFetchClient/activeFetchDeadlineMs comment above
+  // feedStatus's declaration: this is the one call in the whole file
+  // confirmed to have caused every watchdog reboot logged so far, so it's
+  // the one wrapped in the external force-stop deadline.
+  activeFetchDeadlineMs = millis() + 15000UL;
+  activeFetchClient = &client;
   http.writeToStream(&body);
+  activeFetchClient = nullptr;
   const DeserializationError error = deserializeJson(
       doc, body.data(), body.size(), DeserializationOption::Filter(filter));
   http.end();
@@ -4242,6 +4272,18 @@ void loop() {
   delay(20);
   return;
 #endif
+  // Last-resort rescue for the writeToStreamDataBlock() stall documented by
+  // activeFetchClient's declaration: networkTask() on core 0 can be stuck
+  // spinning inside that vendored loop with no way to feed the watchdog
+  // itself, but this loop on core 1 is never blocked by it, so it's the one
+  // place that can still notice and act. Deliberately does not take
+  // dataMutex - networkTask holds it for the entire stuck fetch, so waiting
+  // for it here would just add a second stuck task.
+  if (activeFetchClient && static_cast<int32_t>(millis() - activeFetchDeadlineMs) >= 0) {
+    Serial.println("Aircraft fetch body read exceeded its deadline; force-closing the socket to break the stall");
+    activeFetchClient->stop();
+    activeFetchDeadlineMs = millis() + 15000UL;
+  }
   // Everything network-bound now lives in networkTask() on the other core.
   // This loop only ever touches shared data through dataMutex, and even then
   // just for the length of a render call (milliseconds), never for the
