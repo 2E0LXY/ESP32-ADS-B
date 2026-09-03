@@ -405,9 +405,19 @@ String feedStatus = "Not fetched";
 // the underlying socket out from under it: loop() on core 1 is never
 // blocked by this (every crash log shows CPU 1/IDLE1 running fine), so it
 // polls activeFetchDeadlineMs and force-stops activeFetchClient if a body
-// read has run too long, which unblocks the stuck read with a clean error
-// instead of a 60-second hang ending in a full reboot.
+// read has made no progress in that long, which unblocks the stuck read
+// with a clean error instead of a 60-second hang ending in a full reboot.
+// The deadline is an idle timeout, not a cap on the whole transfer: it is
+// pushed forward every time activeFetchBody's size actually grows, so a
+// big-but-healthy response (more aircraft, more route lookups already
+// cached) isn't punished for simply taking a while - only a transfer that
+// goes completely quiet gets force-closed. An earlier version used a flat
+// deadline for the entire read and ended up killing normal slow transfers
+// on almost every cycle, which is worse than the rare genuine stall it was
+// meant to catch.
 NetworkClientSecure *volatile activeFetchClient = nullptr;
+PsramSink *volatile activeFetchBody = nullptr;
+volatile size_t activeFetchLastSeenSize = 0;
 volatile uint32_t activeFetchDeadlineMs = 0;
 float homeLatitude = DEFAULT_HOME_LAT;
 float homeLongitude = DEFAULT_HOME_LON;
@@ -2288,10 +2298,13 @@ void fetchAdsbV2Aircraft() {
   // feedStatus's declaration: this is the one call in the whole file
   // confirmed to have caused every watchdog reboot logged so far, so it's
   // the one wrapped in the external force-stop deadline.
+  activeFetchLastSeenSize = 0;
+  activeFetchBody = &body;
   activeFetchDeadlineMs = millis() + 15000UL;
   activeFetchClient = &client;
   http.writeToStream(&body);
   activeFetchClient = nullptr;
+  activeFetchBody = nullptr;
   const DeserializationError error = deserializeJson(
       doc, body.data(), body.size(), DeserializationOption::Filter(filter));
   http.end();
@@ -4279,10 +4292,18 @@ void loop() {
   // place that can still notice and act. Deliberately does not take
   // dataMutex - networkTask holds it for the entire stuck fetch, so waiting
   // for it here would just add a second stuck task.
-  if (activeFetchClient && static_cast<int32_t>(millis() - activeFetchDeadlineMs) >= 0) {
-    Serial.println("Aircraft fetch body read exceeded its deadline; force-closing the socket to break the stall");
-    activeFetchClient->stop();
-    activeFetchDeadlineMs = millis() + 15000UL;
+  if (activeFetchClient) {
+    // Any growth in the buffered body is forward progress - a big response
+    // taking a while is not the same failure as one that has gone silent.
+    const size_t currentSize = activeFetchBody ? activeFetchBody->size() : 0;
+    if (currentSize != activeFetchLastSeenSize) {
+      activeFetchLastSeenSize = currentSize;
+      activeFetchDeadlineMs = millis() + 15000UL;
+    } else if (static_cast<int32_t>(millis() - activeFetchDeadlineMs) >= 0) {
+      Serial.println("Aircraft fetch body read stalled with no new data for 15s; force-closing the socket");
+      activeFetchClient->stop();
+      activeFetchDeadlineMs = millis() + 15000UL;
+    }
   }
   // Everything network-bound now lives in networkTask() on the other core.
   // This loop only ever touches shared data through dataMutex, and even then
