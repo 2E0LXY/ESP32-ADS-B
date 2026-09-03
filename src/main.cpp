@@ -419,6 +419,11 @@ NetworkClientSecure *volatile activeFetchClient = nullptr;
 PsramSink *volatile activeFetchBody = nullptr;
 volatile size_t activeFetchLastSeenSize = 0;
 volatile uint32_t activeFetchDeadlineMs = 0;
+// Diagnostic only: timestamps the fetch started and every observed growth in
+// activeFetchBody, so a stalled cycle's log shows the actual shape of the
+// stall (steady trickle vs. an early jump then dead flat) instead of just
+// the final byte count once the 15s idle timeout gives up.
+volatile uint32_t activeFetchStartedMs = 0;
 float homeLatitude = DEFAULT_HOME_LAT;
 float homeLongitude = DEFAULT_HOME_LON;
 uint16_t queryRadiusNm = DEFAULT_RADIUS_NM;
@@ -2300,7 +2305,8 @@ void fetchAdsbV2Aircraft() {
   // the one wrapped in the external force-stop deadline.
   activeFetchLastSeenSize = 0;
   activeFetchBody = &body;
-  activeFetchDeadlineMs = millis() + 15000UL;
+  activeFetchStartedMs = millis();
+  activeFetchDeadlineMs = activeFetchStartedMs + 15000UL;
   activeFetchClient = &client;
   http.writeToStream(&body);
   activeFetchClient = nullptr;
@@ -4299,6 +4305,8 @@ void loop() {
     if (currentSize != activeFetchLastSeenSize) {
       activeFetchLastSeenSize = currentSize;
       activeFetchDeadlineMs = millis() + 15000UL;
+      Serial.printf("fetch body: %u bytes at t+%lums\n", (unsigned)currentSize,
+                    static_cast<unsigned long>(millis() - activeFetchStartedMs));
     } else if (static_cast<int32_t>(millis() - activeFetchDeadlineMs) >= 0) {
       Serial.println("Aircraft fetch body read stalled with no new data for 15s; force-closing the socket");
       activeFetchClient->stop();
