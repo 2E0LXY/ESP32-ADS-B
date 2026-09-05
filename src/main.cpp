@@ -2209,6 +2209,24 @@ void sortAircraftByDistance() {
 
 void fetchAdsbV2Aircraft() {
   logHeapDiagnostics("fetch-start");
+  // Provider terms, checked directly against each provider's own published
+  // docs (also summarised for the user in web_ui.h's providerNotes):
+  // - adsb.fi (github.com/adsbfi/opendata): personal, non-commercial use
+  //   only; no reselling/redistributing the data; 1 req/s. A single device
+  //   run by its owner for their own display is fine. A commercial backend
+  //   aggregating this feed for many customers is exactly what these terms
+  //   prohibit without adsb.fi's separate written permission.
+  // - airplanes.live: blocks cloud/datacenter source IPs outright and asks
+  //   that anything beyond personal use go through contact@airplanes.live
+  //   first (confirmed firsthand - this project's own aggregator VPS got
+  //   blocked with that exact message).
+  // - adsb.lol (github.com/adsblol/api): no non-commercial restriction
+  //   found; BSD-3-Clause. Docs say a future API key will be earned by
+  //   feeding adsb.lol, but none is required yet.
+  // None of this blocks a single hobbyist device querying a provider
+  // directly for itself - it only matters for a shared backend serving many
+  // devices, which is a decision for whatever fetches on the backend's
+  // behalf, not this per-device code path.
   String url;
   const String latitude = String(homeLatitude, 5);
   const String longitude = String(homeLongitude, 5);
