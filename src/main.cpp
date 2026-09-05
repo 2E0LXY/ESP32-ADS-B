@@ -2231,7 +2231,15 @@ void fetchAdsbV2Aircraft() {
   const String latitude = String(homeLatitude, 5);
   const String longitude = String(homeLongitude, 5);
   const String radius = String(queryRadiusNm);
-  if (apiProvider == "adsbfi") {
+  if (apiProvider == "aggregator") {
+    // Our own backend: polls adsb.fi/airplanes.live/adsb.lol centrally on a
+    // shared cache and dedupes by ICAO hex, so many devices share one set
+    // of upstream connections instead of each hitting the public APIs
+    // directly - see the provider-terms comment above for why that matters
+    // at more than a handful of devices. Same {"ac": [...]} response shape
+    // as every other provider here, so no parsing changes needed.
+    url = "https://adsb.2e0lxy.uk/v1/aircraft?lat=" + latitude + "&lon=" + longitude + "&radius=" + radius;
+  } else if (apiProvider == "adsbfi") {
     url = "https://opendata.adsb.fi/api/v3/lat/" + latitude + "/lon/" + longitude + "/dist/" + radius;
   } else if (apiProvider == "airplaneslive") {
     url = "https://api.airplanes.live/v2/point/" + latitude + "/" + longitude + "/" + radius;
@@ -3371,7 +3379,8 @@ void handleProviderSettings() {
   const String provider = webServer.arg("provider");
   if (provider != "opensky" && provider != "adsbfi" &&
       provider != "airplaneslive" && provider != "adsblol" &&
-      provider != "adsbone" && provider != "adsbx") {
+      provider != "adsbone" && provider != "adsbx" &&
+      provider != "aggregator") {
     sendMessage(400, "Unknown aircraft data provider");
     return;
   }
@@ -4180,7 +4189,8 @@ void setup() {
   apiProvider = settingsStore.getString("provider", "opensky");
   if (apiProvider != "opensky" && apiProvider != "adsbfi" &&
       apiProvider != "airplaneslive" && apiProvider != "adsblol" &&
-      apiProvider != "adsbone" && apiProvider != "adsbx") apiProvider = "opensky";
+      apiProvider != "adsbone" && apiProvider != "adsbx" &&
+      apiProvider != "aggregator") apiProvider = "opensky";
   // Compiled-in credentials are opt-in. Without this flag a locally built
   // image carries no secret that `strings firmware.bin` could recover.
 #ifdef ADSB_BAKE_CREDENTIALS
