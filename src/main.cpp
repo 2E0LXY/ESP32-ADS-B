@@ -1,4 +1,8 @@
 #include <Arduino.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/semphr.h>
+#include <esp_task_wdt.h>
 
 // Board capability macros. Must come before anything that tests them,
 // notably the SD backend selection below.
@@ -23,6 +27,7 @@
 #define SDCARD SD
 #endif
 #include <PNGdec.h>
+#include <WebSocketsClient.h>
 #include <esp_heap_caps.h>
 #include <esp_system.h>
 #include <mbedtls/sha256.h>
@@ -110,6 +115,14 @@ constexpr uint16_t DEFAULT_RADIUS_NM = 60;
 constexpr char TOKEN_URL[] = "https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token";
 constexpr uint32_t REFRESH_MS = 30000;
 constexpr int MAX_AIRCRAFT = 250;
+constexpr int MAX_VESSELS = 250;
+constexpr uint16_t DEFAULT_MARINE_RADIUS_NM = 25;  // typical VHF AIS coastal range
+constexpr uint32_t MARINE_STALE_MS = 20UL * 60UL * 1000UL;  // AIS position reports are event-driven, not polled
+// REST marine providers are polled, unlike AISstream's push WebSocket.
+// AISHub's terms forbid querying more than once a minute; MyShipTracking
+// and Datalastic bill per vessel per request, so this stays conservative
+// for all three rather than tuning a separate interval per provider.
+constexpr uint32_t MARINE_REST_REFRESH_MS = 60UL * 1000UL;
 constexpr int ROUTE_CACHE_SIZE = 48;
 constexpr int MAX_ROUTE_LOOKUPS_PER_REFRESH = 2;
 constexpr uint32_t ROUTE_CACHE_MS = 6UL * 60UL * 60UL * 1000UL;
@@ -120,7 +133,6 @@ constexpr char WEB_USERNAME[] = "admin";
 constexpr char GITHUB_OWNER[] = "2E0LXY";
 constexpr char GITHUB_REPOSITORY[] = "ESP32-ADS-B";
 constexpr char GITHUB_RELEASE_API[] = "https://api.github.com/repos/2E0LXY/ESP32-ADS-B/releases/latest";
-constexpr uint32_t UPDATE_CHECK_MS = 6UL * 60UL * 60UL * 1000UL;
 // Sized for RSA-4096 so rotating the signing key does not silently disable
 // every OTA path. verifyFirmwareSignature() checks the actual length.
 constexpr size_t MAX_SIGNATURE_BYTES = 512;
@@ -207,6 +219,21 @@ struct RouteCacheEntry {
   char callsign[9] = {};
   char origin[5] = {};
   char destination[5] = {};
+  // Full airport names, used by the browser Aircraft/Overview table; the LCD
+  // pages keep the short codes above since the on-panel font has no room for
+  // full names.
+  char originName[40] = {};
+  char destinationName[40] = {};
+  // City/municipality names, used by the browser table fallback and as the
+  // input to the abbreviations below; full airport names don't fit even the
+  // wider WS7 panel, but a city pair ("LONDON -> MADRID") does.
+  char originCity[24] = {};
+  char destinationCity[24] = {};
+  // Departure-board-style abbreviation ("LON STAN"), used by the LCD Table
+  // page: a city code plus the first distinguishing word of the airport
+  // name. Computed once here rather than per frame.
+  char originAbbrev[10] = {};
+  char destinationAbbrev[10] = {};
   uint32_t resolvedAt = 0;
   uint32_t lastUsed = 0;
   bool occupied = false;
@@ -240,6 +267,22 @@ struct AircraftDisplay {
   char emergency[16];
 };
 
+struct VesselDisplay {
+  int x;
+  int y;
+  double latitude;
+  double longitude;
+  float speedKnots;
+  float courseOverGround;
+  float heading;  // -1 if not broadcast; AIS separates heading from course
+  float distanceMiles;
+  uint32_t mmsi;
+  uint32_t lastUpdateMs;
+  char name[24];
+  char shipType[24];
+  char navStatus[24];
+};
+
 uint16_t *framebuffer = nullptr;
 uint16_t *baseMap = nullptr;
 PNG pngDecoder;
@@ -253,16 +296,73 @@ int lastMlat = 0;
 long creditsRemaining = -1;
 RouteCacheEntry routeCache[ROUTE_CACHE_SIZE];
 AircraftDisplay *latestAircraft = nullptr;
+VesselDisplay *latestVessels = nullptr;
+int vesselCount = 0;
+// The aircraft feed and marine tracking both need a persistent TLS session
+// (AIS) or frequent HTTPS fetches (REST providers), competing for the same
+// tight internal RAM - running both at once was the root of the recurring
+// SSL alloc failures. Off by default; enabling it stops the aircraft feed
+// entirely rather than share the budget between two live feeds.
+bool marineTrackingEnabled = false;
+String marineProvider = "aisstream";
+String aisApiKey;
+String aisHubUsername;
+String myShipTrackingApiKey;
+String datalasticApiKey;
+bool aisConnected = false;
+uint32_t aisLastMessageAt = 0;
+uint32_t nextMarineFetchAt = 0;
+uint16_t marineRadiusNm = DEFAULT_MARINE_RADIUS_NM;
+// AIS's TLS handshake competes for the same tight internal RAM as the
+// aircraft fetch; retrying every few seconds after a real failure just
+// keeps hammering an already-fragmented heap. Back off exponentially
+// (8s/16s/32s/60s cap) instead, reset on an actual successful connect.
+// aisIntentionalDisconnect distinguishes that from the deliberate pause
+// around each aircraft fetch, which isn't a failure and shouldn't be
+// penalised.
+uint32_t aisNextRetryAt = 0;
+uint8_t aisConsecutiveFailures = 0;
+bool aisIntentionalDisconnect = false;
+WebSocketsClient aisWebSocket;
+// Defined near setup(), inside this same anonymous namespace, but
+// handleMarineCredentials() below needs to call it earlier in the file.
+void connectAisWebSocket();
+
+bool marineConfigured() {
+  if (marineProvider == "aishub") return aisHubUsername.length() > 0;
+  if (marineProvider == "myshiptracking") return myShipTrackingApiKey.length() > 0;
+  if (marineProvider == "datalastic") return datalasticApiKey.length() > 0;
+  return aisApiKey.length() > 0;
+}
 // Page order matches the swipe order on the panel: Overview is the first
-// screen, then swipe right advances Table -> Map -> Radar and wraps.
-enum class DisplayPage : uint8_t { Overview = 0, Table = 1, Map = 2, Radar = 3 };
-constexpr uint8_t DISPLAY_PAGE_COUNT = 4;
+// screen, then swipe right advances Table -> Map -> Radar -> Marine and wraps.
+enum class DisplayPage : uint8_t { Overview = 0, Table = 1, Map = 2, Radar = 3, Marine = 4 };
+constexpr uint8_t DISPLAY_PAGE_COUNT = 5;
 DisplayPage displayPage = DisplayPage::Overview;
 float radarSweepDegrees = 0.0f;
 uint32_t nextRadarFrameAt = 0;
+uint32_t nextMarineRenderAt = 0;
+uint32_t nextMarinePruneAt = 0;
 bool touchReady = false;
 uint8_t touchAddress = 0;
 uint32_t lastTouchAt = 0;
+int lastTapX = 0;
+int lastTapY = 0;
+
+// Screen positions of the aircraft icons drawn on the current frame, so a
+// tap can be matched back to a specific aircraft. Rebuilt on every render of
+// a page that plots icons (Overview, Map, Radar); MAX_AIRCRAFT is already
+// the hard cap on how many can exist at once.
+struct IconHit { int16_t x, y; int16_t aircraftIndex; };
+IconHit iconHits[MAX_AIRCRAFT];
+int iconHitCount = 0;
+int detailAircraftIndex = -1;
+uint32_t detailShownAt = 0;
+// How many rows into latestAircraft (sorted nearest-first) the table page's
+// visible window starts. Reset whenever the page is left so it always
+// re-opens at the nearest aircraft rather than wherever it was scrolled to.
+int tableScrollOffset = 0;
+constexpr int TABLE_VISIBLE_ROWS = 10;
 volatile bool bootButtonPending = false;
 WebServer webServer(80);
 Preferences settingsStore;
@@ -286,6 +386,44 @@ uint32_t feedRequestStartedAt = 0;
 uint32_t feedRequestDurationMs = 0;
 int feedHttpCode = 0;
 String feedStatus = "Not fetched";
+// HTTPClient::writeToStreamDataBlock() (arduino-esp32 3.3.11) has no overall
+// deadline of its own once headers are in: its body-read loop is just
+// `while (connected()) { if (available()) read-and-copy; else delay(1); }`
+// forever, with no millis()-based timeout unlike the header-reading loop
+// above it. If a provider accepts the connection, sends a partial response,
+// then stalls without closing the socket - a dead NAT/firewall state is
+// enough, no cooperation from the far end required - that loop spins on
+// core 0 until the task watchdog panics and reboots the whole board. That
+// is the exact, source-confirmed cause of every "IDLE0 starved on CPU 0:
+// network" reboot logged in this project: every backtrace bottoms out in
+// this one loop, just caught at whichever inner call happened to be running
+// when the watchdog sampled it. It can't be fixed by any HTTPClient/
+// WiFiClientSecure timeout setter - none of them are consulted here - and
+// rewriting the body read ourselves would lose HTTPClient's own chunked-
+// transfer decoding (see PsramSink's comment above on why that matters).
+// The only lever available from outside the vendored library is closing
+// the underlying socket out from under it: loop() on core 1 is never
+// blocked by this (every crash log shows CPU 1/IDLE1 running fine), so it
+// polls activeFetchDeadlineMs and force-stops activeFetchClient if a body
+// read has made no progress in that long, which unblocks the stuck read
+// with a clean error instead of a 60-second hang ending in a full reboot.
+// The deadline is an idle timeout, not a cap on the whole transfer: it is
+// pushed forward every time activeFetchBody's size actually grows, so a
+// big-but-healthy response (more aircraft, more route lookups already
+// cached) isn't punished for simply taking a while - only a transfer that
+// goes completely quiet gets force-closed. An earlier version used a flat
+// deadline for the entire read and ended up killing normal slow transfers
+// on almost every cycle, which is worse than the rare genuine stall it was
+// meant to catch.
+NetworkClientSecure *volatile activeFetchClient = nullptr;
+PsramSink *volatile activeFetchBody = nullptr;
+volatile size_t activeFetchLastSeenSize = 0;
+volatile uint32_t activeFetchDeadlineMs = 0;
+// Diagnostic only: timestamps the fetch started and every observed growth in
+// activeFetchBody, so a stalled cycle's log shows the actual shape of the
+// stall (steady trickle vs. an early jump then dead flat) instead of just
+// the final byte count once the 15s idle timeout gives up.
+volatile uint32_t activeFetchStartedMs = 0;
 float homeLatitude = DEFAULT_HOME_LAT;
 float homeLongitude = DEFAULT_HOME_LON;
 uint16_t queryRadiusNm = DEFAULT_RADIUS_NM;
@@ -303,7 +441,6 @@ size_t githubFirmwareSize = 0;
 uint8_t githubSignature[MAX_SIGNATURE_BYTES] = {};
 size_t githubSignatureSize = 0;
 String githubUpdateStatus = "Not checked";
-uint32_t nextGithubCheckAt = 0;
 bool sdMounted = false;
 String sdStatus = "Not checked";
 String sdCardType = "None";
@@ -317,9 +454,70 @@ String csrfToken;
 bool mapRebuildActive = false;
 int mapRebuildDone = 0;
 int mapRebuildTotal = 0;
+// A tile that fails to fetch/decode leaves the pre-tile dark ring pattern
+// from drawLocationFallback() showing through that square permanently, since
+// the finished framebuffer is unconditionally snapshotted into baseMap. Track
+// misses so a failed rebuild retries itself instead of leaving that patch
+// baked into the persisted map until someone notices and forces a rescan.
+int mapRebuildMissingTiles = 0;
+uint8_t mapRebuildRetryCount = 0;
+uint32_t nextMapRetryAt = 0;
 bool openSkyAuthRetryPending = false;
 bool pageSavePending = false;
 uint32_t pageSaveAt = 0;
+
+// Network I/O (aircraft/marine fetches, the map tile rebuild, the AIS
+// WebSocket) runs on its own FreeRTOS task pinned to the other core, so a
+// slow fetch or a weak Wi-Fi signal can no longer freeze touch polling and
+// page rendering on the UI side - previously everything shared one loop(),
+// and a multi-second blocking HTTP call meant swipes were missed outright.
+// Both tasks still touch the same buffers (latestAircraft, latestVessels,
+// baseMap, framebuffer), so every access on either side is wrapped in this
+// mutex. needsRedraw lets the network task ask the UI task to repaint the
+// current page after data it owns (mainly the physical map) changes,
+// without the network task touching the display itself.
+SemaphoreHandle_t dataMutex = nullptr;
+volatile bool needsRedraw = false;
+// Must be internal RAM, not PSRAM: writing to flash (any Preferences/NVS
+// call - this task does that constantly, e.g. page-save, location/provider
+// settings) briefly disables the cache that also serves PSRAM access, and
+// the CPU cannot keep executing code or touching a stack that lives in that
+// disabled region. A PSRAM-backed stack was tried here to ease internal-RAM
+// pressure and instead crashed reliably on the very next NVS write
+// ("esp_task_stack_is_sane_cache_disabled()" assert) - ESP-IDF's own sanity
+// check catching exactly this.
+//
+// 8192 (a guess at what the original single loop task used, never actually
+// verified) was then tried here and reliably stack-overflowed instead
+// ("Stack canary watchpoint triggered (network)"), consistently inside
+// mbedTLS certificate parsing - TLS handshakes have a genuinely deep,
+// stack-hungry call chain. 12288 is the same size that ran this exact
+// workload without any stack-overflow symptom when it was (briefly, and for
+// the unrelated reason above) in PSRAM, so it's a size known to be
+// sufficient, just moved back to the RAM tier that's actually safe here.
+constexpr uint32_t NETWORK_TASK_STACK_BYTES = 12288;
+
+// RAII lock: guarantees the mutex is released on every return path, even
+// through the many early returns inside fetchAircraft()/fetchAdsbV2Aircraft()
+// and friends. Wrapping the call site with this instead of hand-threading
+// xSemaphoreGive() through every branch removes an entire class of
+// forgot-to-unlock deadlock risk.
+class MutexGuard {
+ public:
+  // Recursive, not a plain mutex: refreshPhysicalBaseMap() (called under this
+  // guard) calls webServer.handleClient() between tiles to stay responsive,
+  // and that can dispatch a handler - handlePageControl() does - that takes
+  // this same mutex on the same task. A plain mutex would deadlock there;
+  // recursive re-entry by the same task is a no-op until the outermost
+  // guard releases.
+  explicit MutexGuard(SemaphoreHandle_t m) : mutex(m) { xSemaphoreTakeRecursive(mutex, portMAX_DELAY); }
+  ~MutexGuard() { xSemaphoreGiveRecursive(mutex); }
+  MutexGuard(const MutexGuard &) = delete;
+  MutexGuard &operator=(const MutexGuard &) = delete;
+ private:
+  SemaphoreHandle_t mutex;
+};
+
 String previousWifiSsid;
 String previousWifiPassword;
 uint32_t wifiRollbackAt = 0;
@@ -336,6 +534,20 @@ void applyTlsPolicy(WiFiClientSecure &client) {
       rootca_crt_bundle_start,
       static_cast<size_t>(rootca_crt_bundle_end - rootca_crt_bundle_start));
 #endif
+}
+
+// Diagnostic for the recurring "-32512 SSL - Memory allocation failed":
+// mbedTLS needs one contiguous internal-RAM block per handshake, and total
+// free heap alone doesn't say whether that block is available - fragmented
+// heap can fail this allocation with plenty of free bytes left. Logging both
+// numbers around each fetch cycle will show whether the largest block keeps
+// shrinking cycle over cycle (a leak somewhere) or is already pinned at a
+// low ceiling from the very first cycle (something else holding it, e.g.
+// the web server's own connections or WiFiManager's leftover state).
+void logHeapDiagnostics(const char *tag) {
+  Serial.printf("heap[%s]: free=%u largestInternal=%u\n", tag,
+                static_cast<unsigned>(ESP.getFreeHeap()),
+                static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)));
 }
 
 // One User-Agent for every outbound request, always matching the running
@@ -399,7 +611,7 @@ bool downloadFirmwareSignature() {
   WiFiClientSecure client;
   applyTlsPolicy(client);
   HTTPClient http;
-  http.setTimeout(12000);
+  http.setTimeout(12000); http.setConnectTimeout(12000);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   if (!http.begin(client, githubSignatureUrl)) return false;
   http.addHeader("User-Agent", userAgent());
@@ -613,10 +825,13 @@ bool beginTouch() {
 #endif
 }
 
-enum class TouchGesture : uint8_t { None, Tap, SwipeLeft, SwipeRight };
+enum class TouchGesture : uint8_t { None, Tap, SwipeLeft, SwipeRight, SwipeUp, SwipeDown };
 
-// A swipe must travel this far horizontally, stay mostly horizontal, and
-// finish inside the time limit. Anything shorter that lifts cleanly is a tap.
+// A swipe must travel this far in its dominant axis, stay mostly on that
+// axis, and finish inside the time limit. Anything shorter that lifts
+// cleanly is a tap - and anything that doesn't clear the 2:1 dominance ratio
+// on either axis falls through to a tap too, which used to silently double
+// as "advance page" for a vertical drag that missed being a clean swipe.
 constexpr int SWIPE_MIN_PIXELS = 70;
 constexpr uint32_t SWIPE_MAX_MS = 700;
 
@@ -674,6 +889,17 @@ TouchGesture touchGesture() {
       abs(deltaX) > abs(deltaY) * 2) {
     return deltaX < 0 ? TouchGesture::SwipeLeft : TouchGesture::SwipeRight;
   }
+  // A vertical drag that missed a clean horizontal swipe used to fall all
+  // the way through to a tap, which - on any page where the release point
+  // didn't land on an aircraft icon - advanced the page exactly like a
+  // horizontal swipe would. Table scrolling needs this recognised as its
+  // own gesture instead.
+  if (heldFor <= SWIPE_MAX_MS && abs(deltaY) >= SWIPE_MIN_PIXELS &&
+      abs(deltaY) > abs(deltaX) * 2) {
+    return deltaY < 0 ? TouchGesture::SwipeUp : TouchGesture::SwipeDown;
+  }
+  lastTapX = lastX;
+  lastTapY = lastY;
   return TouchGesture::Tap;
 }
 
@@ -718,6 +944,27 @@ void disc(int cx, int cy, int r, uint16_t c) {
 void filledRect(int x, int y, int width, int height, uint16_t c) {
   for (int yy = y; yy < y + height; ++yy)
     for (int xx = x; xx < x + width; ++xx) pixel(xx, yy, c);
+}
+
+// Standard sorted-scanline triangle fill - the only solid-shape primitive
+// available besides disc()/filledRect(), used to build bold aircraft
+// silhouettes instead of the thin wireframe outlines a plain line() gives.
+void filledTriangle(int x0, int y0, int x1, int y1, int x2, int y2, uint16_t c) {
+  auto swapInt = [](int &a, int &b) { const int t = a; a = b; b = t; };
+  if (y0 > y1) { swapInt(x0, x1); swapInt(y0, y1); }
+  if (y0 > y2) { swapInt(x0, x2); swapInt(y0, y2); }
+  if (y1 > y2) { swapInt(x1, x2); swapInt(y1, y2); }
+  auto edge = [](int ya, int xa, int yb, int xb, int y) {
+    if (yb == ya) return static_cast<float>(xa);
+    return xa + (xb - xa) * static_cast<float>(y - ya) / (yb - ya);
+  };
+  for (int y = y0; y <= y2; ++y) {
+    const float xLeftFull = edge(y0, x0, y2, x2, y);
+    const float xOther = (y < y1) ? edge(y0, x0, y1, x1, y) : edge(y1, x1, y2, x2, y);
+    int xa = lroundf(xLeftFull), xb = lroundf(xOther);
+    if (xa > xb) swapInt(xa, xb);
+    for (int x = xa; x <= xb; ++x) pixel(x, y, c);
+  }
 }
 
 const uint8_t *glyph(char ch) {
@@ -882,7 +1129,7 @@ bool cacheOsmTile(uint8_t zoom, int tileX, int tileY, const String &path) {
   WiFiClientSecure client;
   applyTlsPolicy(client);
   HTTPClient http;
-  http.setTimeout(12000);
+  http.setTimeout(12000); http.setConnectTimeout(12000);
   const String url = "https://tile.openstreetmap.org/" + String(zoom) + "/" + String(tileX) + "/" + String(tileY) + ".png";
   if (!http.begin(client, url)) {
     Serial.printf("OSM tile %d/%d/%d begin() failed\n", zoom, tileX, tileY);
@@ -954,6 +1201,15 @@ bool refreshPhysicalBaseMap() {
   mapRebuildActive = true;
   mapRebuildDone = 0;
   mapRebuildTotal = 0;
+  // Same contention that broke the aircraft feed: a full rebuild (especially
+  // right after a cache clear, which has to re-fetch every tile instead of
+  // just the missing ones) is a burst of sequential HTTPS requests that
+  // competes with the AIS WebSocket's persistent TLS session for the same
+  // scarce internal RAM - a user report of heapMinimum dropping to ~200
+  // bytes and the LCD going solid black during exactly this rebuild
+  // confirmed it. Pause it for the duration, same as the periodic fetch does.
+  const bool pauseAisForMapRebuild = marineProvider == "aisstream" && aisWebSocket.isConnected();
+  if (pauseAisForMapRebuild) aisWebSocket.disconnect();
   drawLocationFallback();
   const double centerX = osmWorldX(homeLongitude, physicalMapZoom);
   const double centerY = osmWorldY(homeLatitude, physicalMapZoom);
@@ -971,8 +1227,14 @@ bool refreshPhysicalBaseMap() {
     for (int tileX = firstTileX; tileX <= lastTileX; ++tileX) {
       const int wrappedX = (tileX % tilesPerAxis + tilesPerAxis) % tilesPerAxis;
       const String path = osmTilePath(physicalMapZoom, wrappedX, tileY);
-      const bool cached = cacheOsmTile(physicalMapZoom, wrappedX, tileY, path);
-      const bool drawn = cached && drawCachedOsmTile(path, tileX * 256 - left, tileY * 256 - top);
+      // A single failed fetch/decode used to leave that tile's square showing
+      // the dark ring fallback pattern for good; a couple of quick retries
+      // clears most transient network blips without a full manual rescan.
+      bool cached = false, drawn = false;
+      for (int attempt = 0; attempt < 3 && !drawn; ++attempt) {
+        cached = cacheOsmTile(physicalMapZoom, wrappedX, tileY, path);
+        drawn = cached && drawCachedOsmTile(path, tileX * 256 - left, tileY * 256 - top);
+      }
       if (drawn) ++tilesDrawn;
       Serial.printf("tile %d/%d at %d,%d cached=%d drawn=%d\n", wrappedX, tileY,
                     tileX * 256 - left, tileY * 256 - top, cached, drawn);
@@ -980,16 +1242,54 @@ bool refreshPhysicalBaseMap() {
       // Each tile is a separate HTTPS round trip. Service the admin interface
       // between them so the UI stays responsive and can show progress.
       if (webServerReady) webServer.handleClient();
+      // This loop runs long enough on this core to starve the RGB panel's
+      // DMA of PSRAM bandwidth (the tile cache and framebuffer both live in
+      // PSRAM, and the panel continuously DMA-reads the framebuffer to
+      // refresh the screen) - that's the pre-existing "table/map top rolls
+      // to bottom" bug. It isn't a data race dataMutex can fix; the DMA
+      // controller is just losing its bus turn to the CPU's own PSRAM
+      // traffic. present() already retries this once per frame; nudging it
+      // here too gives it a chance to resynchronise mid-loop instead of only
+      // once the whole operation is done. See the other call sites of
+      // restartAtNextVsync() in the fetch route-lookup loops for the same fix.
+      rgbpanel->restartAtNextVsync();
     }
   }
   filledRect(0, H - 15, 17 * 6 + 4, 15, rgb(0, 0, 0));
   text5(3, H - 12, "(C) OPENSTREETMAP", rgb(255, 255, 255));
+  // The tile loop above is the single heaviest PSRAM/SD-bus contention
+  // window of the whole rebuild - whatever page calls restoreMap() next
+  // (right after this function returns, in setup()) is the first thing
+  // presented after that window closes, exactly the moment a DMA
+  // desync from that contention is most likely to still be in effect.
+  // One more nudge here, on top of the per-tile ones above, before that
+  // handoff.
+  rgbpanel->restartAtNextVsync();
   memcpy(baseMap, framebuffer, W * H * sizeof(uint16_t));
   physicalMapReady = true;
   mapRebuildActive = false;
+  mapRebuildMissingTiles = mapRebuildTotal - tilesDrawn;
   Serial.printf("Physical map %d/%d tiles at %.5f, %.5f radius %u nm zoom %u\n",
                 tilesDrawn, mapRebuildTotal, homeLatitude,
                 homeLongitude, queryRadiusNm, physicalMapZoom);
+  // A retry re-fetches every tile in view over HTTPS, not just the missing
+  // ones - real network load on top of whatever else (the web server, the
+  // AIS socket) is competing for the same scarce internal RAM. Skip it while
+  // memory is already tight rather than making a low-memory situation worse;
+  // a manual rescan from the admin page still works once things recover.
+  const size_t freeInternalHeap = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (mapRebuildMissingTiles > 0 && mapRebuildRetryCount < 3 && freeInternalHeap > 20000) {
+    ++mapRebuildRetryCount;
+    nextMapRetryAt = millis() + 15000UL;
+    Serial.printf("Map rebuild missing %d tiles; retry %u/3 in 15s\n",
+                  mapRebuildMissingTiles, mapRebuildRetryCount);
+  } else {
+    if (mapRebuildMissingTiles > 0)
+      Serial.printf("Map rebuild missing %d tiles but free heap is %u; not auto-retrying\n",
+                    mapRebuildMissingTiles, static_cast<unsigned>(freeInternalHeap));
+    mapRebuildRetryCount = 0;
+  }
+  if (pauseAisForMapRebuild) connectAisWebSocket();
   return tilesDrawn > 0;
 }
 
@@ -1043,7 +1343,7 @@ bool requestAccessToken() {
   WiFiClientSecure client;
   applyTlsPolicy(client);
   HTTPClient http;
-  http.setTimeout(8000);
+  http.setTimeout(8000); http.setConnectTimeout(8000);
   if (!http.begin(client, TOKEN_URL)) return false;
   http.addHeader("Content-Type", "application/x-www-form-urlencoded");
   String body = "grant_type=client_credentials&client_id=" + urlEncode(openSkyClientId.c_str()) +
@@ -1097,6 +1397,60 @@ void airportCode(JsonObject airport, char output[5]) {
   output[4] = 0;
 }
 
+void airportName(JsonObject airport, char *output, size_t outSize) {
+  const char *name = airport["name"] | "";
+  strncpy(output, name, outSize - 1);
+  output[outSize - 1] = 0;
+}
+
+void airportCity(JsonObject airport, char *output, size_t outSize) {
+  const char *city = airport["municipality"] | "";
+  strncpy(output, city, outSize - 1);
+  output[outSize - 1] = 0;
+}
+
+// Departure-board-style abbreviation, e.g. "LONDON" + "London Stansted
+// Airport" -> "LON STAN": the first 3 letters of the city plus the first
+// word of the airport name that isn't the city itself or a generic suffix
+// like "Airport"/"International". Best-effort - adsbdb has no canonical
+// short form, and this won't suit every naming convention worldwide.
+void abbreviateAirport(const char *cityName, const char *fullAirportName, char *output, size_t outSize) {
+  char cityPart[4] = {};
+  int ci = 0;
+  for (const char *p = cityName; *p && ci < 3; ++p)
+    if (isalpha(static_cast<unsigned char>(*p))) cityPart[ci++] = toupper(static_cast<unsigned char>(*p));
+  cityPart[ci] = 0;
+
+  char cityUpper[24] = {};
+  size_t cu = 0;
+  for (const char *p = cityName; *p && cu < sizeof(cityUpper) - 1; ++p) cityUpper[cu++] = toupper(static_cast<unsigned char>(*p));
+  cityUpper[cu] = 0;
+
+  static const char *skipWords[] = {"AIRPORT", "INTERNATIONAL", "INTL", "REGIONAL",
+                                     "FIELD", "AIRFIELD", "MUNICIPAL", "COUNTY", "AERODROME"};
+
+  char distinguishing[5] = {};
+  char word[32] = {};
+  size_t wi = 0;
+  for (const char *p = fullAirportName;; ++p) {
+    char c = *p;
+    bool boundary = (c == ' ' || c == '-' || c == 0);
+    if (!boundary && wi < sizeof(word) - 1) word[wi++] = toupper(static_cast<unsigned char>(c));
+    if (boundary) {
+      word[wi] = 0;
+      if (wi > 0 && !distinguishing[0] && strcmp(word, cityUpper)) {
+        bool skip = false;
+        for (const char *s : skipWords) if (!strcmp(word, s)) { skip = true; break; }
+        if (!skip) { strncpy(distinguishing, word, 4); distinguishing[4] = 0; }
+      }
+      wi = 0;
+      if (c == 0) break;
+    }
+  }
+  if (distinguishing[0]) snprintf(output, outSize, "%s %s", cityPart, distinguishing);
+  else snprintf(output, outSize, "%s", cityPart);
+}
+
 RouteCacheEntry *routeForCallsign(const char *rawCallsign, int &lookupsUsed,
                                   WiFiClientSecure &client, HTTPClient &http) {
   char callsign[9];
@@ -1131,10 +1485,9 @@ RouteCacheEntry *routeForCallsign(const char *rawCallsign, int &lookupsUsed,
   slot->occupied = true;
   slot->resolvedAt = slot->lastUsed = millis();
 
-  // client and http are owned by the caller and reused across the whole batch:
-  // api.adsbdb.com is the same host every time, so keeping the TLS session
-  // open turns N handshakes into one and cuts the window in which loop() -
-  // and therefore the web server - is blocked.
+  // client and http are owned by the caller, one fresh pair per lookup - see
+  // the caller's comment on why this no longer reuses one keep-alive
+  // connection across the whole batch.
   String url = "https://api.adsbdb.com/v0/callsign/" + String(callsign);
   if (!http.begin(client, url)) return slot;
   http.addHeader("Accept-Encoding", "identity");
@@ -1145,14 +1498,31 @@ RouteCacheEntry *routeForCallsign(const char *rawCallsign, int &lookupsUsed,
     http.end();
     return slot;
   }
-  String payload = http.getString();
+  // Every other JSON parse in this file keeps its allocations in PSRAM via
+  // psramJsonAllocator/PsramSink - this one didn't, and getString()+a
+  // default JsonDocument put both the response body and the whole parsed
+  // tree in internal RAM instead. Called on every route lookup (up to
+  // MAX_ROUTE_LOOKUPS_PER_REFRESH times per fetch), that's the actual
+  // culprit behind the internal-heap fragmentation that permanently breaks
+  // the aircraft feed's own TLS connections after the first fetch - not a
+  // hardware ceiling, just this one call site allocating in the wrong pool.
+  PsramSink body;
+  http.writeToStream(&body);
   http.end();
-  JsonDocument routeDoc;
-  if (deserializeJson(routeDoc, payload)) return slot;
+  JsonDocument routeDoc(&psramJsonAllocator);
+  if (deserializeJson(routeDoc, body.data(), body.size())) return slot;
   JsonObject route = routeDoc["response"]["flightroute"].as<JsonObject>();
   if (route.isNull()) return slot;
   airportCode(route["origin"].as<JsonObject>(), slot->origin);
   airportCode(route["destination"].as<JsonObject>(), slot->destination);
+  airportName(route["origin"].as<JsonObject>(), slot->originName, sizeof(slot->originName));
+  airportName(route["destination"].as<JsonObject>(), slot->destinationName, sizeof(slot->destinationName));
+  airportCity(route["origin"].as<JsonObject>(), slot->originCity, sizeof(slot->originCity));
+  airportCity(route["destination"].as<JsonObject>(), slot->destinationCity, sizeof(slot->destinationCity));
+  if (slot->originCity[0] && slot->originName[0])
+    abbreviateAirport(slot->originCity, slot->originName, slot->originAbbrev, sizeof(slot->originAbbrev));
+  if (slot->destinationCity[0] && slot->destinationName[0])
+    abbreviateAirport(slot->destinationCity, slot->destinationName, slot->destinationAbbrev, sizeof(slot->destinationAbbrev));
   slot->hasRoute = slot->origin[0] && slot->destination[0];
   if (slot->hasRoute) Serial.printf("Route %s %s>%s\n", callsign, slot->origin, slot->destination);
   return slot;
@@ -1165,6 +1535,63 @@ RouteCacheEntry *cachedRoute(const char *rawCallsign) {
     if (entry.occupied && !strcmp(entry.callsign, callsign)) return &entry;
   }
   return nullptr;
+}
+
+// Persists the route cache across reboots - the callsigns seen near a fixed
+// receiver location repeat daily, so this avoids re-querying adsbdb for
+// routes it already resolved last time the device was on. Raw struct dump:
+// this file is only ever read back by the exact build that wrote it, so a
+// version mismatch (from a firmware update changing RouteCacheEntry) just
+// means starting cache-cold again rather than reading garbage.
+constexpr uint32_t ROUTE_CACHE_FILE_MAGIC = 0x52435341; // "ASCR"
+constexpr uint8_t ROUTE_CACHE_FILE_VERSION = 1;
+
+const char *routeCacheFilePath() {
+  return sdMounted ? "/adsb/route_cache.bin" : "/route_cache.bin";
+}
+
+void saveRouteCacheToStorage() {
+  fs::FS &storage = sdMounted ? static_cast<fs::FS &>(SDCARD) : static_cast<fs::FS &>(LittleFS);
+  File file = storage.open(routeCacheFilePath(), FILE_WRITE);
+  if (!file) return;
+  file.write(reinterpret_cast<const uint8_t *>(&ROUTE_CACHE_FILE_MAGIC), sizeof(ROUTE_CACHE_FILE_MAGIC));
+  file.write(&ROUTE_CACHE_FILE_VERSION, sizeof(ROUTE_CACHE_FILE_VERSION));
+  uint8_t count = 0;
+  for (auto &entry : routeCache) if (entry.occupied) ++count;
+  file.write(&count, sizeof(count));
+  for (auto &entry : routeCache) {
+    if (!entry.occupied) continue;
+    file.write(reinterpret_cast<const uint8_t *>(&entry), sizeof(entry));
+  }
+  file.close();
+}
+
+void loadRouteCacheFromStorage() {
+  fs::FS &storage = sdMounted ? static_cast<fs::FS &>(SDCARD) : static_cast<fs::FS &>(LittleFS);
+  File file = storage.open(routeCacheFilePath(), FILE_READ);
+  if (!file) return;
+  uint32_t magic = 0;
+  uint8_t version = 0, count = 0;
+  bool headerOk = file.read(reinterpret_cast<uint8_t *>(&magic), sizeof(magic)) == sizeof(magic) &&
+                  magic == ROUTE_CACHE_FILE_MAGIC &&
+                  file.read(&version, sizeof(version)) == sizeof(version) &&
+                  version == ROUTE_CACHE_FILE_VERSION &&
+                  file.read(&count, sizeof(count)) == sizeof(count);
+  int loaded = 0;
+  if (headerOk) {
+    RouteCacheEntry entry;
+    while (loaded < count && loaded < ROUTE_CACHE_SIZE &&
+           file.read(reinterpret_cast<uint8_t *>(&entry), sizeof(entry)) == sizeof(entry)) {
+      // millis() resets to near-zero at boot, so a persisted timestamp from
+      // the previous session would otherwise read as impossibly stale;
+      // treat every loaded entry as freshly resolved right now instead.
+      entry.resolvedAt = millis();
+      entry.lastUsed = millis();
+      routeCache[loaded++] = entry;
+    }
+  }
+  file.close();
+  if (loaded) Serial.printf("Loaded %d cached routes from %s\n", loaded, routeCacheFilePath());
 }
 
 uint16_t operatorColour(const char *code) {
@@ -1192,19 +1619,6 @@ void drawMlatPlane(int x, int y, float heading) {
   pixel(x,y,white);
 }
 
-void drawAdsbLogo(int x, int y, float heading, const char *flight, const char *hex) {
-  char code[4] = {'?','?','?',0};
-  const char *src = (flight && strlen(flight)>=3) ? flight : hex;
-  for (int i=0;i<3 && src && src[i];++i) code[i]=toupper(static_cast<unsigned char>(src[i]));
-  uint16_t brand=operatorColour(code), white=rgb(255,255,255), dark=rgb(5,15,20);
-  disc(x,y,11,dark); disc(x,y,10,brand);
-  text5(x-8,y-3,code,white,1);
-  float a=radians(heading-90.0f);
-  int nx=x+lroundf(cosf(a)*15), ny=y+lroundf(sinf(a)*15);
-  line(x,y,nx,ny,white);
-  disc(nx,ny,2,white);
-}
-
 void drawOperatorBadge(int x, int y, const char *flight, const char *hex) {
   char code[4] = {'?','?','?',0};
   const char *src = (flight && strlen(flight)>=3) ? flight : hex;
@@ -1212,6 +1626,110 @@ void drawOperatorBadge(int x, int y, const char *flight, const char *hex) {
   disc(x,y,11,rgb(5,15,20));
   disc(x,y,10,operatorColour(code));
   text5(x-8,y-3,code,rgb(255,255,255));
+}
+
+// The ADS-B emitter category (A0-A7/B0-B7/C0-C7) picks a recognisable
+// silhouette instead of every aircraft drawing as the same blob; an empty or
+// unrecognised category (common on feeds that omit it) falls back to the
+// airliner shape since that's the majority of what's actually in the air.
+enum class PlaneShape : uint8_t { Jet, Light, Helicopter, Military };
+
+PlaneShape planeShapeForCategory(const char *category) {
+  if (!category || !category[0]) return PlaneShape::Jet;
+  if (!strcmp(category, "A7")) return PlaneShape::Helicopter;
+  if (!strcmp(category, "A6")) return PlaneShape::Military;
+  if (!strcmp(category, "A1") || !strcmp(category, "A2") ||
+      !strcmp(category, "B1") || !strcmp(category, "B2") ||
+      !strcmp(category, "B3") || !strcmp(category, "B4")) return PlaneShape::Light;
+  return PlaneShape::Jet;
+}
+
+// Every shape is built from filledTriangle()/disc() - solid, not outlined -
+// so it actually reads as a plane silhouette on the panel instead of a faint
+// wireframe; a thin line() outline (the original version of this function)
+// all but disappeared against the map at normal viewing distance.
+void drawPlaneIcon(int x, int y, float heading, PlaneShape shape, uint16_t colour) {
+  const float a = radians(heading - 90.0f), cs = cosf(a), sn = sinf(a);
+  auto tx = [&](float px, float py) { return x + lroundf(px * cs - py * sn); };
+  auto ty = [&](float px, float py) { return y + lroundf(px * sn + py * cs); };
+  const uint16_t white = rgb(255, 255, 255);
+  switch (shape) {
+    case PlaneShape::Helicopter: {
+      // The rotor spins independent of track; a short tail boom still shows
+      // which way the aircraft is actually heading. A real rotor blade is
+      // thin, so this is the one shape that stays as lines (doubled for
+      // weight) rather than a fill.
+      static float rotorAngle = 0.0f;
+      rotorAngle += 35.0f;
+      if (rotorAngle >= 360.0f) rotorAngle -= 360.0f;
+      const float ra = radians(rotorAngle);
+      const int r1x = x + lroundf(cosf(ra) * 13), r1y = y + lroundf(sinf(ra) * 13);
+      const int r2x = x - lroundf(cosf(ra) * 13), r2y = y - lroundf(sinf(ra) * 13);
+      disc(x, y, 4, colour);
+      line(r1x, r1y, r2x, r2y, colour);
+      line(r1x, r1y + 1, r2x, r2y + 1, colour);
+      line(x, y, tx(-11, 0), ty(-11, 0), colour);
+      pixel(x, y, white);
+      break;
+    }
+    case PlaneShape::Military:
+      // Narrower and more sharply swept than the standard jet silhouette.
+      filledTriangle(tx(13,0), ty(13,0), tx(-6,-4), ty(-6,-4), tx(-10,0), ty(-10,0), colour);
+      filledTriangle(tx(13,0), ty(13,0), tx(-10,0), ty(-10,0), tx(-6,4), ty(-6,4), colour);
+      pixel(x, y, white);
+      break;
+    case PlaneShape::Light:
+      // Straight, unswept wings crossing a slim fuselage - a small prop
+      // aircraft, not the swept dart shape used for everything else.
+      filledTriangle(tx(10,0), ty(10,0), tx(-10,-2), ty(-10,-2), tx(-10,2), ty(-10,2), colour);
+      filledTriangle(tx(2,0), ty(2,0), tx(0,-8), ty(0,-8), tx(-2,0), ty(-2,0), colour);
+      filledTriangle(tx(2,0), ty(2,0), tx(-2,0), ty(-2,0), tx(0,8), ty(0,8), colour);
+      pixel(x, y, white);
+      break;
+    case PlaneShape::Jet:
+    default:
+      // Swept-wing airliner dart - the same outline every icon used to draw,
+      // now filled solid via its two diagonal-split triangles.
+      filledTriangle(tx(12,0), ty(12,0), tx(-9,-5), ty(-9,-5), tx(-5,0), ty(-5,0), colour);
+      filledTriangle(tx(12,0), ty(12,0), tx(-5,0), ty(-5,0), tx(-9,5), ty(-9,5), colour);
+      pixel(x, y, white);
+      break;
+  }
+}
+
+// Replaces the old drawAdsbLogo/drawMlatPlane pair: shape identifies the
+// aircraft type from its ADS-B category, colour flags MLAT (estimated,
+// non-ADS-B) position in red the same way the table's A/M source column
+// already does, and falls back to the operator's brand colour otherwise.
+void drawAircraftIcon(int x, int y, float heading, const char *flight,
+                       const char *hex, const char *category, bool isMlat) {
+  char code[4] = {'?','?','?',0};
+  const char *src = (flight && strlen(flight) >= 3) ? flight : hex;
+  for (int i = 0; i < 3 && src && src[i]; ++i) code[i] = toupper(static_cast<unsigned char>(src[i]));
+  const uint16_t colour = isMlat ? rgb(245, 30, 35) : operatorColour(code);
+  drawPlaneIcon(x, y, heading, planeShapeForCategory(category), colour);
+}
+
+// Records where an icon was just drawn against which entry in latestAircraft,
+// so a later tap can be matched back to a specific aircraft. Call sites reset
+// iconHitCount to 0 before their draw loop and call this once per icon drawn.
+void recordIconHit(int x, int y, int aircraftIndex) {
+  if (iconHitCount >= MAX_AIRCRAFT) return;
+  iconHits[iconHitCount].x = static_cast<int16_t>(x);
+  iconHits[iconHitCount].y = static_cast<int16_t>(y);
+  iconHits[iconHitCount].aircraftIndex = static_cast<int16_t>(aircraftIndex);
+  ++iconHitCount;
+}
+
+int findAircraftIconAt(int x, int y) {
+  int best = -1;
+  long bestDistSq = 22 * 22;  // generous finger-sized hit radius
+  for (int i = 0; i < iconHitCount; ++i) {
+    const long dx = iconHits[i].x - x, dy = iconHits[i].y - y;
+    const long distSq = dx * dx + dy * dy;
+    if (distSq <= bestDistSq) { bestDistSq = distSq; best = iconHits[i].aircraftIndex; }
+  }
+  return best;
 }
 
 void drawRouteLabel(int x, int y, const RouteCacheEntry *route) {
@@ -1275,22 +1793,32 @@ void renderBootScreen(const String &networkLine = "", uint16_t networkColour = R
 // under the table.
 constexpr int OVERVIEW_MAP_WIDTH = W * 5 / 8;
 
+// Offsets from panelX, expressed as fractions of W so the wider WS7 panel
+// gets proportionally more room instead of the WS4 pixel values overflowing
+// or crowding together.
+constexpr int OVERVIEW_COL_MILES = W * 66 / 480;
+constexpr int OVERVIEW_COL_ALT = W * 108 / 480;
+constexpr int OVERVIEW_COL_ROUTE = W * 144 / 480;
+
 void renderOverviewPage() {
   restoreMap();
+  iconHitCount = 0;
   for (int i = 0; i < lastCount; ++i) {
     AircraftDisplay &display = latestAircraft[i];
     if (display.x < 0 || display.x >= OVERVIEW_MAP_WIDTH - 10) continue;
     if (display.y < 0 || display.y >= H) continue;
-    if (display.positionSource == 2) drawMlatPlane(display.x, display.y, display.track);
-    else drawAdsbLogo(display.x, display.y, display.track, display.flight, display.hex);
+    drawAircraftIcon(display.x, display.y, display.track, display.flight, display.hex,
+                      display.category, display.positionSource == 2);
+    recordIconHit(display.x, display.y, i);
   }
 
   filledRect(OVERVIEW_MAP_WIDTH, 0, W - OVERVIEW_MAP_WIDTH, H, rgb(2, 10, 18));
   line(OVERVIEW_MAP_WIDTH, 0, OVERVIEW_MAP_WIDTH, H - 1, rgb(30, 90, 120));
   const int panelX = OVERVIEW_MAP_WIDTH + 8;
   text5(panelX, 8, "NEAREST", rgb(80, 220, 255));
-  text5(panelX + 66, 8, "MI", rgb(120, 170, 200));
-  text5(panelX + 108, 8, "ALT", rgb(120, 170, 200));
+  text5(panelX + OVERVIEW_COL_MILES, 8, "MI", rgb(120, 170, 200));
+  text5(panelX + OVERVIEW_COL_ALT, 8, "ALT", rgb(120, 170, 200));
+  text5(panelX + OVERVIEW_COL_ROUTE, 8, "RTE", rgb(120, 170, 200));
   line(panelX, 18, W - 6, 18, rgb(30, 90, 120));
 
   const int rows = min(lastCount, (H - 46) / 22);
@@ -1301,11 +1829,19 @@ void renderOverviewPage() {
     text5(panelX, y, callsign, rgb(190, 235, 255));
     char miles[8];
     snprintf(miles, sizeof(miles), "%d", static_cast<int>(display.distanceMiles + 0.5f));
-    text5(panelX + 66, y, miles, rgb(245, 205, 65));
+    text5(panelX + OVERVIEW_COL_MILES, y, miles, rgb(245, 205, 65));
     char altitude[10];
     if (display.altitudeFt > 0) snprintf(altitude, sizeof(altitude), "%d", display.altitudeFt);
     else snprintf(altitude, sizeof(altitude), "--");
-    text5(panelX + 108, y, altitude, rgb(150, 225, 190));
+    text5(panelX + OVERVIEW_COL_ALT, y, altitude, rgb(150, 225, 190));
+    RouteCacheEntry *route = cachedRoute(display.flight);
+    char routeLabel[11];
+    // "---" means not looked up yet (still queued); "NO RTE" means adsbdb
+    // was asked and had nothing on file, usually a private/GA registration.
+    if (route && route->hasRoute) snprintf(routeLabel, sizeof(routeLabel), "%s>%s", route->origin, route->destination);
+    else if (route) strcpy(routeLabel, "NO RTE");
+    else strcpy(routeLabel, "---");
+    text5(panelX + OVERVIEW_COL_ROUTE, y, routeLabel, rgb(130, 210, 255));
   }
 
   char footer[24];
@@ -1319,13 +1855,14 @@ void renderOverviewPage() {
 
 void renderMapPage() {
   restoreMap();
+  iconHitCount = 0;
   for (int i=0; i<lastCount; ++i) {
     AircraftDisplay &display = latestAircraft[i];
     if (display.x < 0 || display.x >= W || display.y < 0 || display.y >= H) continue;
-    if (display.positionSource == 2) {
-      drawMlatPlane(display.x,display.y,display.track);
-    } else {
-      drawAdsbLogo(display.x,display.y,display.track,display.flight,display.hex);
+    drawAircraftIcon(display.x, display.y, display.track, display.flight, display.hex,
+                      display.category, display.positionSource == 2);
+    recordIconHit(display.x, display.y, i);
+    if (display.positionSource != 2) {
       drawRouteLabel(display.x,display.y,cachedRoute(display.flight));
     }
   }
@@ -1336,58 +1873,148 @@ void renderMapPage() {
   present();
 }
 
-// Table column origins, expressed against the panel width. The 480 design
-// used 2/34/132/184/244/280/354; those ratios are preserved.
-constexpr int COL_LOGO = W * 2 / 480;
-constexpr int COL_CALLSIGN = W * 34 / 480;
-constexpr int COL_MILES = W * 132 / 480;
-constexpr int COL_SOURCE = W * 184 / 480;
-constexpr int COL_DIR = W * 244 / 480;
-constexpr int COL_ALT = W * 280 / 480;
-constexpr int COL_ROUTE = W * 354 / 480;
+void drawVesselIcon(int x, int y, float course, uint16_t colour) {
+  const float a = radians(course - 90.0f);
+  const float cs = cosf(a), sn = sinf(a);
+  auto tx = [&](float px, float py) { return x + lroundf(px * cs - py * sn); };
+  auto ty = [&](float px, float py) { return y + lroundf(px * sn + py * cs); };
+  disc(x, y, 2, colour);
+  line(tx(9, 0), ty(9, 0), tx(-6, -4), ty(-6, -4), colour);
+  line(tx(9, 0), ty(9, 0), tx(-6, 4), ty(-6, 4), colour);
+  line(tx(-6, -4), ty(-6, -4), tx(-3, 0), ty(-3, 0), colour);
+  line(tx(-3, 0), ty(-3, 0), tx(-6, 4), ty(-6, 4), colour);
+}
+
+void renderMarinePage() {
+  restoreMap();
+  int plotted = 0;
+  for (int i = 0; i < vesselCount; ++i) {
+    VesselDisplay &vessel = latestVessels[i];
+    int x, y;
+    if (!mapPoint(vessel.latitude, vessel.longitude, x, y)) continue;
+    drawVesselIcon(x, y, vessel.courseOverGround, rgb(70, 200, 255));
+    ++plotted;
+  }
+  char count[28];
+  if (!marineTrackingEnabled) snprintf(count, sizeof(count), "MARINE TRACKING OFF");
+  else if (!marineConfigured()) snprintf(count, sizeof(count), "AIS NOT CONFIGURED");
+  else snprintf(count, sizeof(count), "%d SHIPS%s", plotted, aisConnected ? "" : " (OFFLINE)");
+  status(count, !marineConfigured() ? rgb(150,150,150) : aisConnected ? rgb(35,210,80) : rgb(220,60,60));
+  present();
+}
+
+// Table column origins, sized to the content they hold at the fixed scale-2
+// glyph width (12px/char) rather than scaled to the panel width - a wider
+// board should give its extra room to the ROUTE column, not stretch empty
+// gaps between narrow columns proportionally. Small columns get slightly
+// more even padding than the bare minimum so the row reads as a grid.
+constexpr int COL_LOGO = 2;
+constexpr int COL_CALLSIGN = 34;
+constexpr int COL_MILES = 150;
+constexpr int COL_SOURCE = 210;
+constexpr int COL_DIR = 240;
+constexpr int COL_ALT = 280;
+constexpr int COL_ROUTE = 350;
+
+const uint16_t ROW_BAND_DARK = rgb(6, 16, 28);
+const uint16_t ROW_BAND_LIGHT = rgb(14, 36, 58);
+
+// Picks the richest origin/destination representation that fits maxChars,
+// falling back from full airport names to city names to the departure-board
+// abbreviation to raw codes - so a wide panel shows full names while a
+// narrow one still gets something readable instead of clipped garbage.
+void buildRouteLabel(const RouteCacheEntry *route, char *output, size_t outSize, int maxChars) {
+  // No cache entry yet: this callsign hasn't reached the front of the
+  // (throttled, two-per-refresh) lookup queue. A resolved entry with
+  // hasRoute false means adsbdb was actually asked and had nothing - most
+  // often a private/GA registration with no scheduled route on file.
+  if (!route) { snprintf(output, outSize, "---"); return; }
+  if (!route->hasRoute) { snprintf(output, outSize, maxChars >= 8 ? "NO ROUTE" : "---"); return; }
+  struct Option { const char *origin; const char *destination; };
+  const Option options[] = {
+    {route->originName[0] ? route->originName : nullptr, route->destinationName[0] ? route->destinationName : nullptr},
+    {route->originCity[0] ? route->originCity : nullptr, route->destinationCity[0] ? route->destinationCity : nullptr},
+    {route->originAbbrev[0] ? route->originAbbrev : nullptr, route->destinationAbbrev[0] ? route->destinationAbbrev : nullptr},
+    {route->origin, route->destination},
+  };
+  for (const Option &opt : options) {
+    if (!opt.origin || !opt.destination) continue;
+    int len = static_cast<int>(strlen(opt.origin) + 1 + strlen(opt.destination));
+    if (len <= maxChars) { snprintf(output, outSize, "%s>%s", opt.origin, opt.destination); return; }
+  }
+  // Nothing fit - an extremely narrow panel. Show the codes and let the
+  // panel edge clip them rather than show nothing.
+  snprintf(output, outSize, "%s>%s", route->origin, route->destination);
+}
 
 void renderTablePage() {
   filledRect(0,0,W,H,rgb(2,10,18));
-  // Columns are fractions of the panel width so the 800px board spreads the
-  // table out instead of crowding it into the leftmost 480px.
   text5(layout::centreX - 96,7,"NEAREST AIRCRAFT",rgb(80,220,255),2);
   text5(COL_LOGO,31,"LOGO",rgb(170,190,205));
   text5(COL_CALLSIGN,31,"CALLSIGN",rgb(170,190,205));
   text5(COL_MILES,31,"MILES",rgb(170,190,205));
-  text5(COL_SOURCE,31,"SOURCE",rgb(170,190,205));
+  text5(COL_SOURCE,31,"S",rgb(170,190,205));
   text5(COL_DIR,31,"DIR",rgb(170,190,205));
   text5(COL_ALT,31,"ALT FT",rgb(170,190,205));
   text5(COL_ROUTE,31,"FROM TO",rgb(170,190,205));
   line(3,41,W - 4,41,rgb(55,85,105));
 
-  int rows = min(lastCount, 10);
+  // Clamped here (not just where the scroll gesture changes it) because
+  // lastCount shrinks on every fetch as aircraft leave range, which can
+  // strand the offset past the end of a now-shorter list.
+  tableScrollOffset = constrain(tableScrollOffset, 0, max(0, lastCount - TABLE_VISIBLE_ROWS));
+  const int rows = min(lastCount - tableScrollOffset, TABLE_VISIBLE_ROWS);
   for (int i=0; i<rows; ++i) {
-    AircraftDisplay &display = latestAircraft[i];
+    AircraftDisplay &display = latestAircraft[tableScrollOffset + i];
     int y=49+i*40;
-    char distance[6], altitude[7], routeLabel[11];
+    filledRect(0, y-7, W, 40, (i & 1) ? ROW_BAND_LIGHT : ROW_BAND_DARK);
+    char distance[6], altitude[7], routeLabel[84];
     snprintf(distance,sizeof(distance),"%d",static_cast<int>(lroundf(display.distanceMiles)));
     if (display.altitudeFt >= 0) snprintf(altitude,sizeof(altitude),"%d",display.altitudeFt);
     else strcpy(altitude,"--");
-    RouteCacheEntry *route=cachedRoute(display.flight);
-    if (route && route->hasRoute) snprintf(routeLabel,sizeof(routeLabel),"%s>%s",route->origin,route->destination);
-    else strcpy(routeLabel,"---");
     const char *identity=display.flight[0] ? display.flight : display.hex;
-    if (display.positionSource == 2) drawMlatPlane(16,y+7,display.track);
+    const bool isMlat = display.positionSource == 2;
+    // MLAT-derived aircraft never get a route lookup (fetchAircraft/
+    // fetchAdsbV2Aircraft skip them - it's a multilateration estimate, not a
+    // real callsign an ADS-B route API would recognise), so cachedRoute()
+    // for one is always empty. Say why instead of showing "---", which reads
+    // as a lookup that's still pending or failed.
+    if (isMlat) {
+      strncpy(routeLabel, "MLAT TRIANGULATION", sizeof(routeLabel) - 1);
+      routeLabel[sizeof(routeLabel) - 1] = 0;
+    } else {
+      RouteCacheEntry *route=cachedRoute(display.flight);
+      // Drawn at scale 1 below (6px/char), not the scale-2 used elsewhere in
+      // this row - full airport names need roughly double the char budget
+      // scale 2 would allow in this column's width.
+      const int routeMaxChars = (W - 4 - COL_ROUTE) / 6;
+      buildRouteLabel(route, routeLabel, sizeof(routeLabel), routeMaxChars);
+    }
+    if (isMlat) drawMlatPlane(16,y+7,display.track);
     else drawOperatorBadge(16,y+7,display.flight,display.hex);
-    text5(COL_CALLSIGN,y,identity,rgb(255,255,255),2);
-    text5(COL_MILES,y,distance,rgb(255,220,80),2);
-    text5(COL_SOURCE,y,display.positionSource==2 ? "MLAT" : "ADSB",display.positionSource==2 ? rgb(255,65,65) : rgb(60,220,130),2);
+    text5(COL_CALLSIGN,y,identity,rgb(255,220,60),2);
+    // Registration (tail number) is the airframe's fixed ID, distinct from
+    // the callsign above it which can vary flight to flight (e.g. QTR74X
+    // flown by A7-AOA, or a squadron callsign like REDARROW on XX221).
+    // Scale 1 is a 5x7px glyph - legible in an 800px-wide route label but too
+    // small to read as text at normal viewing distance; it reads as a row of
+    // dots instead. Scale 2 matches the callsign line above it and still
+    // clears the row band (40px tall) with room to spare.
+    if (display.registration[0]) text5(COL_CALLSIGN,y+16,display.registration,rgb(150,180,200),2);
+    text5(COL_MILES,y,distance,rgb(255,255,255),2);
+    text5(COL_SOURCE,y,isMlat ? "M" : "A",isMlat ? rgb(255,65,65) : rgb(60,220,130),2);
     text5(COL_DIR,y,compassDirection(display.track),rgb(255,255,255),2);
     text5(COL_ALT,y,altitude,rgb(255,255,255),2);
-    text5(COL_ROUTE,y,routeLabel,rgb(130,210,255),2);
-    line(3,y+25,W - 4,y+25,rgb(25,45,60));
+    text5(COL_ROUTE,y+4,routeLabel,rgb(255,255,255));
   }
-  char footer[24];
+  char footer[36];
+  const char *scrollHint = (lastCount > TABLE_VISIBLE_ROWS) ? " - SWIPE UP/DOWN" : "";
+  const int rangeStart = rows > 0 ? tableScrollOffset + 1 : 0;
   if (creditsRemaining >= 0)
-    snprintf(footer,sizeof(footer),"%d AIRCRAFT  C%ld",lastCount,creditsRemaining);
+    snprintf(footer,sizeof(footer),"%d-%d OF %d  C%ld%s",rangeStart,tableScrollOffset+rows,lastCount,creditsRemaining,scrollHint);
   else
-    snprintf(footer,sizeof(footer),"%d AIRCRAFT",lastCount);
-  text5(layout::centreX - 70,layout::footerY,footer,rgb(130,160,180));
+    snprintf(footer,sizeof(footer),"%d-%d OF %d%s",rangeStart,tableScrollOffset+rows,lastCount,scrollHint);
+  text5(layout::centreX - 110,layout::footerY,footer,rgb(130,160,180));
   present();
 }
 
@@ -1438,6 +2065,7 @@ void renderRadarPage() {
   }
 
   int plotted = 0;
+  iconHitCount = 0;
   for (int i = 0; i < lastCount; ++i) {
     AircraftDisplay &aircraft = latestAircraft[i];
     if (!isfinite(aircraft.latitude) || !isfinite(aircraft.longitude)) continue;
@@ -1449,10 +2077,10 @@ void renderRadarPage() {
     const int y = centreY + lroundf(sinf(bearing) * radius);
     if (outside) {
       disc(x, y, 3, rgb(255, 65, 65));
-    } else if (aircraft.positionSource == 2) {
-      drawMlatPlane(x, y, aircraft.track);
     } else {
-      drawAdsbLogo(x, y, aircraft.track, aircraft.flight, aircraft.hex);
+      drawAircraftIcon(x, y, aircraft.track, aircraft.flight, aircraft.hex,
+                        aircraft.category, aircraft.positionSource == 2);
+      recordIconHit(x, y, i);
     }
     if (outside) continue;
     if (plotted < 10) {
@@ -1472,10 +2100,70 @@ void renderRadarPage() {
   present();
 }
 
+// A tap that hits a plotted aircraft icon (Overview/Map/Radar) shows this
+// instead of advancing the page, giving the touchscreen the same
+// "tap a marker for full detail" behaviour the browser map already has.
+void renderAircraftDetailCard(int aircraftIndex) {
+  if (aircraftIndex < 0 || aircraftIndex >= lastCount) return;
+  AircraftDisplay &a = latestAircraft[aircraftIndex];
+  const int cardW = min(360, W - 16);
+  const int cardH = min(230, H - 16);
+  const int cx = (W - cardW) / 2, cy = (H - cardH) / 2;
+  const uint16_t frame = rgb(80, 220, 255);
+  filledRect(cx, cy, cardW, cardH, rgb(4, 12, 20));
+  filledRect(cx, cy, cardW, 2, frame);
+  filledRect(cx, cy + cardH - 2, cardW, 2, frame);
+  filledRect(cx, cy, 2, cardH, frame);
+  filledRect(cx + cardW - 2, cy, 2, cardH, frame);
+
+  const char *identity = a.flight[0] ? a.flight : a.hex;
+  text5(cx + 10, cy + 9, identity, rgb(255, 220, 60), 2);
+  const bool isMlat = a.positionSource == 2;
+  text5(cx + cardW - 66, cy + 12, isMlat ? "MLAT" : "ADS-B",
+        isMlat ? rgb(255, 65, 65) : rgb(60, 220, 130));
+
+  int row = cy + 30;
+  const int lineHeight = 12;
+  auto line5 = [&](const char *text, uint16_t colour) {
+    text5(cx + 10, row, text, colour);
+    row += lineHeight;
+  };
+  char buf[64];
+  line5(a.operatorName[0] ? a.operatorName : "Unknown operator", rgb(190, 220, 240));
+  snprintf(buf, sizeof(buf), "REG %s  HEX %s  %s", a.registration[0] ? a.registration : "--",
+           a.hex, a.aircraftType[0] ? a.aircraftType : "TYPE UNKNOWN");
+  line5(buf, rgb(200, 210, 220));
+  if (a.altitudeFt >= 0)
+    snprintf(buf, sizeof(buf), "ALT %d FT  V/S %+d FPM", a.altitudeFt, static_cast<int>(lroundf(a.verticalRateFpm)));
+  else
+    snprintf(buf, sizeof(buf), "ALT --  V/S %+d FPM", static_cast<int>(lroundf(a.verticalRateFpm)));
+  line5(buf, rgb(255, 255, 255));
+  snprintf(buf, sizeof(buf), "SPD %d KT  HDG %03d %s", static_cast<int>(lroundf(a.speedKnots)),
+           ((static_cast<int>(a.track) % 360) + 360) % 360, compassDirection(a.track));
+  line5(buf, rgb(255, 255, 255));
+  snprintf(buf, sizeof(buf), "DIST %d MI  SQUAWK %s  CAT %s", static_cast<int>(lroundf(a.distanceMiles)),
+           a.squawk[0] ? a.squawk : "--", a.category[0] ? a.category : "--");
+  line5(buf, rgb(255, 255, 255));
+  snprintf(buf, sizeof(buf), "LAT %.4f  LON %.4f", a.latitude, a.longitude);
+  line5(buf, rgb(255, 255, 255));
+  RouteCacheEntry *route = cachedRoute(a.flight);
+  char routeLabel[40];
+  buildRouteLabel(route, routeLabel, sizeof(routeLabel), (cardW - 20) / 6);
+  snprintf(buf, sizeof(buf), "ROUTE %s", routeLabel);
+  line5(buf, rgb(130, 210, 255));
+  if (a.emergency[0] && strcmp(a.emergency, "none")) {
+    snprintf(buf, sizeof(buf), "EMERGENCY: %s", a.emergency);
+    line5(buf, rgb(255, 65, 65));
+  }
+  text5(cx + 10, cy + cardH - 13, "TAP ANYWHERE TO CLOSE", rgb(130, 160, 180));
+  present();
+}
+
 const char *displayPageName() {
   if (displayPage == DisplayPage::Overview) return "overview";
   if (displayPage == DisplayPage::Table) return "table";
   if (displayPage == DisplayPage::Radar) return "radar";
+  if (displayPage == DisplayPage::Marine) return "marine";
   return "map";
 }
 
@@ -1483,6 +2171,7 @@ void renderCurrentPage() {
   if (displayPage == DisplayPage::Overview) renderOverviewPage();
   else if (displayPage == DisplayPage::Table) renderTablePage();
   else if (displayPage == DisplayPage::Radar) renderRadarPage();
+  else if (displayPage == DisplayPage::Marine) renderMarinePage();
   else renderMapPage();
 }
 
@@ -1519,11 +2208,38 @@ void sortAircraftByDistance() {
 }
 
 void fetchAdsbV2Aircraft() {
+  logHeapDiagnostics("fetch-start");
+  // Provider terms, checked directly against each provider's own published
+  // docs (also summarised for the user in web_ui.h's providerNotes):
+  // - adsb.fi (github.com/adsbfi/opendata): personal, non-commercial use
+  //   only; no reselling/redistributing the data; 1 req/s. A single device
+  //   run by its owner for their own display is fine. A commercial backend
+  //   aggregating this feed for many customers is exactly what these terms
+  //   prohibit without adsb.fi's separate written permission.
+  // - airplanes.live: blocks cloud/datacenter source IPs outright and asks
+  //   that anything beyond personal use go through contact@airplanes.live
+  //   first (confirmed firsthand - this project's own aggregator VPS got
+  //   blocked with that exact message).
+  // - adsb.lol (github.com/adsblol/api): no non-commercial restriction
+  //   found; BSD-3-Clause. Docs say a future API key will be earned by
+  //   feeding adsb.lol, but none is required yet.
+  // None of this blocks a single hobbyist device querying a provider
+  // directly for itself - it only matters for a shared backend serving many
+  // devices, which is a decision for whatever fetches on the backend's
+  // behalf, not this per-device code path.
   String url;
   const String latitude = String(homeLatitude, 5);
   const String longitude = String(homeLongitude, 5);
   const String radius = String(queryRadiusNm);
-  if (apiProvider == "adsbfi") {
+  if (apiProvider == "aggregator") {
+    // Our own backend: polls adsb.fi/airplanes.live/adsb.lol centrally on a
+    // shared cache and dedupes by ICAO hex, so many devices share one set
+    // of upstream connections instead of each hitting the public APIs
+    // directly - see the provider-terms comment above for why that matters
+    // at more than a handful of devices. Same {"ac": [...]} response shape
+    // as every other provider here, so no parsing changes needed.
+    url = "https://adsb.2e0lxy.uk/v1/aircraft?lat=" + latitude + "&lon=" + longitude + "&radius=" + radius;
+  } else if (apiProvider == "adsbfi") {
     url = "https://opendata.adsb.fi/api/v3/lat/" + latitude + "/lon/" + longitude + "/dist/" + radius;
   } else if (apiProvider == "airplaneslive") {
     url = "https://api.airplanes.live/v2/point/" + latitude + "/" + longitude + "/" + radius;
@@ -1554,7 +2270,21 @@ void fetchAdsbV2Aircraft() {
   WiFiClientSecure client;
   applyTlsPolicy(client);
   HTTPClient http;
-  http.setTimeout(9000);
+  // HTTPClient::setTimeout(), called here before http.begin() ever connects,
+  // is a no-op on this arduino-esp32 version: it only forwards to the live
+  // socket once connected() is already true, and even then it lands on
+  // Stream::setTimeout() - a member NetworkClientSecure's SO_RCVTIMEO/
+  // SO_SNDTIMEO logic never reads. That logic is instead keyed off
+  // NetworkClient's own _timeout, which only gets set once, inside
+  // connect(), from HTTPClient's separate _connectTimeout (default 5000ms,
+  // never previously set here). So every read on this socket has always
+  // been bounded by an unconfigured 5s default rather than the timeout this
+  // file believed it was setting. setConnectTimeout() below is what actually
+  // reaches that value. Confirmed independent of provider (adsb.fi and
+  // airplanes.live both hit the same watchdog abort mid-read), so this
+  // closes a real gap even though it may not be the sole cause of a stall
+  // long enough to still trip the 60s watchdog.
+  http.setTimeout(9000); http.setConnectTimeout(9000);
   if (!http.begin(client, url)) {
     finishFeedAttempt("Connection failed");
     status("API", rgb(245,30,35));
@@ -1595,7 +2325,18 @@ void fetchAdsbV2Aircraft() {
   for (const char *field : fields) aircraftFilter[field] = true;
   JsonDocument doc(&psramJsonAllocator);
   PsramSink body;
+  // See the activeFetchClient/activeFetchDeadlineMs comment above
+  // feedStatus's declaration: this is the one call in the whole file
+  // confirmed to have caused every watchdog reboot logged so far, so it's
+  // the one wrapped in the external force-stop deadline.
+  activeFetchLastSeenSize = 0;
+  activeFetchBody = &body;
+  activeFetchStartedMs = millis();
+  activeFetchDeadlineMs = activeFetchStartedMs + 15000UL;
+  activeFetchClient = &client;
   http.writeToStream(&body);
+  activeFetchClient = nullptr;
+  activeFetchBody = nullptr;
   const DeserializationError error = deserializeJson(
       doc, body.data(), body.size(), DeserializationOption::Filter(filter));
   http.end();
@@ -1659,12 +2400,6 @@ void fetchAdsbV2Aircraft() {
   }
   sortAircraftByDistance();
   int routeLookups = 0;
-  {
-  WiFiClientSecure routeClient;
-  applyTlsPolicy(routeClient);
-  HTTPClient routeHttp;
-  routeHttp.setReuse(true);
-  routeHttp.setTimeout(6000);
   for (int i = 0; i < lastCount; ++i) {
     AircraftDisplay &display = latestAircraft[i];
     if (display.positionSource == 2) ++lastMlat;
@@ -1673,12 +2408,36 @@ void fetchAdsbV2Aircraft() {
       // single-threaded web server. Service pending admin requests around it
       // so the browser does not fill the listen backlog and get RST.
       if (webServerReady) webServer.handleClient();
+      // Nudges the panel to resync mid-loop against PSRAM-DMA starvation -
+      // see the tile-rebuild loop's comment on restartAtNextVsync() above.
+      rgbpanel->restartAtNextVsync();
+      // A prior version kept one keep-alive connection open across every
+      // lookup in this loop (HTTPClient::setReuse(true)) to save handshakes.
+      // Every watchdog reboot logged after switching provider away from
+      // adsb.fi traced back to a hang on the very next fetch cycle's own,
+      // completely unrelated connection - always right after this loop had
+      // run - and persisted even after explicitly stop()-ing the reused
+      // connection at the end of the batch. Whatever state that reuse left
+      // behind, closing it afterwards wasn't enough to undo it. Falling back
+      // to one fresh connection per lookup, the same pattern every other
+      // HTTPS call in this file already uses without issue, trades a little
+      // latency for not touching whatever that reuse path corrupts.
+      WiFiClientSecure routeClient;
+      applyTlsPolicy(routeClient);
+      HTTPClient routeHttp;
+      routeHttp.setTimeout(6000);
+      routeHttp.setConnectTimeout(6000);
       routeForCallsign(display.flight, routeLookups, routeClient, routeHttp);
+      routeHttp.end();
+      routeClient.stop();
       if (webServerReady) webServer.handleClient();
+      // Nudges the panel to resync mid-loop against PSRAM-DMA starvation -
+      // see the tile-rebuild loop's comment on restartAtNextVsync() above.
+      rgbpanel->restartAtNextVsync();
     }
   }
-  routeHttp.end();
-  }
+  logHeapDiagnostics("fetch-end");
+  if (routeLookups > 0) saveRouteCacheToStorage();
   if (aircraftAtZeroMiles) beepAlert();
   lastFetchCompletedAt = millis();
   finishFeedAttempt("OK", responseCode);
@@ -1687,6 +2446,7 @@ void fetchAdsbV2Aircraft() {
 }
 
 void fetchAircraft() {
+  logHeapDiagnostics("fetch-start");
   const bool retriedAuth = openSkyAuthRetryPending;
   openSkyAuthRetryPending = false;
   feedRequestStartedAt = millis();
@@ -1710,7 +2470,7 @@ void fetchAircraft() {
   // the optional per-callsign HTTPS route lookups.
   {
   WiFiClientSecure client; applyTlsPolicy(client);
-  HTTPClient http; http.setTimeout(7000);
+  HTTPClient http; http.setTimeout(7000); http.setConnectTimeout(7000);
   const float latDelta = queryRadiusNm / 60.0f;
   const float lonDelta = queryRadiusNm / max(1.0f, 60.0f * cosf(radians(homeLatitude)));
   const String statesUrl = "https://opensky-network.org/api/states/all?lamin=" +
@@ -1808,24 +2568,42 @@ void fetchAircraft() {
   doc.clear();
   }
   int routeLookups = 0;
-  {
-  WiFiClientSecure routeClient;
-  applyTlsPolicy(routeClient);
-  HTTPClient routeHttp;
-  routeHttp.setReuse(true);
-  routeHttp.setTimeout(6000);
   for (int i=0; i<lastCount; ++i) {
     AircraftDisplay &display = latestAircraft[i];
     if (display.positionSource == 2) {
       ++lastMlat;
     } else {
       if (webServerReady) webServer.handleClient();
+      // Nudges the panel to resync mid-loop against PSRAM-DMA starvation -
+      // see the tile-rebuild loop's comment on restartAtNextVsync() above.
+      rgbpanel->restartAtNextVsync();
+      // A prior version kept one keep-alive connection open across every
+      // lookup in this loop (HTTPClient::setReuse(true)) to save handshakes.
+      // Every watchdog reboot logged after switching provider away from
+      // adsb.fi traced back to a hang on the very next fetch cycle's own,
+      // completely unrelated connection - always right after this loop had
+      // run - and persisted even after explicitly stop()-ing the reused
+      // connection at the end of the batch. Whatever state that reuse left
+      // behind, closing it afterwards wasn't enough to undo it. Falling back
+      // to one fresh connection per lookup, the same pattern every other
+      // HTTPS call in this file already uses without issue, trades a little
+      // latency for not touching whatever that reuse path corrupts.
+      WiFiClientSecure routeClient;
+      applyTlsPolicy(routeClient);
+      HTTPClient routeHttp;
+      routeHttp.setTimeout(6000);
+      routeHttp.setConnectTimeout(6000);
       routeForCallsign(display.flight, routeLookups, routeClient, routeHttp);
+      routeHttp.end();
+      routeClient.stop();
       if (webServerReady) webServer.handleClient();
+      // Nudges the panel to resync mid-loop against PSRAM-DMA starvation -
+      // see the tile-rebuild loop's comment on restartAtNextVsync() above.
+      rgbpanel->restartAtNextVsync();
     }
   }
-  routeHttp.end();
-  }
+  logHeapDiagnostics("fetch-end");
+  if (routeLookups > 0) saveRouteCacheToStorage();
   if (aircraftAtZeroMiles) beepAlert();
   lastFetchCompletedAt = millis();
   finishFeedAttempt("OK", HTTP_CODE_OK);
@@ -1866,7 +2644,7 @@ String fetchPublishedSha256(const String &url, const String &wantedName) {
   WiFiClientSecure client;
   applyTlsPolicy(client);
   HTTPClient http;
-  http.setTimeout(12000);
+  http.setTimeout(12000); http.setConnectTimeout(12000);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   if (!http.begin(client, url)) return "";
   http.addHeader("User-Agent", userAgent());
@@ -1906,7 +2684,7 @@ bool checkGithubUpdate() {
   WiFiClientSecure client;
   applyTlsPolicy(client);
   HTTPClient http;
-  http.setTimeout(12000);
+  http.setTimeout(12000); http.setConnectTimeout(12000);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   if (!http.begin(client, GITHUB_RELEASE_API)) {
     githubUpdateStatus = "GitHub connection failed";
@@ -1988,7 +2766,7 @@ bool downloadGithubUpdateToSd() {
   WiFiClientSecure client;
   applyTlsPolicy(client);
   HTTPClient http;
-  http.setTimeout(15000);
+  http.setTimeout(15000); http.setConnectTimeout(15000);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   if (!http.begin(client, githubFirmwareUrl)) {
     file.close();
@@ -2138,7 +2916,7 @@ bool installGithubUpdate() {
   WiFiClientSecure client;
   applyTlsPolicy(client);
   HTTPClient http;
-  http.setTimeout(15000);
+  http.setTimeout(15000); http.setConnectTimeout(15000);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   if (!http.begin(client, githubFirmwareUrl)) {
     githubUpdateStatus = "Firmware download failed";
@@ -2306,6 +3084,19 @@ void handleStatusApi() {
   doc["temperatureC"] = temperatureRead();
   doc["aircraftCapacity"] = MAX_AIRCRAFT;
   doc["aircraftStorage"] = "PSRAM";
+  doc["marineTrackingEnabled"] = marineTrackingEnabled;
+  doc["marineProvider"] = marineProvider;
+  doc["aisConfigured"] = marineConfigured();
+  doc["hasAisApiKey"] = aisApiKey.length() > 0;
+  doc["hasAisHubUsername"] = aisHubUsername.length() > 0;
+  doc["hasMyShipTrackingApiKey"] = myShipTrackingApiKey.length() > 0;
+  doc["hasDatalasticApiKey"] = datalasticApiKey.length() > 0;
+  doc["aisConnected"] = aisConnected;
+  doc["vesselCount"] = vesselCount;
+  doc["vesselCapacity"] = MAX_VESSELS;
+  doc["marineRadiusNm"] = marineRadiusNm;
+  doc["aisLastMessageSeconds"] = aisLastMessageAt ?
+      static_cast<int32_t>((millis() - aisLastMessageAt) / 1000UL) : -1;
   doc["sdMounted"] = sdMounted;
   doc["sdStatus"] = sdStatus;
   doc["sdType"] = sdCardType;
@@ -2364,8 +3155,14 @@ void handleAircraftApi() {
     item["messages"] = display.messages;
     item["signal"] = display.signalDb;
     RouteCacheEntry *route = cachedRoute(display.flight);
-    if (route && route->hasRoute) item["route"] = String(route->origin) + ">" + route->destination;
-    else item["route"] = "";
+    if (route && route->hasRoute) {
+      item["route"] = String(route->origin) + ">" + route->destination;
+      item["routeFull"] = String(route->originName[0] ? route->originName : route->origin) +
+                           " -> " + (route->destinationName[0] ? route->destinationName : route->destination);
+    } else {
+      item["route"] = "";
+      item["routeFull"] = "";
+    }
   }
   sendJsonDocument(200, doc);
 }
@@ -2450,18 +3247,20 @@ void handlePageControl() {
   if (!requireWebAuthentication()) return;
   if (!requireCsrfToken()) return;
   const String page = webServer.arg("page");
-  if (page != "overview" && page != "map" && page != "table" && page != "radar") {
-    sendMessage(400, "Page must be overview, map, radar or table");
+  if (page != "overview" && page != "map" && page != "table" && page != "radar" && page != "marine") {
+    sendMessage(400, "Page must be overview, map, radar, table or marine");
     return;
   }
   displayPage = page == "overview" ? DisplayPage::Overview :
                 page == "table" ? DisplayPage::Table :
-                page == "radar" ? DisplayPage::Radar : DisplayPage::Map;
+                page == "radar" ? DisplayPage::Radar :
+                page == "marine" ? DisplayPage::Marine : DisplayPage::Map;
   settingsStore.putUChar("display-page", static_cast<uint8_t>(displayPage));
-  renderCurrentPage();
+  { MutexGuard guard(dataMutex); renderCurrentPage(); }
   if (displayPage == DisplayPage::Overview) sendMessage(200, "Overview page selected");
   else if (displayPage == DisplayPage::Table) sendMessage(200, "Table page selected");
   else if (displayPage == DisplayPage::Radar) sendMessage(200, "Radar page selected");
+  else if (displayPage == DisplayPage::Marine) sendMessage(200, "Marine page selected");
   else sendMessage(200, "Map page selected");
 }
 
@@ -2580,7 +3379,8 @@ void handleProviderSettings() {
   const String provider = webServer.arg("provider");
   if (provider != "opensky" && provider != "adsbfi" &&
       provider != "airplaneslive" && provider != "adsblol" &&
-      provider != "adsbone" && provider != "adsbx") {
+      provider != "adsbone" && provider != "adsbx" &&
+      provider != "aggregator") {
     sendMessage(400, "Unknown aircraft data provider");
     return;
   }
@@ -2617,6 +3417,85 @@ void handleProviderSettings() {
   tokenExpiresAt = 0;
   nextFetchAt = 0;
   sendMessage(200, "Aircraft data provider settings saved");
+}
+
+void handleMarineCredentials() {
+  if (!requireWebAuthentication()) return;
+  if (!requireCsrfToken()) return;
+  const String provider = webServer.hasArg("provider") ? webServer.arg("provider") : marineProvider;
+  if (provider != "aisstream" && provider != "aishub" &&
+      provider != "myshiptracking" && provider != "datalastic") {
+    sendMessage(400, "Unknown marine data provider");
+    return;
+  }
+  if (webServer.arg("credential").length() > 128) {
+    sendMessage(400, "Marine credential is too long");
+    return;
+  }
+  String *credentialField = provider == "aishub" ? &aisHubUsername :
+                             provider == "myshiptracking" ? &myShipTrackingApiKey :
+                             provider == "datalastic" ? &datalasticApiKey : &aisApiKey;
+  const char *storeKey = provider == "aishub" ? "aishub-user" :
+                         provider == "myshiptracking" ? "mst-key" :
+                         provider == "datalastic" ? "datalastic-key" : "ais-key";
+  if (webServer.arg("clear") == "1") {
+    *credentialField = "";
+    settingsStore.putString(storeKey, "");
+  } else if (webServer.hasArg("credential") && webServer.arg("credential").length()) {
+    *credentialField = webServer.arg("credential");
+    settingsStore.putString(storeKey, *credentialField);
+  }
+  if (webServer.hasArg("radius")) {
+    const long radius = webServer.arg("radius").toInt();
+    if (radius < 5 || radius > 250) {
+      sendMessage(400, "Marine radius must be 5 to 250 nautical miles");
+      return;
+    }
+    marineRadiusNm = static_cast<uint16_t>(radius);
+    settingsStore.putUShort("marine-radius", marineRadiusNm);
+  }
+  marineProvider = provider;
+  settingsStore.putString("marine-provider", marineProvider);
+  if (webServer.hasArg("enabled")) {
+    marineTrackingEnabled = webServer.arg("enabled") == "1";
+    settingsStore.putBool("marine-enabled", marineTrackingEnabled);
+    // Mutually exclusive with the aircraft feed: switching this on should
+    // stop competing with it for the same TLS/heap budget, and switching it
+    // off should let the aircraft feed resume immediately rather than wait
+    // out whatever fetch interval was already in flight.
+    if (!marineTrackingEnabled) nextFetchAt = 0;
+  }
+  // Any provider, key, radius, or enabled change needs a clean slate: the
+  // old vessels came from a different source/area/state and would
+  // otherwise linger stale on the map until MARINE_STALE_MS drops them.
+  aisWebSocket.disconnect();
+  aisConnected = false;
+  vesselCount = 0;
+  nextMarineFetchAt = 0;
+  if (marineTrackingEnabled && marineProvider == "aisstream" && aisApiKey.length()) connectAisWebSocket();
+  sendMessage(200, "Marine settings saved");
+}
+
+void handleMarineVessels() {
+  if (!requireWebAuthentication()) return;
+  JsonDocument doc(&psramJsonAllocator);
+  JsonArray vessels = doc["vessels"].to<JsonArray>();
+  for (int i = 0; i < vesselCount; ++i) {
+    VesselDisplay &vessel = latestVessels[i];
+    JsonObject item = vessels.add<JsonObject>();
+    item["mmsi"] = vessel.mmsi;
+    item["name"] = vessel.name[0] ? vessel.name : String(vessel.mmsi);
+    item["latitude"] = vessel.latitude;
+    item["longitude"] = vessel.longitude;
+    item["speed"] = roundf(vessel.speedKnots * 10.0f) / 10.0f;
+    item["course"] = roundf(vessel.courseOverGround * 10.0f) / 10.0f;
+    item["heading"] = vessel.heading;
+    item["distance"] = roundf(vessel.distanceMiles * 10.0f) / 10.0f;
+    item["navStatus"] = vessel.navStatus[0] ? vessel.navStatus : "UNKNOWN";
+    item["shipType"] = vessel.shipType[0] ? vessel.shipType : "UNKNOWN";
+    item["age"] = roundf((millis() - vessel.lastUpdateMs) / 100.0f) / 10.0f;
+  }
+  sendJsonDocument(200, doc);
 }
 
 void handleFirmwareUpload() {
@@ -2748,6 +3627,8 @@ void beginWebControl() {
     webServer.on("/api/wifi/connect", HTTP_POST, handleWifiConnect);
     webServer.on("/api/password", HTTP_POST, handlePasswordChange);
     webServer.on("/api/provider", HTTP_POST, handleProviderSettings);
+    webServer.on("/api/marine/credentials", HTTP_POST, handleMarineCredentials);
+    webServer.on("/api/marine/vessels", HTTP_GET, handleMarineVessels);
     webServer.on("/api/firmware", HTTP_POST, handleFirmwareResult, handleFirmwareUpload);
     webServer.on("/api/reboot", HTTP_POST, []() {
       if (!requireWebAuthentication()) return;
@@ -2778,17 +3659,538 @@ void beginWebControl() {
   Serial.printf("Web control: http://%s/ or http://%s.local/\n",
                 WiFi.localIP().toString().c_str(), DEVICE_HOSTNAME);
 }
+
+// AIS ship-type codes are a large ITU-defined table; this groups the ranges
+// that matter for a receiver display rather than reproducing it in full.
+const char *shipTypeName(int type) {
+  if (type == 30) return "FISHING";
+  if (type == 36 || type == 37) return "PLEASURE/SAIL";
+  if (type >= 40 && type <= 49) return "HIGH SPEED";
+  if (type == 50) return "PILOT";
+  if (type == 51) return "SAR";
+  if (type == 52) return "TUG";
+  if (type >= 60 && type <= 69) return "PASSENGER";
+  if (type >= 70 && type <= 79) return "CARGO";
+  if (type >= 80 && type <= 89) return "TANKER";
+  if (type >= 90 && type <= 99) return "OTHER";
+  return "UNKNOWN";
+}
+
+const char *navStatusName(int status) {
+  switch (status) {
+    case 0: return "UNDERWAY";
+    case 1: return "AT ANCHOR";
+    case 2: return "NOT UNDER CMD";
+    case 3: return "RESTRICTED MANOEUVRE";
+    case 4: return "CONSTRAINED DRAUGHT";
+    case 5: return "MOORED";
+    case 6: return "AGROUND";
+    case 7: return "FISHING";
+    case 8: return "SAILING";
+    case 14: return "AIS-SART";
+    default: return "UNKNOWN";
+  }
+}
+
+VesselDisplay *findOrCreateVessel(uint32_t mmsi) {
+  for (int i = 0; i < vesselCount; ++i) {
+    if (latestVessels[i].mmsi == mmsi) return &latestVessels[i];
+  }
+  VesselDisplay *slot;
+  if (vesselCount < MAX_VESSELS) {
+    slot = &latestVessels[vesselCount++];
+  } else {
+    // Full: evict the longest-untouched vessel rather than dropping this one.
+    slot = &latestVessels[0];
+    for (int i = 1; i < vesselCount; ++i)
+      if (latestVessels[i].lastUpdateMs < slot->lastUpdateMs) slot = &latestVessels[i];
+  }
+  memset(slot, 0, sizeof(*slot));
+  slot->mmsi = mmsi;
+  slot->heading = -1;
+  return slot;
+}
+
+void pruneStaleVessels() {
+  const uint32_t now = millis();
+  int kept = 0;
+  for (int i = 0; i < vesselCount; ++i) {
+    if (now - latestVessels[i].lastUpdateMs <= MARINE_STALE_MS) {
+      if (kept != i) latestVessels[kept] = latestVessels[i];
+      ++kept;
+    }
+  }
+  vesselCount = kept;
+}
+
+bool marineDataDirty = false;
+
+// Shared by every REST provider below: writes name/type/nav-status text
+// fields and marks the vessel touched, so each fetch function only has to
+// pull its provider-specific field names into these common slots.
+void applyVesselTextFields(VesselDisplay *vessel, const char *name, int shipType, int navStatus) {
+  if (name && name[0]) {
+    strncpy(vessel->name, name, sizeof(vessel->name) - 1);
+    vessel->name[sizeof(vessel->name) - 1] = 0;
+  }
+  const char *typeName = shipTypeName(shipType);
+  strncpy(vessel->shipType, typeName, sizeof(vessel->shipType) - 1);
+  vessel->shipType[sizeof(vessel->shipType) - 1] = 0;
+  const char *statusName = navStatusName(navStatus);
+  strncpy(vessel->navStatus, statusName, sizeof(vessel->navStatus) - 1);
+  vessel->navStatus[sizeof(vessel->navStatus) - 1] = 0;
+}
+
+void applyVesselPosition(VesselDisplay *vessel, double lat, double lon) {
+  if (lat == 0.0 && lon == 0.0) return;
+  vessel->latitude = lat;
+  vessel->longitude = lon;
+  vessel->distanceMiles = distanceMilesFromHome(lat, lon);
+}
+
+// data.aishub.net: https://www.aishub.net/api - a member-contributed AIS
+// exchange. Requires an AISHub account that shares your own receiver's data
+// with their network; the username alone (without a contributing receiver)
+// may return no data. Do not query more than once a minute - AISHub's
+// service returns nothing if called more frequently.
+void fetchAisHubVessels() {
+  if (!aisHubUsername.length()) return;
+  const double latRadius = marineRadiusNm / 60.0;
+  const double lonRadius = marineRadiusNm / (60.0 * max(0.1, cos(radians(homeLatitude))));
+  const String url = "https://data.aishub.net/ws.php?username=" + aisHubUsername +
+      "&format=1&output=json&compress=0" +
+      "&latmin=" + String(homeLatitude - latRadius, 5) +
+      "&latmax=" + String(homeLatitude + latRadius, 5) +
+      "&lonmin=" + String(homeLongitude - lonRadius, 5) +
+      "&lonmax=" + String(homeLongitude + lonRadius, 5);
+  WiFiClientSecure client;
+  applyTlsPolicy(client);
+  HTTPClient http;
+  http.setTimeout(9000); http.setConnectTimeout(9000);
+  if (!http.begin(client, url)) return;
+  http.addHeader("User-Agent", userAgent());
+  const int code = http.GET();
+  if (code == HTTP_CODE_OK) {
+    JsonDocument doc(&psramJsonAllocator);
+    PsramSink body;
+    http.writeToStream(&body);
+    // AISHub's own success envelope is a 2-element array: [{meta}, [vessels]].
+    if (!deserializeJson(doc, body.data(), body.size()) && doc[0]["ERROR"] == false) {
+      for (JsonObject v : doc[1].as<JsonArray>()) {
+        const uint32_t mmsi = v["MMSI"] | 0;
+        if (!mmsi) continue;
+        VesselDisplay *vessel = findOrCreateVessel(mmsi);
+        vessel->lastUpdateMs = millis();
+        applyVesselPosition(vessel, v["LATITUDE"] | 0.0, v["LONGITUDE"] | 0.0);
+        vessel->speedKnots = v["SOG"] | vessel->speedKnots;
+        vessel->courseOverGround = v["COG"] | vessel->courseOverGround;
+        const float heading = v["HEADING"] | 511.0f;
+        vessel->heading = heading < 360.0f ? heading : -1;
+        applyVesselTextFields(vessel, v["NAME"] | "", v["TYPE"] | -1, v["NAVSTAT"] | -1);
+      }
+      aisConnected = true;
+      aisLastMessageAt = millis();
+    } else {
+      aisConnected = false;
+    }
+  } else {
+    aisConnected = false;
+  }
+  http.end();
+}
+
+// api.myshiptracking.com/api/v2/vessel/zone - freemium REST, Bearer auth.
+void fetchMyShipTrackingVessels() {
+  if (!myShipTrackingApiKey.length()) return;
+  const double latRadius = marineRadiusNm / 60.0;
+  const double lonRadius = marineRadiusNm / (60.0 * max(0.1, cos(radians(homeLatitude))));
+  const String url = "https://api.myshiptracking.com/api/v2/vessel/zone?response=simple" +
+      String("&minlat=") + String(homeLatitude - latRadius, 5) +
+      "&maxlat=" + String(homeLatitude + latRadius, 5) +
+      "&minlon=" + String(homeLongitude - lonRadius, 5) +
+      "&maxlon=" + String(homeLongitude + lonRadius, 5);
+  WiFiClientSecure client;
+  applyTlsPolicy(client);
+  HTTPClient http;
+  http.setTimeout(9000); http.setConnectTimeout(9000);
+  if (!http.begin(client, url)) return;
+  http.addHeader("User-Agent", userAgent());
+  http.addHeader("Authorization", "Bearer " + myShipTrackingApiKey);
+  const int code = http.GET();
+  if (code == HTTP_CODE_OK) {
+    JsonDocument doc(&psramJsonAllocator);
+    PsramSink body;
+    http.writeToStream(&body);
+    if (!deserializeJson(doc, body.data(), body.size()) && doc["status"] == "success") {
+      for (JsonObject v : doc["data"].as<JsonArray>()) {
+        const uint32_t mmsi = v["mmsi"] | 0;
+        if (!mmsi) continue;
+        VesselDisplay *vessel = findOrCreateVessel(mmsi);
+        vessel->lastUpdateMs = millis();
+        applyVesselPosition(vessel, v["lat"] | 0.0, v["lng"] | 0.0);
+        vessel->speedKnots = v["speed"] | vessel->speedKnots;
+        vessel->courseOverGround = v["course"] | vessel->courseOverGround;
+        // This endpoint doesn't report true heading separately from course.
+        vessel->heading = -1;
+        applyVesselTextFields(vessel, v["vessel_name"] | "", v["vtype"] | -1, v["nav_status"] | -1);
+      }
+      aisConnected = true;
+      aisLastMessageAt = millis();
+    } else {
+      aisConnected = false;
+    }
+  } else {
+    aisConnected = false;
+  }
+  http.end();
+}
+
+// api.datalastic.com/api/v0/vessel_inradius - freemium REST, API-key query
+// param. Radius is capped at 50 nm by the API itself, tighter than the
+// 250 nm ceiling on the other providers' bounding boxes.
+void fetchDatalasticVessels() {
+  if (!datalasticApiKey.length()) return;
+  const uint16_t radius = min<uint16_t>(marineRadiusNm, 50);
+  const String url = "https://api.datalastic.com/api/v0/vessel_inradius?api-key=" + datalasticApiKey +
+      "&lat=" + String(homeLatitude, 5) +
+      "&lon=" + String(homeLongitude, 5) +
+      "&radius=" + String(radius);
+  WiFiClientSecure client;
+  applyTlsPolicy(client);
+  HTTPClient http;
+  http.setTimeout(9000); http.setConnectTimeout(9000);
+  if (!http.begin(client, url)) return;
+  http.addHeader("User-Agent", userAgent());
+  const int code = http.GET();
+  if (code == HTTP_CODE_OK) {
+    JsonDocument doc(&psramJsonAllocator);
+    PsramSink body;
+    http.writeToStream(&body);
+    if (!deserializeJson(doc, body.data(), body.size()) && !doc["data"].isNull()) {
+      for (JsonObject v : doc["data"]["vessels"].as<JsonArray>()) {
+        // Datalastic returns mmsi as a string field, not a number.
+        const uint32_t mmsi = atol(v["mmsi"] | "");
+        if (!mmsi) continue;
+        VesselDisplay *vessel = findOrCreateVessel(mmsi);
+        vessel->lastUpdateMs = millis();
+        applyVesselPosition(vessel, v["lat"] | 0.0, v["lon"] | 0.0);
+        vessel->speedKnots = v["speed"] | vessel->speedKnots;
+        vessel->courseOverGround = v["course"] | vessel->courseOverGround;
+        const float heading = v["heading"] | 511.0f;
+        vessel->heading = heading < 360.0f ? heading : -1;
+        // Datalastic's "type" is a text label (e.g. "Tanker"), not a numeric
+        // AIS code, so it's copied directly instead of going through
+        // shipTypeName()'s numeric-range lookup.
+        const char *typeText = v["type"] | "UNKNOWN";
+        strncpy(vessel->shipType, typeText, sizeof(vessel->shipType) - 1);
+        vessel->shipType[sizeof(vessel->shipType) - 1] = 0;
+        strcpy(vessel->navStatus, "UNKNOWN");
+      }
+      aisConnected = true;
+      aisLastMessageAt = millis();
+    } else {
+      aisConnected = false;
+    }
+  } else {
+    aisConnected = false;
+  }
+  http.end();
+}
+
+void fetchMarineRest() {
+  if (marineProvider == "aishub") fetchAisHubVessels();
+  else if (marineProvider == "myshiptracking") fetchMyShipTrackingVessels();
+  else if (marineProvider == "datalastic") fetchDatalasticVessels();
+}
+
+// AISstream.io pushes one JSON object per WebSocket text frame - a
+// PositionReport (course/speed/heading) or ShipStaticData (name/type),
+// keyed by MMSI. There is no polling: this is the entire live feed.
+void onAisEvent(WStype_t type, uint8_t *payload, size_t length) {
+  switch (type) {
+    case WStype_CONNECTED: {
+      aisConnected = true;
+      aisConsecutiveFailures = 0;
+      Serial.println("AIS WebSocket connected; subscribing");
+      const double latRadius = marineRadiusNm / 60.0;
+      const double lonRadius = marineRadiusNm / (60.0 * max(0.1, cos(radians(homeLatitude))));
+      JsonDocument sub(&psramJsonAllocator);
+      sub["APIKey"] = aisApiKey;
+      JsonArray boxes = sub["BoundingBoxes"].to<JsonArray>();
+      JsonArray box = boxes.add<JsonArray>();
+      JsonArray corner1 = box.add<JsonArray>();
+      corner1.add(homeLatitude - latRadius);
+      corner1.add(homeLongitude - lonRadius);
+      JsonArray corner2 = box.add<JsonArray>();
+      corner2.add(homeLatitude + latRadius);
+      corner2.add(homeLongitude + lonRadius);
+      JsonArray filters = sub["FilterMessageTypes"].to<JsonArray>();
+      filters.add("PositionReport");
+      filters.add("ShipStaticData");
+      String message;
+      serializeJson(sub, message);
+      aisWebSocket.sendTXT(message);
+      break;
+    }
+    case WStype_DISCONNECTED:
+      aisConnected = false;
+      if (aisIntentionalDisconnect) {
+        aisIntentionalDisconnect = false;
+        Serial.println("AIS WebSocket paused for aircraft fetch");
+      } else {
+        // A real failure (usually the SSL alloc error logged just above by
+        // the library) - back off instead of retrying every few seconds
+        // and hammering an already-tight heap.
+        const uint32_t backoffMs = min<uint32_t>(60000UL, 8000UL << min<uint8_t>(aisConsecutiveFailures, 3));
+        aisNextRetryAt = millis() + backoffMs;
+        if (aisConsecutiveFailures < 250) ++aisConsecutiveFailures;
+        Serial.printf("AIS WebSocket disconnected; retrying in %lu ms (failure #%u)\n",
+                      static_cast<unsigned long>(backoffMs), aisConsecutiveFailures);
+      }
+      break;
+    // AISstream.io documents that it always sends binary frames whose
+    // payload happens to be UTF-8 JSON, not text frames - handle both the
+    // same way rather than silently dropping every real message.
+    case WStype_TEXT:
+    case WStype_BIN: {
+      aisLastMessageAt = millis();
+      // Every position report parses here, often several times a second in
+      // busy waters - unlike a one-off request, this allocator choice runs
+      // hot, so it must come from PSRAM like every other large JSON parse in
+      // this file rather than fragmenting the scarce internal heap.
+      JsonDocument doc(&psramJsonAllocator);
+      if (deserializeJson(doc, payload, length)) return;
+      const char *messageType = doc["MessageType"] | "";
+      JsonObject meta = doc["MetaData"].as<JsonObject>();
+      if (meta.isNull()) return;
+      const uint32_t mmsi = meta["MMSI"] | 0;
+      if (!mmsi) return;
+      VesselDisplay *vessel = findOrCreateVessel(mmsi);
+      vessel->lastUpdateMs = millis();
+      const char *name = meta["ShipName"] | "";
+      if (name[0]) {
+        strncpy(vessel->name, name, sizeof(vessel->name) - 1);
+        vessel->name[sizeof(vessel->name) - 1] = 0;
+      }
+      if (!strcmp(messageType, "PositionReport")) {
+        JsonObject report = doc["Message"]["PositionReport"].as<JsonObject>();
+        if (!report.isNull()) {
+          // Despite the docs' inline example showing Latitude/Longitude on
+          // MetaData, AISstream's own example code (github.com/aisstream/
+          // example) reads position from the PositionReport message itself
+          // - MetaData's copy is unreliable and was silently leaving every
+          // vessel at 0,0.
+          const double lat = report["Latitude"] | 0.0;
+          const double lon = report["Longitude"] | 0.0;
+          if (lat != 0.0 || lon != 0.0) {
+            vessel->latitude = lat;
+            vessel->longitude = lon;
+            vessel->distanceMiles = distanceMilesFromHome(lat, lon);
+          }
+          vessel->speedKnots = report["Sog"] | vessel->speedKnots;
+          vessel->courseOverGround = report["Cog"] | vessel->courseOverGround;
+          const float trueHeading = report["TrueHeading"] | 511.0f;
+          vessel->heading = trueHeading < 360.0f ? trueHeading : -1;
+          const int navStatus = report["NavigationalStatus"] | -1;
+          const char *statusName = navStatusName(navStatus);
+          strncpy(vessel->navStatus, statusName, sizeof(vessel->navStatus) - 1);
+          vessel->navStatus[sizeof(vessel->navStatus) - 1] = 0;
+        }
+      } else if (!strcmp(messageType, "ShipStaticData")) {
+        JsonObject staticData = doc["Message"]["ShipStaticData"].as<JsonObject>();
+        if (!staticData.isNull()) {
+          const int shipType = staticData["Type"] | -1;
+          const char *typeName = shipTypeName(shipType);
+          strncpy(vessel->shipType, typeName, sizeof(vessel->shipType) - 1);
+          vessel->shipType[sizeof(vessel->shipType) - 1] = 0;
+        }
+      }
+      if (displayPage == DisplayPage::Marine) marineDataDirty = true;
+      break;
+    }
+    default:
+      break;
+  }
+}
+
+// AISstream.io negotiates permessage-deflate (RFC 7692) when the client
+// requests it; the links2004/WebSockets library used here does not
+// implement that extension, so this connection runs uncompressed. Per
+// AISstream's own documentation, uncompressed connections become subject to
+// per-user bandwidth limits (with excess messages dropped) starting
+// September 2026 - if vessels start silently going stale after that date,
+// this is the first thing to check.
+void connectAisWebSocket() {
+  if (!marineTrackingEnabled || marineProvider != "aisstream" || !aisApiKey.length()) return;
+#if ADSB_TLS_INSECURE
+  aisWebSocket.beginSSL("stream.aisstream.io", 443, "/v0/stream");
+#else
+  aisWebSocket.beginSslWithBundle(
+      "stream.aisstream.io", 443, "/v0/stream",
+      rootca_crt_bundle_start,
+      static_cast<size_t>(rootca_crt_bundle_end - rootca_crt_bundle_start));
+#endif
+  aisWebSocket.onEvent(onAisEvent);
+  // Reconnect timing is driven explicitly (aisNextRetryAt, in networkTask)
+  // so our own exponential backoff actually controls retry frequency;
+  // leave the library's own timer effectively disabled rather than have it
+  // race a second reconnect attempt against ours.
+  aisWebSocket.setReconnectInterval(3600000UL);
+}
+
+}
+
+// Everything that talks to the network or the SD/flash filesystem for admin
+// housekeeping lives here, running on its own core so a slow or failing
+// fetch never blocks touch input or rendering in loop(). Calls that touch
+// the buffers loop() also reads (aircraft/vessel data, the physical map) are
+// wrapped in dataMutex; see its declaration for the full rationale.
+void networkTask(void *) {
+  for (;;) {
+    // Several admin API handlers (handleAircraftApi in particular) build a
+    // sizeable PSRAM-backed JSON document from latestAircraft on every call -
+    // real, non-trivial PSRAM traffic that ran unguarded here despite
+    // present()'s full-frame PSRAM->DMA copy needing the same mutex. The two
+    // running at once is exactly the condition that can starve the RGB
+    // panel's DMA and roll a frame (see the vsync-restart comment in
+    // present()); serialize all HTTP handling against rendering the same way
+    // the fetches already are, not just the ones known to touch PSRAM.
+    { MutexGuard guard(dataMutex); webServer.handleClient(); }
+    if (githubInstallPending) {
+      githubInstallPending = false;
+      installGithubUpdate();
+    }
+    // Only ever checks when the admin page's "Check for updates" button asks
+    // for it (githubCheckPending) - this used to also run automatically
+    // every UPDATE_CHECK_MS, one more background HTTPS/TLS session this
+    // board didn't need adding to its already-tight memory budget.
+    if (githubCheckPending) {
+      githubCheckPending = false;
+      checkGithubUpdate();
+    }
+    if (physicalMapRefreshPending) {
+      physicalMapRefreshPending = false;
+      { MutexGuard guard(dataMutex); refreshPhysicalBaseMap(); }
+      needsRedraw = true;
+    }
+    if (nextMapRetryAt && static_cast<int32_t>(millis() - nextMapRetryAt) >= 0) {
+      nextMapRetryAt = 0;
+      physicalMapRefreshPending = true;
+    }
+    if (setupPortalPending) {
+      setupPortalPending = false;
+      delay(250);
+      webServer.stop();
+      MDNS.end();
+      WiFiManager wm;
+      wm.setWiFiAPChannel(6);
+      wm.setConfigPortalTimeout(900);
+      wm.startConfigPortal("ADSBMAP", "aircraft");
+      beginWebControl();
+    }
+    if (pageSavePending && static_cast<int32_t>(millis() - pageSaveAt) >= 0) {
+      pageSavePending = false;
+      settingsStore.putUChar("display-page", static_cast<uint8_t>(displayPage));
+    }
+    if (wifiRollbackAt && static_cast<int32_t>(millis() - wifiRollbackAt) >= 0) {
+      wifiRollbackAt = 0;
+      if (WiFi.status() != WL_CONNECTED && previousWifiSsid.length()) {
+        Serial.println("New Wi-Fi credentials failed; restoring the previous network");
+        WiFi.begin(previousWifiSsid.c_str(), previousWifiPassword.c_str());
+      }
+      previousWifiSsid = "";
+      previousWifiPassword = "";
+    }
+    if (restartPending && static_cast<int32_t>(millis() - restartAt) >= 0) {
+      delay(100);
+      ESP.restart();
+    }
+    // Marine tracking and the aircraft feed are mutually exclusive - both
+    // need a persistent TLS session or frequent HTTPS fetches, and running
+    // both at once was the root of the recurring SSL alloc failures. Only
+    // one of these two blocks ever does anything at a time.
+    if (marineTrackingEnabled) {
+      if (marineProvider == "aisstream") {
+        if (aisApiKey.length()) {
+          MutexGuard guard(dataMutex);
+          aisWebSocket.loop();
+          if (!aisWebSocket.isConnected() && static_cast<int32_t>(millis() - aisNextRetryAt) >= 0) {
+            connectAisWebSocket();
+          }
+        }
+      } else if (marineConfigured() && static_cast<int32_t>(millis() - nextMarineFetchAt) >= 0) {
+        { MutexGuard guard(dataMutex); fetchMarineRest(); }
+        nextMarineFetchAt = millis() + MARINE_REST_REFRESH_MS;
+        marineDataDirty = true;
+      }
+      if (static_cast<int32_t>(millis() - nextMarinePruneAt) >= 0) {
+        { MutexGuard guard(dataMutex); pruneStaleVessels(); }
+        nextMarinePruneAt = millis() + 60000UL;
+      }
+    } else if (static_cast<int32_t>(millis() - nextFetchAt) >= 0) {
+      const uint32_t fetchStartedAt = millis();
+      // The AIS WebSocket's persistent TLS session and this fetch's own TLS
+      // session compete for the same scarce internal RAM on this board - with
+      // both open at once, heapMinimum fell to a few hundred bytes and every
+      // aircraft/route request failed. Pausing the socket for the fetch's
+      // duration is the difference between the feed working at all and not;
+      // AISstream tolerates the brief reconnect (it re-subscribes on connect).
+      const bool pauseAis = marineProvider == "aisstream" && aisWebSocket.isConnected();
+      if (pauseAis) { aisIntentionalDisconnect = true; aisWebSocket.disconnect(); }
+      { MutexGuard guard(dataMutex); fetchAircraft(); }
+      // This was a known-good, already-connected session we paused ourselves,
+      // not a failure - reconnect immediately rather than waiting on the
+      // failure backoff, which doesn't apply here.
+      if (pauseAis) connectAisWebSocket();
+      Serial.printf("fetchAircraft blocked the network task for %lu ms\n",
+                    static_cast<unsigned long>(millis() - fetchStartedAt));
+      if (openSkyAuthRetryPending) nextFetchAt = millis() + 1000UL;
+      else if (static_cast<int32_t>(millis() - nextFetchAt) >= 0) nextFetchAt = millis() + REFRESH_MS;
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
 }
 
 void setup() {
   Serial.begin(115200);
+  // The default Task Watchdog Timer (5s, watching the idle task on both
+  // cores) reboots the whole chip if any task occupies a core without
+  // yielding for that long. Pinning network I/O to its own core means the
+  // various already-deliberate HTTPClient timeouts in this file (up to
+  // 15000ms, e.g. the firmware download path) can now legitimately exceed
+  // that 5s window on a slow response or a weak Wi-Fi link - a live test
+  // reproduced exactly this, crashing on an ordinary slow adsb.fi fetch, not
+  // a real hang. Widen it well past the longest configured timeout instead
+  // of shortening those timeouts (they were sized for real, already-observed
+  // slow-network conditions on this board); a genuinely stuck task still
+  // gets caught and rebooted, just with more headroom for legitimate waits.
+  //
+  // 30s wasn't enough either: a later live test hit this same abort on
+  // ordinary aircraft fetches (http.setTimeout is only 9000ms) every single
+  // boot. HTTPClient::writeToStreamDataBlock has no overall deadline of its
+  // own - each individual read is capped at 9s, but if the far end keeps
+  // trickling a few bytes through just before each of those caps, the loop
+  // never gives up and never yields long enough for the idle task to run,
+  // so several such reads in a row can add up past whatever this is set to
+  // without any single call ever looking "stuck". Doubled to 60s to buy more
+  // margin; this doesn't fix that unbounded retry loop (nothing in this
+  // file's control can, short of vendoring a patched HTTPClient), so a
+  // connection degraded enough could still trip it.
+  esp_task_wdt_config_t watchdogConfig = {
+      .timeout_ms = 60000,
+      .idle_core_mask = (1 << 0) | (1 << 1),
+      .trigger_panic = true,
+  };
+  esp_task_wdt_reconfigure(&watchdogConfig);
+  dataMutex = xSemaphoreCreateRecursiveMutex();
   if (!LittleFS.begin(true)) Serial.println("LittleFS map cache unavailable");
   settingsStore.begin("adsb-web", false);
   managementPassword = settingsStore.getString("password", "aircraft");
   apiProvider = settingsStore.getString("provider", "opensky");
   if (apiProvider != "opensky" && apiProvider != "adsbfi" &&
       apiProvider != "airplaneslive" && apiProvider != "adsblol" &&
-      apiProvider != "adsbone" && apiProvider != "adsbx") apiProvider = "opensky";
+      apiProvider != "adsbone" && apiProvider != "adsbx" &&
+      apiProvider != "aggregator") apiProvider = "opensky";
   // Compiled-in credentials are opt-in. Without this flag a locally built
   // image carries no secret that `strings firmware.bin` could recover.
 #ifdef ADSB_BAKE_CREDENTIALS
@@ -2799,6 +4201,15 @@ void setup() {
   openSkyClientSecret = settingsStore.getString("os-secret", "");
 #endif
   rapidApiKey = settingsStore.getString("rapid-key", "");
+  aisApiKey = settingsStore.getString("ais-key", "");
+  aisHubUsername = settingsStore.getString("aishub-user", "");
+  myShipTrackingApiKey = settingsStore.getString("mst-key", "");
+  datalasticApiKey = settingsStore.getString("datalastic-key", "");
+  marineTrackingEnabled = settingsStore.getBool("marine-enabled", false);
+  marineProvider = settingsStore.getString("marine-provider", "aisstream");
+  if (marineProvider != "aisstream" && marineProvider != "aishub" &&
+      marineProvider != "myshiptracking" && marineProvider != "datalastic") marineProvider = "aisstream";
+  marineRadiusNm = constrain(settingsStore.getUShort("marine-radius", DEFAULT_MARINE_RADIUS_NM), 5, 250);
   homeLatitude = settingsStore.getFloat("home-lat", DEFAULT_HOME_LAT);
   homeLongitude = settingsStore.getFloat("home-lon", DEFAULT_HOME_LON);
   queryRadiusNm = constrain(settingsStore.getUShort("radius-nm", DEFAULT_RADIUS_NM), 5, 250);
@@ -2850,11 +4261,14 @@ void setup() {
   baseMap=(uint16_t*)heap_caps_malloc(W*H*sizeof(uint16_t),MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
   latestAircraft = static_cast<AircraftDisplay *>(heap_caps_calloc(
       MAX_AIRCRAFT, sizeof(AircraftDisplay), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-  if (!framebuffer || !baseMap || !latestAircraft) {
+  latestVessels = static_cast<VesselDisplay *>(heap_caps_calloc(
+      MAX_VESSELS, sizeof(VesselDisplay), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (!framebuffer || !baseMap || !latestAircraft || !latestVessels) {
     Serial.println("PSRAM display/aircraft buffers unavailable");
     while(true) delay(1000);
   }
   mountSdCard();
+  loadRouteCacheFromStorage();
   restoreMap(); status("SETUP",rgb(245,150,0)); present();
   WiFi.setHostname(DEVICE_HOSTNAME);
   WiFi.mode(WIFI_STA);
@@ -2873,16 +4287,24 @@ void setup() {
   if (WiFi.status() == WL_CONNECTED) {
     renderBootScreen("Wi-Fi connected: " + WiFi.localIP().toString(), rgb(55,215,110));
     delay(5000);
-    refreshPhysicalBaseMap();
+    { MutexGuard guard(dataMutex); refreshPhysicalBaseMap(); }
     restoreMap();
     status("MAP", rgb(53,169,244));
     present();
   }
   beginWebControl();
   Serial.printf("Web login username: %s\n", WEB_USERNAME);
-  fetchAircraft();
+  { MutexGuard guard(dataMutex); fetchAircraft(); }
   nextFetchAt=millis()+REFRESH_MS;
-  nextGithubCheckAt=millis()+15000UL;
+  connectAisWebSocket();
+  // Everything network-bound (aircraft/marine fetches, the map tile rebuild,
+  // the AIS socket, the admin web server, OTA/Wi-Fi/SD housekeeping) now runs
+  // on its own task on the other core, so a slow fetch can't freeze touch
+  // input and rendering in loop() below. See the dataMutex comment above for
+  // how the two tasks share the aircraft/vessel/map buffers safely, and the
+  // NETWORK_TASK_STACK_BYTES comment for why its stack has to be internal
+  // RAM rather than PSRAM despite the extra pressure that puts on mbedTLS/AIS.
+  xTaskCreatePinnedToCore(networkTask, "network", NETWORK_TASK_STACK_BYTES, nullptr, 1, nullptr, 0);
 }
 
 void loop() {
@@ -2897,87 +4319,109 @@ void loop() {
   delay(20);
   return;
 #endif
-  webServer.handleClient();
-  if (githubInstallPending) {
-    githubInstallPending = false;
-    installGithubUpdate();
-  }
-  if (githubCheckPending || static_cast<int32_t>(millis() - nextGithubCheckAt) >= 0) {
-    githubCheckPending = false;
-    checkGithubUpdate();
-    nextGithubCheckAt = millis() + UPDATE_CHECK_MS;
-  }
-  if (physicalMapRefreshPending) {
-    physicalMapRefreshPending = false;
-    refreshPhysicalBaseMap();
-    renderCurrentPage();
-  }
-  if (setupPortalPending) {
-    setupPortalPending = false;
-    delay(250);
-    webServer.stop();
-    MDNS.end();
-    WiFiManager wm;
-    wm.setWiFiAPChannel(6);
-    wm.setConfigPortalTimeout(900);
-    wm.startConfigPortal("ADSBMAP", "aircraft");
-    beginWebControl();
-  }
-  if (pageSavePending && static_cast<int32_t>(millis() - pageSaveAt) >= 0) {
-    pageSavePending = false;
-    settingsStore.putUChar("display-page", static_cast<uint8_t>(displayPage));
-  }
-  if (wifiRollbackAt && static_cast<int32_t>(millis() - wifiRollbackAt) >= 0) {
-    wifiRollbackAt = 0;
-    if (WiFi.status() != WL_CONNECTED && previousWifiSsid.length()) {
-      Serial.println("New Wi-Fi credentials failed; restoring the previous network");
-      WiFi.begin(previousWifiSsid.c_str(), previousWifiPassword.c_str());
+  // Last-resort rescue for the writeToStreamDataBlock() stall documented by
+  // activeFetchClient's declaration: networkTask() on core 0 can be stuck
+  // spinning inside that vendored loop with no way to feed the watchdog
+  // itself, but this loop on core 1 is never blocked by it, so it's the one
+  // place that can still notice and act. Deliberately does not take
+  // dataMutex - networkTask holds it for the entire stuck fetch, so waiting
+  // for it here would just add a second stuck task.
+  if (activeFetchClient) {
+    // Any growth in the buffered body is forward progress - a big response
+    // taking a while is not the same failure as one that has gone silent.
+    const size_t currentSize = activeFetchBody ? activeFetchBody->size() : 0;
+    if (currentSize != activeFetchLastSeenSize) {
+      activeFetchLastSeenSize = currentSize;
+      activeFetchDeadlineMs = millis() + 15000UL;
+      Serial.printf("fetch body: %u bytes at t+%lums\n", (unsigned)currentSize,
+                    static_cast<unsigned long>(millis() - activeFetchStartedMs));
+    } else if (static_cast<int32_t>(millis() - activeFetchDeadlineMs) >= 0) {
+      Serial.println("Aircraft fetch body read stalled with no new data for 15s; force-closing the socket");
+      activeFetchClient->stop();
+      activeFetchDeadlineMs = millis() + 15000UL;
     }
-    previousWifiSsid = "";
-    previousWifiPassword = "";
   }
-  if (restartPending && static_cast<int32_t>(millis() - restartAt) >= 0) {
-    delay(100);
-    ESP.restart();
+  // Everything network-bound now lives in networkTask() on the other core.
+  // This loop only ever touches shared data through dataMutex, and even then
+  // just for the length of a render call (milliseconds), never for the
+  // length of a network request - that's what keeps touch and rendering
+  // responsive regardless of what the network is doing.
+  if (needsRedraw) {
+    needsRedraw = false;
+    MutexGuard guard(dataMutex);
+    renderCurrentPage();
   }
   // Evaluate both: short-circuiting used to leave bootButtonPending set, which
   // advanced the page twice on the following pass.
   const TouchGesture gesture = touchGesture();
   const bool pressed = bootButtonTapped();
   int pageStep = 0;
-  // Swipe right advances Overview -> Table -> Map -> Radar and wraps; swipe
-  // left walks back. Tap and the boot button both advance.
-  if (gesture == TouchGesture::SwipeRight) pageStep = 1;
-  else if (gesture == TouchGesture::SwipeLeft) pageStep = -1;
-  else if (gesture == TouchGesture::Tap || pressed) pageStep = 1;
+  // Swipe right advances Overview -> Table -> Map -> Radar -> Marine and
+  // wraps; swipe left walks back. A tap either opens a detail card over the
+  // aircraft icon it hit, or - if it missed every icon - advances the page,
+  // same as before. The boot button also advances. All of that is swallowed
+  // while a detail card is showing: any touch just dismisses it back to
+  // whichever page was already active, and it times out on its own too, so
+  // it can't be left open indefinitely if nobody taps again.
+  if (detailAircraftIndex >= 0) {
+    if (gesture != TouchGesture::None || pressed || millis() - detailShownAt > 8000) {
+      detailAircraftIndex = -1;
+      MutexGuard guard(dataMutex);
+      renderCurrentPage();
+    }
+  } else if (gesture == TouchGesture::SwipeRight) {
+    pageStep = 1;
+  } else if (gesture == TouchGesture::SwipeLeft) {
+    pageStep = -1;
+  } else if (displayPage == DisplayPage::Table &&
+             (gesture == TouchGesture::SwipeUp || gesture == TouchGesture::SwipeDown)) {
+    // Content follows the finger: dragging up brings later rows into view
+    // (scroll forward through the list), dragging down goes back toward the
+    // nearest aircraft.
+    tableScrollOffset += gesture == TouchGesture::SwipeUp ? TABLE_VISIBLE_ROWS : -TABLE_VISIBLE_ROWS;
+    tableScrollOffset = constrain(tableScrollOffset, 0, max(0, lastCount - TABLE_VISIBLE_ROWS));
+    { MutexGuard guard(dataMutex); renderCurrentPage(); }
+  } else if (gesture == TouchGesture::Tap) {
+    const int hitIndex = findAircraftIconAt(lastTapX, lastTapY);
+    if (hitIndex >= 0) {
+      detailAircraftIndex = hitIndex;
+      detailShownAt = millis();
+      MutexGuard guard(dataMutex);
+      renderAircraftDetailCard(hitIndex);
+    } else {
+      pageStep = 1;
+    }
+  } else if (pressed) {
+    pageStep = 1;
+  }
   if (pageStep) {
     const int pageCount = DISPLAY_PAGE_COUNT;
     displayPage = static_cast<DisplayPage>(
         (static_cast<int>(displayPage) + pageStep + pageCount) % pageCount);
+    tableScrollOffset = 0;
     pageSavePending = true;
     pageSaveAt = millis() + 5000UL;
-    renderCurrentPage();
+    { MutexGuard guard(dataMutex); renderCurrentPage(); }
     Serial.printf("Page: %s (%s)\n", displayPageName(),
                   gesture == TouchGesture::SwipeLeft    ? "swipe left"
                   : gesture == TouchGesture::SwipeRight ? "swipe right"
                   : gesture == TouchGesture::Tap        ? "tap"
                                                         : "button");
   }
-  if (displayPage == DisplayPage::Radar && static_cast<int32_t>(millis() - nextRadarFrameAt) >= 0) {
+  if (displayPage == DisplayPage::Radar && detailAircraftIndex < 0 &&
+      static_cast<int32_t>(millis() - nextRadarFrameAt) >= 0) {
     // Full-screen PSRAM copies faster than this can starve the RGB DMA and
     // momentarily wrap the bottom scan lines to the top of the panel.
     radarSweepDegrees += 18.0f;
     if (radarSweepDegrees >= 360.0f) radarSweepDegrees -= 360.0f;
-    renderRadarPage();
+    { MutexGuard guard(dataMutex); renderRadarPage(); }
     nextRadarFrameAt = millis() + 750;
   }
-  if (static_cast<int32_t>(millis()-nextFetchAt) >= 0) {
-    const uint32_t fetchStartedAt = millis();
-    fetchAircraft();
-    Serial.printf("fetchAircraft blocked the loop for %lu ms\n",
-                  static_cast<unsigned long>(millis() - fetchStartedAt));
-    if (openSkyAuthRetryPending) nextFetchAt = millis() + 1000UL;
-    else if (static_cast<int32_t>(millis()-nextFetchAt) >= 0) nextFetchAt=millis()+REFRESH_MS;
+  if (displayPage == DisplayPage::Marine && marineDataDirty && detailAircraftIndex < 0 &&
+      static_cast<int32_t>(millis() - nextMarineRenderAt) >= 0) {
+    marineDataDirty = false;
+    { MutexGuard guard(dataMutex); renderMarinePage(); }
+    nextMarineRenderAt = millis() + 2000;
   }
-  delay(50);
+  delay(15);
 }
