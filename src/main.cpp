@@ -2182,13 +2182,28 @@ void renderAircraftDetailCard(int aircraftIndex) {
 void renderScreensaverPage() {
   filledRect(0, 0, W, H, rgb(0, 0, 0));
   text5(10, 8, "SCREENSAVER - TAP OR SWIPE TO RETURN", rgb(80, 100, 120));
-  if (lastCount <= 0) {
-    text5(20, H / 2 - 6, "NO AIRCRAFT IN RANGE", rgb(120, 140, 160), 2);
+  // Overhead only: something you could plausibly see or hear from the
+  // receiver location, not just anything within the full query radius.
+  // Ground distance alone isn't enough - an airliner at cruise altitude can
+  // be 0 miles away horizontally (directly above) and still be far too high
+  // to see or hear, so filter on slant range (distance and altitude
+  // combined) instead.
+  constexpr float OVERHEAD_MAX_SLANT_MILES = 5.0f;
+  int overheadMatches[32];
+  int overheadCount = 0;
+  for (int i = 0; i < lastCount && overheadCount < 32; ++i) {
+    const AircraftDisplay &candidate = latestAircraft[i];
+    if (candidate.onGround) continue;
+    const float altitudeMiles = candidate.altitudeFt > 0 ? candidate.altitudeFt / 5280.0f : 0.0f;
+    const float slantMiles = sqrtf(candidate.distanceMiles * candidate.distanceMiles + altitudeMiles * altitudeMiles);
+    if (slantMiles <= OVERHEAD_MAX_SLANT_MILES) overheadMatches[overheadCount++] = i;
+  }
+  if (overheadCount == 0) {
+    text5(20, H / 2 - 6, "NO OVERHEAD AIRCRAFT", rgb(120, 140, 160), 2);
     present();
     return;
   }
-  if (screensaverAircraftIndex >= lastCount) screensaverAircraftIndex = 0;
-  AircraftDisplay &a = latestAircraft[screensaverAircraftIndex];
+  AircraftDisplay &a = latestAircraft[overheadMatches[screensaverAircraftIndex % overheadCount]];
   const char *identity = a.flight[0] ? a.flight : a.hex;
 
   const int iconX = 40, iconY = H / 2 - 34, textX = iconX + 34;
