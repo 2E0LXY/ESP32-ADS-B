@@ -215,6 +215,162 @@ class PsramSink : public Stream {
   size_t _capacity = 0;
 };
 
+// ---------------------------------------------------------------------------
+// Response body reader.
+//
+// Deliberately not HTTPClient::writeToStream(). That call has no overall
+// deadline, so the only lever over a stalled body read was force-closing the
+// socket from the *other* core - and that turned out to be the cause of a
+// whole family of failures rather than a fix for one.
+// NetworkClientSecure::stop() tears the mbedTLS session down (mbedtls_ssl_free
+// and friends) while the fetching core may be sitting inside
+// mbedtls_ssl_read() on that same context; mbedTLS is not built here for two
+// cores touching one session, so it is a plain use-after-free. The logs bear
+// that out exactly: "PK verify failed"/"Certificate matched but signature
+// verification failed", "BIGNUM - Memory allocation failed" and "SSL - Memory
+// allocation failed" only ever appear *after* a force-close line and never
+// before one, and the first fetch after any boot always succeeds. The task
+// watchdog aborts naming "CPU 0: network" are the same race landing somewhere
+// that never yields.
+//
+// Reading the body here means the deadline belongs to the task that owns the
+// session: a stall ends in an ordinary http.end() on this core, with nothing
+// freed underneath another core, so the next connection starts from an intact
+// heap. Not calling writeToStream() gives up HTTPClient's own de-chunking, so
+// chunked replies are decoded below - several providers here are
+// Cloudflare-fronted and do chunk (see the PsramSink comment above). Every
+// idle pass yields, so however long the far end stays silent this loop cannot
+// starve the idle task and trip the watchdog.
+// ---------------------------------------------------------------------------
+constexpr uint32_t BODY_IDLE_TIMEOUT_MS = 8000;
+constexpr uint32_t BODY_TOTAL_TIMEOUT_MS = 20000;
+
+enum class BodyRead : uint8_t { Complete, Stalled, ClosedEarly, OutOfMemory, NoStream };
+
+const char *bodyReadName(BodyRead outcome) {
+  switch (outcome) {
+    case BodyRead::Complete: return "complete";
+    case BodyRead::Stalled: return "STALLED";
+    case BodyRead::ClosedEarly: return "CLOSED EARLY";
+    case BodyRead::OutOfMemory: return "OUT OF PSRAM";
+    case BodyRead::NoStream: return "NO STREAM";
+  }
+  return "unknown";
+}
+
+struct BodyReader {
+  NetworkClient *stream = nullptr;
+  PsramSink *sink = nullptr;
+  uint32_t startedAt = 0;
+  uint32_t lastProgressAt = 0;
+  size_t received = 0;
+
+  bool expired() const {
+    return millis() - lastProgressAt >= BODY_IDLE_TIMEOUT_MS ||
+           millis() - startedAt >= BODY_TOTAL_TIMEOUT_MS;
+  }
+
+  // Blocks until at least one byte is readable. false means stop, with
+  // `outcome` saying why. Data already buffered wins over a closed socket:
+  // a peer that sends the whole body then closes is a success, not a loss.
+  bool waitForData(BodyRead &outcome) {
+    for (;;) {
+      if (stream->available() > 0) return true;
+      if (!stream->connected()) { outcome = BodyRead::ClosedEarly; return false; }
+      if (expired()) { outcome = BodyRead::Stalled; return false; }
+      delay(2);
+    }
+  }
+
+  bool copy(size_t count, BodyRead &outcome) {
+    uint8_t buffer[512];
+    size_t remaining = count;
+    while (remaining) {
+      if (!waitForData(outcome)) return false;
+      const int avail = stream->available();
+      if (avail <= 0) continue;
+      size_t want = min(sizeof(buffer), remaining);
+      want = min(want, static_cast<size_t>(avail));
+      const int got = stream->read(buffer, want);
+      if (got <= 0) { outcome = BodyRead::ClosedEarly; return false; }
+      if (sink->write(buffer, got) != static_cast<size_t>(got)) {
+        outcome = BodyRead::OutOfMemory;
+        return false;
+      }
+      received += got;
+      remaining -= got;
+      lastProgressAt = millis();
+    }
+    return true;
+  }
+
+  // One CRLF-terminated line: chunk size headers and their trailers.
+  bool readLine(String &line, BodyRead &outcome) {
+    line = "";
+    for (;;) {
+      if (!waitForData(outcome)) return false;
+      const int c = stream->read();
+      if (c < 0) { outcome = BodyRead::ClosedEarly; return false; }
+      lastProgressAt = millis();
+      if (c == '\n') return true;
+      if (c != '\r' && line.length() < 40) line += static_cast<char>(c);
+    }
+  }
+};
+
+BodyRead readResponseBody(HTTPClient &http, PsramSink &sink, int &expected,
+                          size_t &received, bool &chunked) {
+  BodyReader reader;
+  reader.stream = http.getStreamPtr();
+  reader.sink = &sink;
+  reader.startedAt = millis();
+  reader.lastProgressAt = reader.startedAt;
+  expected = http.getSize();
+  chunked = http.header("Transfer-Encoding").equalsIgnoreCase("chunked");
+  received = 0;
+  if (!reader.stream) return BodyRead::NoStream;
+
+  BodyRead outcome = BodyRead::Complete;
+  if (!chunked && expected >= 0) {
+    if (expected > 0 && !reader.copy(static_cast<size_t>(expected), outcome)) {
+      received = reader.received;
+      return outcome;
+    }
+    received = reader.received;
+    return BodyRead::Complete;
+  }
+  if (!chunked) {
+    // Neither a length nor chunked framing: the body runs until the peer
+    // closes, which is a normal end here rather than a truncation.
+    for (;;) {
+      if (!reader.waitForData(outcome)) {
+        received = reader.received;
+        return outcome == BodyRead::ClosedEarly ? BodyRead::Complete : outcome;
+      }
+      const int avail = reader.stream->available();
+      if (avail <= 0) continue;
+      if (!reader.copy(static_cast<size_t>(avail), outcome)) {
+        received = reader.received;
+        return outcome;
+      }
+    }
+  }
+  // Transfer-Encoding: chunked - "<hex size>[;ext]" CRLF, data, CRLF, ending
+  // with a zero-length chunk. HTTPClient strips this inside writeToStream();
+  // doing it here is the price of owning the deadline.
+  for (;;) {
+    String header;
+    if (!reader.readLine(header, outcome)) { received = reader.received; return outcome; }
+    const size_t chunkSize = strtoul(header.c_str(), nullptr, 16);
+    if (chunkSize == 0) break;  // final chunk; any trailers are ignored
+    if (!reader.copy(chunkSize, outcome)) { received = reader.received; return outcome; }
+    String terminator;
+    if (!reader.readLine(terminator, outcome)) { received = reader.received; return outcome; }
+  }
+  received = reader.received;
+  return BodyRead::Complete;
+}
+
 struct RouteCacheEntry {
   char callsign[9] = {};
   char origin[5] = {};
@@ -402,44 +558,13 @@ uint32_t feedRequestStartedAt = 0;
 uint32_t feedRequestDurationMs = 0;
 int feedHttpCode = 0;
 String feedStatus = "Not fetched";
-// HTTPClient::writeToStreamDataBlock() (arduino-esp32 3.3.11) has no overall
-// deadline of its own once headers are in: its body-read loop is just
-// `while (connected()) { if (available()) read-and-copy; else delay(1); }`
-// forever, with no millis()-based timeout unlike the header-reading loop
-// above it. If a provider accepts the connection, sends a partial response,
-// then stalls without closing the socket - a dead NAT/firewall state is
-// enough, no cooperation from the far end required - that loop spins on
-// core 0 until the task watchdog panics and reboots the whole board. That
-// is the exact, source-confirmed cause of every "IDLE0 starved on CPU 0:
-// network" reboot logged in this project: every backtrace bottoms out in
-// this one loop, just caught at whichever inner call happened to be running
-// when the watchdog sampled it. It can't be fixed by any HTTPClient/
-// WiFiClientSecure timeout setter - none of them are consulted here - and
-// rewriting the body read ourselves would lose HTTPClient's own chunked-
-// transfer decoding (see PsramSink's comment above on why that matters).
-// The only lever available from outside the vendored library is closing
-// the underlying socket out from under it: loop() on core 1 is never
-// blocked by this (every crash log shows CPU 1/IDLE1 running fine), so it
-// polls activeFetchDeadlineMs and force-stops activeFetchClient if a body
-// read has made no progress in that long, which unblocks the stuck read
-// with a clean error instead of a 60-second hang ending in a full reboot.
-// The deadline is an idle timeout, not a cap on the whole transfer: it is
-// pushed forward every time activeFetchBody's size actually grows, so a
-// big-but-healthy response (more aircraft, more route lookups already
-// cached) isn't punished for simply taking a while - only a transfer that
-// goes completely quiet gets force-closed. An earlier version used a flat
-// deadline for the entire read and ended up killing normal slow transfers
-// on almost every cycle, which is worse than the rare genuine stall it was
-// meant to catch.
-NetworkClientSecure *volatile activeFetchClient = nullptr;
-PsramSink *volatile activeFetchBody = nullptr;
-volatile size_t activeFetchLastSeenSize = 0;
-volatile uint32_t activeFetchDeadlineMs = 0;
-// Diagnostic only: timestamps the fetch started and every observed growth in
-// activeFetchBody, so a stalled cycle's log shows the actual shape of the
-// stall (steady trickle vs. an early jump then dead flat) instead of just
-// the final byte count once the 15s idle timeout gives up.
-volatile uint32_t activeFetchStartedMs = 0;
+// The body read used to be HTTPClient::writeToStreamDataBlock(), which has no
+// overall deadline of its own, so a stalled transfer was killed by
+// force-closing the socket from the other core. That cross-core teardown races
+// with mbedTLS on the fetching core and corrupts the heap - see the
+// readResponseBody() comment above PsramSink for the full evidence trail. The
+// read now owns its own deadline on its own core, so nothing outside it needs
+// to reach in and stop it, and these globals are gone with the mechanism.
 float homeLatitude = DEFAULT_HOME_LAT;
 float homeLongitude = DEFAULT_HOME_LON;
 uint16_t queryRadiusNm = DEFAULT_RADIUS_NM;
@@ -1195,8 +1320,26 @@ bool drawCachedOsmTile(const String &path, int screenX, int screenY) {
     return false;
   }
   const size_t size = file.size();
+  // An empty cache entry opens fine and then fails every later step silently
+  // (malloc(0) returns null), so it would sit there being reported as
+  // "cached" and never drawn for ever. Treat it as the corrupt entry it is.
+  if (size == 0) {
+    file.close();
+    cache.remove(path);
+    Serial.printf("Removed empty cached tile %s\n", path.c_str());
+    return false;
+  }
   uint8_t *data = static_cast<uint8_t *>(heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-  if (!data) { file.close(); return false; }
+  if (!data) {
+    // Not the tile's fault, so it stays cached - but say so, because this
+    // path used to fail silently and was indistinguishable in the log from a
+    // corrupt tile.
+    file.close();
+    Serial.printf("Tile %s: no PSRAM for %u bytes (%u free)\n", path.c_str(),
+                  static_cast<unsigned>(size),
+                  static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
+    return false;
+  }
   const size_t read = file.read(data, size);
   file.close();
   if (read != size) {
@@ -2444,6 +2587,10 @@ void fetchAdsbV2Aircraft() {
     } else if (apiProvider == "flyitalyadsb" && flyItalyApiKey.length()) {
       http.addHeader("X-Api-Key", flyItalyApiKey);
     }
+    // readResponseBody() needs to know how the body is framed, and
+    // HTTPClient only keeps response headers it was asked for in advance.
+    static const char *bodyFramingHeaders[] = {"Transfer-Encoding", "Content-Encoding"};
+    http.collectHeaders(bodyFramingHeaders, 2);
     code = http.GET();
     responseCode = code;
     if (code == HTTP_CODE_TOO_MANY_REQUESTS) {
@@ -2464,27 +2611,38 @@ void fetchAdsbV2Aircraft() {
     }
 
     PsramSink body;
-    // See the activeFetchClient/activeFetchDeadlineMs comment above
-    // feedStatus's declaration: this is the one call in the whole file
-    // confirmed to have caused every watchdog reboot logged so far, so it's
-    // the one wrapped in the external force-stop deadline.
-    activeFetchLastSeenSize = 0;
-    activeFetchBody = &body;
-    activeFetchStartedMs = millis();
-    activeFetchDeadlineMs = activeFetchStartedMs + 15000UL;
-    activeFetchClient = &client;
-    http.writeToStream(&body);
-    activeFetchClient = nullptr;
-    activeFetchBody = nullptr;
+    // Read the body on this core with our own deadline - see the readResponseBody
+    // comment for why the old cross-core force-close had to go.
+    const uint32_t bodyStartedAt = millis();
+    int expected = -1;
+    bool chunked = false;
+    size_t received = 0;
+    const BodyRead bodyOutcome = readResponseBody(http, body, expected, received, chunked);
+    const uint32_t bodyMs = millis() - bodyStartedAt;
     doc.clear();
     error = deserializeJson(doc, body.data(), body.size(), DeserializationOption::Filter(filter));
     bodySize = body.size();
     http.end();
-    if (!error && doc["ac"].is<JsonArray>()) break;
-    Serial.printf("%s JSON %s (%u bytes)\n", apiProvider.c_str(), error.c_str(),
-                  static_cast<unsigned>(bodySize));
-    if (attempt == 0 && error == DeserializationError::IncompleteInput) {
-      Serial.println("Retrying once after an incomplete/stalled response");
+    const bool parsed = !error && doc["ac"].is<JsonArray>();
+    // One line per attempt with everything needed to tell the failure modes
+    // apart without guessing: how much the server said it would send, how
+    // much actually arrived, how the read ended, and whether it parsed.
+    Serial.printf("%s body %s: %u/%s bytes%s in %lu ms, json %s\n",
+                  apiProvider.c_str(), bodyReadName(bodyOutcome),
+                  static_cast<unsigned>(received),
+                  expected >= 0 ? String(expected).c_str() : "?",
+                  chunked ? " (chunked)" : "", static_cast<unsigned long>(bodyMs),
+                  parsed ? "ok" : error.c_str());
+    if (parsed) break;
+    // A stalled or truncated read is a transport problem, not a bad response:
+    // retry it once on a fresh connection before surfacing an error. Anything
+    // else (a complete body that still won't parse) would fail identically a
+    // second time, so it isn't retried.
+    const bool transportFailure = bodyOutcome == BodyRead::Stalled ||
+                                  bodyOutcome == BodyRead::ClosedEarly ||
+                                  (expected >= 0 && received < static_cast<size_t>(expected));
+    if (attempt == 0 && transportFailure) {
+      Serial.println("Retrying once on a fresh connection after an incomplete body");
       continue;
     }
     finishFeedAttempt("Invalid response", code);
@@ -4340,6 +4498,18 @@ void networkTask(void *) {
 
 void setup() {
   Serial.begin(115200);
+  // First thing on the wire, before anything can fail: which binary is
+  // actually running. Several rounds of debugging were spent on symptoms that
+  // turned out to be a stale build or the wrong checkout being flashed, and
+  // nothing in the old boot log distinguished one image from another.
+  delay(50);
+#if defined(ADSB_BOARD_WS7)
+  constexpr char boardName[] = "WS7 800x480";
+#else
+  constexpr char boardName[] = "WS4 480x480";
+#endif
+  Serial.printf("\n=== ESP32 ADS-B v%s | built %s %s | %s | panel %dx%d ===\n",
+                FIRMWARE_VERSION, __DATE__, __TIME__, boardName, W, H);
   // The default Task Watchdog Timer (5s, watching the idle task on both
   // cores) reboots the whole chip if any task occupies a core without
   // yielding for that long. Pinning network I/O to its own core means the
@@ -4510,28 +4680,11 @@ void loop() {
   delay(20);
   return;
 #endif
-  // Last-resort rescue for the writeToStreamDataBlock() stall documented by
-  // activeFetchClient's declaration: networkTask() on core 0 can be stuck
-  // spinning inside that vendored loop with no way to feed the watchdog
-  // itself, but this loop on core 1 is never blocked by it, so it's the one
-  // place that can still notice and act. Deliberately does not take
-  // dataMutex - networkTask holds it for the entire stuck fetch, so waiting
-  // for it here would just add a second stuck task.
-  if (activeFetchClient) {
-    // Any growth in the buffered body is forward progress - a big response
-    // taking a while is not the same failure as one that has gone silent.
-    const size_t currentSize = activeFetchBody ? activeFetchBody->size() : 0;
-    if (currentSize != activeFetchLastSeenSize) {
-      activeFetchLastSeenSize = currentSize;
-      activeFetchDeadlineMs = millis() + 15000UL;
-      Serial.printf("fetch body: %u bytes at t+%lums\n", (unsigned)currentSize,
-                    static_cast<unsigned long>(millis() - activeFetchStartedMs));
-    } else if (static_cast<int32_t>(millis() - activeFetchDeadlineMs) >= 0) {
-      Serial.println("Aircraft fetch body read stalled with no new data for 15s; force-closing the socket");
-      activeFetchClient->stop();
-      activeFetchDeadlineMs = millis() + 15000UL;
-    }
-  }
+  // The cross-core force-close that used to live here is gone: it was the
+  // cause of the corrupted-heap failures (cert verification, BIGNUM/SSL
+  // allocation) and watchdog aborts that followed every stall, not a cure for
+  // them. readResponseBody() now bounds the read on the core that owns the
+  // TLS session, so nothing here needs to reach into another core's socket.
   // Everything network-bound now lives in networkTask() on the other core.
   // This loop only ever touches shared data through dataMutex, and even then
   // just for the length of a render call (milliseconds), never for the
