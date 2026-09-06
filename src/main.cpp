@@ -378,6 +378,20 @@ String rapidApiKey;
 String aggregatorApiKey;
 String flyItalyApiKey;
 bool soundAlerts = true;
+// Screensaver: after screensaverIdleMinutes with no touch/button/web-UI
+// interaction, the panel switches to a rotating single-aircraft
+// departure-board style display (renderScreensaverPage()) instead of
+// whatever page was showing; any interaction dismisses it straight back to
+// that page. lastInteractionAt is deliberately updated by both physical
+// input (loop()) and web-driven changes (handlePageControl(),
+// handleDisplaySettings()) - a receiver being administered over the web
+// shouldn't be treated as sitting idle.
+bool screensaverEnabled = false;
+uint16_t screensaverIdleMinutes = 5;
+bool screensaverActive = false;
+uint32_t lastInteractionAt = 0;
+uint32_t screensaverRotateAt = 0;
+int screensaverAircraftIndex = 0;
 uint8_t brightnessPercent = 100;
 bool webServerReady = false;
 bool restartPending = false;
@@ -2161,6 +2175,54 @@ void renderAircraftDetailCard(int aircraftIndex) {
   present();
 }
 
+// Rotating single-aircraft display in the style of an LED departure board:
+// operator badge, callsign, route and type, plus a phase guess (departing/
+// arriving/en route) derived from altitude and vertical rate - the feed has
+// no explicit flight-phase field to read instead.
+void renderScreensaverPage() {
+  filledRect(0, 0, W, H, rgb(0, 0, 0));
+  text5(10, 8, "SCREENSAVER - TAP OR SWIPE TO RETURN", rgb(80, 100, 120));
+  if (lastCount <= 0) {
+    text5(20, H / 2 - 6, "NO AIRCRAFT IN RANGE", rgb(120, 140, 160), 2);
+    present();
+    return;
+  }
+  if (screensaverAircraftIndex >= lastCount) screensaverAircraftIndex = 0;
+  AircraftDisplay &a = latestAircraft[screensaverAircraftIndex];
+  const char *identity = a.flight[0] ? a.flight : a.hex;
+
+  const int iconX = 40, iconY = H / 2 - 34, textX = iconX + 34;
+  drawOperatorBadge(iconX, iconY, a.flight, a.hex);
+  text5(textX, H / 2 - 70, identity, rgb(255, 255, 255), 3);
+
+  RouteCacheEntry *route = cachedRoute(a.flight);
+  char routeLabel[40];
+  buildRouteLabel(route, routeLabel, sizeof(routeLabel), (W - textX - 10) / 12);
+  text5(textX, H / 2 - 30, routeLabel, rgb(130, 210, 255), 2);
+  text5(textX, H / 2 - 4, a.aircraftType[0] ? a.aircraftType : "UNKNOWN TYPE", rgb(200, 210, 220), 2);
+
+  const bool hasRoute = route && route->hasRoute;
+  const char *originLabel = hasRoute ? (route->originName[0] ? route->originName : route->origin) : nullptr;
+  const char *destinationLabel = hasRoute ? (route->destinationName[0] ? route->destinationName : route->destination) : nullptr;
+  char status[64];
+  if (a.onGround) {
+    snprintf(status, sizeof(status), "ON GROUND");
+  } else if (a.altitudeFt >= 0 && a.altitudeFt < 5000 && a.verticalRateFpm > 300 && originLabel) {
+    snprintf(status, sizeof(status), "DEPARTING FROM %s", originLabel);
+  } else if (a.altitudeFt >= 0 && a.altitudeFt < 6000 && a.verticalRateFpm < -300 && destinationLabel) {
+    snprintf(status, sizeof(status), "ARRIVING AT %s", destinationLabel);
+  } else if (destinationLabel) {
+    snprintf(status, sizeof(status), "EN ROUTE TO %s", destinationLabel);
+  } else {
+    snprintf(status, sizeof(status), "%d FT  %d KT", a.altitudeFt, static_cast<int>(lroundf(a.speedKnots)));
+  }
+  // text5() doesn't wrap; truncate rather than overrun the panel edge.
+  const int maxStatusChars = (W - 20) / 12;
+  if (static_cast<int>(strlen(status)) > maxStatusChars) status[maxStatusChars] = 0;
+  text5(10, H - 34, status, rgb(255, 255, 255), 2);
+  present();
+}
+
 const char *displayPageName() {
   if (displayPage == DisplayPage::Overview) return "overview";
   if (displayPage == DisplayPage::Table) return "table";
@@ -2170,6 +2232,7 @@ const char *displayPageName() {
 }
 
 void renderCurrentPage() {
+  if (screensaverActive) { renderScreensaverPage(); return; }
   if (displayPage == DisplayPage::Overview) renderOverviewPage();
   else if (displayPage == DisplayPage::Table) renderTablePage();
   else if (displayPage == DisplayPage::Radar) renderRadarPage();
@@ -3138,6 +3201,9 @@ void handleStatusApi() {
   doc["stagedUpdateVersion"] = stagedUpdateVersion;
   doc["brightness"] = brightnessPercent;
   doc["sound"] = soundAlerts;
+  doc["screensaverEnabled"] = screensaverEnabled;
+  doc["screensaverIdleMinutes"] = screensaverIdleMinutes;
+  doc["screensaverActive"] = screensaverActive;
   doc["page"] = displayPageName();
   doc["latitude"] = homeLatitude;
   doc["longitude"] = homeLongitude;
@@ -3286,6 +3352,8 @@ void handlePageControl() {
                 page == "radar" ? DisplayPage::Radar :
                 page == "marine" ? DisplayPage::Marine : DisplayPage::Map;
   settingsStore.putUChar("display-page", static_cast<uint8_t>(displayPage));
+  screensaverActive = false;
+  lastInteractionAt = millis();
   { MutexGuard guard(dataMutex); renderCurrentPage(); }
   if (displayPage == DisplayPage::Overview) sendMessage(200, "Overview page selected");
   else if (displayPage == DisplayPage::Table) sendMessage(200, "Table page selected");
@@ -3300,6 +3368,28 @@ void handleDisplaySettings() {
   if (webServer.hasArg("sound")) {
     soundAlerts = webServer.arg("sound") == "1";
     settingsStore.putBool("sound", soundAlerts);
+  }
+  if (webServer.hasArg("screensaverEnabled")) {
+    screensaverEnabled = webServer.arg("screensaverEnabled") == "1";
+    settingsStore.putBool("ssaver-on", screensaverEnabled);
+    // Turning it off (or back on, resetting the clock) shouldn't leave the
+    // panel showing a screensaver from before the setting changed.
+    lastInteractionAt = millis();
+    if (!screensaverEnabled && screensaverActive) {
+      screensaverActive = false;
+      MutexGuard guard(dataMutex);
+      renderCurrentPage();
+    }
+  }
+  if (webServer.hasArg("screensaverIdleMinutes")) {
+    long minutes = 0;
+    if (!parseStrictLong(webServer.arg("screensaverIdleMinutes"), minutes) || minutes < 1 || minutes > 120) {
+      sendMessage(400, "Screensaver idle time must be 1 to 120 minutes");
+      return;
+    }
+    screensaverIdleMinutes = static_cast<uint16_t>(minutes);
+    settingsStore.putUShort("ssaver-min", screensaverIdleMinutes);
+    lastInteractionAt = millis();
   }
   // The brightness slider is gone: the CH422G drives the backlight enable as a
   // plain switch with no PWM channel, so any value between 10 and 100 looked
@@ -4264,6 +4354,8 @@ void setup() {
   physicalMapZoom = constrain(settingsStore.getUChar("map-zoom", zoomForRadius()), 3, 16);
   displayPage = static_cast<DisplayPage>(constrain(settingsStore.getUChar("display-page", 0), 0, DISPLAY_PAGE_COUNT - 1));
   soundAlerts = settingsStore.getBool("sound", true);
+  screensaverEnabled = settingsStore.getBool("ssaver-on", false);
+  screensaverIdleMinutes = constrain(settingsStore.getUShort("ssaver-min", 5), 1, 120);
   brightnessPercent = settingsStore.getUChar("brightness", 100);
   brightnessPercent = constrain(brightnessPercent, 10, 100);
   generateCsrfToken();
@@ -4401,6 +4493,18 @@ void loop() {
   // advanced the page twice on the following pass.
   const TouchGesture gesture = touchGesture();
   const bool pressed = bootButtonTapped();
+  if (gesture != TouchGesture::None || pressed) {
+    lastInteractionAt = millis();
+    if (screensaverActive) {
+      // Consume this touch as a dismissal only - it shouldn't also advance
+      // the page it's returning to, same as the detail-card swallow below.
+      screensaverActive = false;
+      MutexGuard guard(dataMutex);
+      renderCurrentPage();
+      delay(15);
+      return;
+    }
+  }
   int pageStep = 0;
   // Swipe right advances Overview -> Table -> Map -> Radar -> Marine and
   // wraps; swipe left walks back. A tap either opens a detail card over the
@@ -4468,6 +4572,24 @@ void loop() {
     marineDataDirty = false;
     { MutexGuard guard(dataMutex); renderMarinePage(); }
     nextMarineRenderAt = millis() + 2000;
+  }
+  // Screensaver: activate after the configured idle time (no touch/button/
+  // web-driven interaction - see lastInteractionAt's updates elsewhere), then
+  // rotate which aircraft it shows every few seconds. Interaction handling
+  // above already dismisses it and returns early, so reaching here means
+  // nothing has touched the panel this pass.
+  if (screensaverEnabled && !screensaverActive && detailAircraftIndex < 0 &&
+      millis() - lastInteractionAt > screensaverIdleMinutes * 60000UL) {
+    screensaverActive = true;
+    screensaverAircraftIndex = 0;
+    screensaverRotateAt = millis() + 6000UL;
+    MutexGuard guard(dataMutex);
+    renderCurrentPage();
+  } else if (screensaverActive && static_cast<int32_t>(millis() - screensaverRotateAt) >= 0) {
+    ++screensaverAircraftIndex;
+    screensaverRotateAt = millis() + 6000UL;
+    MutexGuard guard(dataMutex);
+    renderCurrentPage();
   }
   delay(15);
 }
