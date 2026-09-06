@@ -2369,59 +2369,6 @@ void fetchAdsbV2Aircraft() {
   // Keep the large provider response scoped so its String and JSON allocations
   // are released before the optional TLS route-enrichment requests.
   {
-  WiFiClientSecure client;
-  applyTlsPolicy(client);
-  HTTPClient http;
-  // HTTPClient::setTimeout(), called here before http.begin() ever connects,
-  // is a no-op on this arduino-esp32 version: it only forwards to the live
-  // socket once connected() is already true, and even then it lands on
-  // Stream::setTimeout() - a member NetworkClientSecure's SO_RCVTIMEO/
-  // SO_SNDTIMEO logic never reads. That logic is instead keyed off
-  // NetworkClient's own _timeout, which only gets set once, inside
-  // connect(), from HTTPClient's separate _connectTimeout (default 5000ms,
-  // never previously set here). So every read on this socket has always
-  // been bounded by an unconfigured 5s default rather than the timeout this
-  // file believed it was setting. setConnectTimeout() below is what actually
-  // reaches that value. Confirmed independent of provider (adsb.fi and
-  // airplanes.live both hit the same watchdog abort mid-read), so this
-  // closes a real gap even though it may not be the sole cause of a stall
-  // long enough to still trip the 60s watchdog.
-  http.setTimeout(9000); http.setConnectTimeout(9000);
-  if (!http.begin(client, url)) {
-    finishFeedAttempt("Connection failed");
-    status("API", rgb(245,30,35));
-    present();
-    return;
-  }
-  http.addHeader("Accept-Encoding", "identity");
-  http.addHeader("User-Agent", userAgent());
-  if (apiProvider == "adsbx") {
-    http.addHeader("X-RapidAPI-Key", rapidApiKey);
-    http.addHeader("X-RapidAPI-Host", "adsbexchange-com1.p.rapidapi.com");
-  } else if (apiProvider == "aggregator" && aggregatorApiKey.length()) {
-    http.addHeader("Authorization", "Bearer " + aggregatorApiKey);
-  } else if (apiProvider == "flyitalyadsb" && flyItalyApiKey.length()) {
-    http.addHeader("X-Api-Key", flyItalyApiKey);
-  }
-  const int code = http.GET();
-  responseCode = code;
-  if (code == HTTP_CODE_TOO_MANY_REQUESTS) {
-    nextFetchAt = millis() + 60000UL;
-    http.end();
-    finishFeedAttempt("Rate limited", code);
-    status("RATE", rgb(245,30,35));
-    present();
-    return;
-  }
-  if (code != HTTP_CODE_OK) {
-    Serial.printf("%s HTTP %d\n", apiProvider.c_str(), code);
-    http.end();
-    finishFeedAttempt("HTTP error", code);
-    status("API", rgb(245,30,35));
-    present();
-    return;
-  }
-
   JsonDocument filter;
   JsonObject aircraftFilter = filter["ac"][0].to<JsonObject>();
   const char *fields[] = {"lat", "lon", "track", "true_heading", "mag_heading",
@@ -2430,25 +2377,94 @@ void fetchAdsbV2Aircraft() {
                           "squawk", "category", "ownOp", "cou", "emergency", "mlat"};
   for (const char *field : fields) aircraftFilter[field] = true;
   JsonDocument doc(&psramJsonAllocator);
-  PsramSink body;
-  // See the activeFetchClient/activeFetchDeadlineMs comment above
-  // feedStatus's declaration: this is the one call in the whole file
-  // confirmed to have caused every watchdog reboot logged so far, so it's
-  // the one wrapped in the external force-stop deadline.
-  activeFetchLastSeenSize = 0;
-  activeFetchBody = &body;
-  activeFetchStartedMs = millis();
-  activeFetchDeadlineMs = activeFetchStartedMs + 15000UL;
-  activeFetchClient = &client;
-  http.writeToStream(&body);
-  activeFetchClient = nullptr;
-  activeFetchBody = nullptr;
-  const DeserializationError error = deserializeJson(
-      doc, body.data(), body.size(), DeserializationOption::Filter(filter));
-  http.end();
-  if (error || !doc["ac"].is<JsonArray>()) {
+  DeserializationError error = DeserializationError::IncompleteInput;
+  int code = 0;
+  size_t bodySize = 0;
+  // A body that stalls partway through (see the force-close comment below)
+  // is almost always a one-off transient network hiccup rather than a
+  // repeatable failure - confirmed by packet capture to sometimes be plain
+  // TCP packet loss on the path, not anything wrong with the request or the
+  // server. Retrying once immediately, before giving up and surfacing an
+  // error, recovers from exactly that case instead of making every
+  // occasional dropped packet count as a failed fetch.
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    WiFiClientSecure client;
+    applyTlsPolicy(client);
+    HTTPClient http;
+    // HTTPClient::setTimeout(), called here before http.begin() ever connects,
+    // is a no-op on this arduino-esp32 version: it only forwards to the live
+    // socket once connected() is already true, and even then it lands on
+    // Stream::setTimeout() - a member NetworkClientSecure's SO_RCVTIMEO/
+    // SO_SNDTIMEO logic never reads. That logic is instead keyed off
+    // NetworkClient's own _timeout, which only gets set once, inside
+    // connect(), from HTTPClient's separate _connectTimeout (default 5000ms,
+    // never previously set here). So every read on this socket has always
+    // been bounded by an unconfigured 5s default rather than the timeout this
+    // file believed it was setting. setConnectTimeout() below is what actually
+    // reaches that value. Confirmed independent of provider (adsb.fi and
+    // airplanes.live both hit the same watchdog abort mid-read), so this
+    // closes a real gap even though it may not be the sole cause of a stall
+    // long enough to still trip the 60s watchdog.
+    http.setTimeout(9000); http.setConnectTimeout(9000);
+    if (!http.begin(client, url)) {
+      finishFeedAttempt("Connection failed");
+      status("API", rgb(245,30,35));
+      present();
+      return;
+    }
+    http.addHeader("Accept-Encoding", "identity");
+    http.addHeader("User-Agent", userAgent());
+    if (apiProvider == "adsbx") {
+      http.addHeader("X-RapidAPI-Key", rapidApiKey);
+      http.addHeader("X-RapidAPI-Host", "adsbexchange-com1.p.rapidapi.com");
+    } else if (apiProvider == "aggregator" && aggregatorApiKey.length()) {
+      http.addHeader("Authorization", "Bearer " + aggregatorApiKey);
+    } else if (apiProvider == "flyitalyadsb" && flyItalyApiKey.length()) {
+      http.addHeader("X-Api-Key", flyItalyApiKey);
+    }
+    code = http.GET();
+    responseCode = code;
+    if (code == HTTP_CODE_TOO_MANY_REQUESTS) {
+      nextFetchAt = millis() + 60000UL;
+      http.end();
+      finishFeedAttempt("Rate limited", code);
+      status("RATE", rgb(245,30,35));
+      present();
+      return;
+    }
+    if (code != HTTP_CODE_OK) {
+      Serial.printf("%s HTTP %d\n", apiProvider.c_str(), code);
+      http.end();
+      finishFeedAttempt("HTTP error", code);
+      status("API", rgb(245,30,35));
+      present();
+      return;
+    }
+
+    PsramSink body;
+    // See the activeFetchClient/activeFetchDeadlineMs comment above
+    // feedStatus's declaration: this is the one call in the whole file
+    // confirmed to have caused every watchdog reboot logged so far, so it's
+    // the one wrapped in the external force-stop deadline.
+    activeFetchLastSeenSize = 0;
+    activeFetchBody = &body;
+    activeFetchStartedMs = millis();
+    activeFetchDeadlineMs = activeFetchStartedMs + 15000UL;
+    activeFetchClient = &client;
+    http.writeToStream(&body);
+    activeFetchClient = nullptr;
+    activeFetchBody = nullptr;
+    doc.clear();
+    error = deserializeJson(doc, body.data(), body.size(), DeserializationOption::Filter(filter));
+    bodySize = body.size();
+    http.end();
+    if (!error && doc["ac"].is<JsonArray>()) break;
     Serial.printf("%s JSON %s (%u bytes)\n", apiProvider.c_str(), error.c_str(),
-                  static_cast<unsigned>(body.size()));
+                  static_cast<unsigned>(bodySize));
+    if (attempt == 0 && error == DeserializationError::IncompleteInput) {
+      Serial.println("Retrying once after an incomplete/stalled response");
+      continue;
+    }
     finishFeedAttempt("Invalid response", code);
     status("JSON", rgb(245,30,35));
     present();
