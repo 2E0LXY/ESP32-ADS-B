@@ -78,7 +78,7 @@ public feed - not part of this aggregator) with its own API key field, for
 users who'd rather use FlyItalyADSB's own key/endpoint directly instead of
 this backend.
 
-## Feeder ingestion (customers' own receivers) - firewall requirement
+## Feeder ingestion (customers' own receivers) - networking requirements
 
 Each feeder-enabled device gets one dedicated TCP port (default range
 30100-30999, set by `FEEDER_PORT_RANGE_START`/`FEEDER_PORT_RANGE_END` in
@@ -91,7 +91,25 @@ since that's how their receiver reaches us:
 sudo ufw allow 30100:30999/tcp
 ```
 
-(adjust if you change the range). This is separate from the feeder-key
+(adjust if you change the range).
+
+**Container networking: this is why `docker-compose.yml` uses
+`network_mode: host` rather than Docker's default published-ports list.**
+Publishing an 800+ port range the normal way (`"30100-30999:30100-30999"`)
+makes Docker create one NAT/iptables rule per port at container start - on a
+small VPS that's enough forked `iptables` processes in a row to exhaust the
+process table and hang the whole machine (this actually happened during
+initial deployment). Host networking skips Docker's per-port NAT layer
+entirely: the app binds ports directly on the VPS's own network stack. The
+`docker-compose.yml` command override pins the main HTTP/admin port to
+`127.0.0.1` explicitly (so it isn't exposed outside of Caddy's reverse
+proxy) while the feeder listeners still bind `0.0.0.0` themselves in
+`feed_ingest.py`, since those are meant to be reachable directly. If you
+ever narrow `FEEDER_PORT_RANGE_START`/`END` to a small handful of ports,
+reverting to normal published ports (dropping `network_mode: host`) would
+be fine too - host mode is only needed because the range is so wide.
+
+This is separate from the feeder-key
 pooling feature - a feeder key is someone else's personal API credential for
 an existing public network; feeder ingestion is a customer's own receiver's
 raw data being pushed straight into this backend.

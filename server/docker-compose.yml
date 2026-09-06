@@ -3,15 +3,25 @@ services:
     build: .
     container_name: adsb-aggregator
     restart: unless-stopped
-    # Caddy already reverse-proxies 127.0.0.1:8090 to adsb.2e0lxy.uk from the
-    # earlier setup - keep the same port so no Caddyfile change is needed.
-    # Feeder ports are raw TCP, not HTTP - Caddy can't proxy these, so they're
-    # published directly on all interfaces. Range must match FEEDER_PORT_RANGE_START/
-    # END in .env, and the VPS firewall must allow inbound TCP on the same range
-    # (see README.md).
-    ports:
-      - "127.0.0.1:8090:8090"
-      - "30100-30999:30100-30999"
+    # Host networking instead of published ports: the feeder range is up to
+    # 900 ports (FEEDER_PORT_RANGE_START/END in .env), and Docker's default
+    # bridge networking creates one NAT/iptables rule per published port -
+    # on a small VPS that's enough forked iptables processes to exhaust the
+    # process table and hang the whole machine (seen in practice). Host mode
+    # skips Docker's per-port NAT entirely; the app binds 0.0.0.0 directly on
+    # the VPS's own network stack (see Dockerfile CMD and feed_ingest.py).
+    # Caddy still reverse-proxies 127.0.0.1:8090 to adsb.2e0lxy.uk with no
+    # Caddyfile change needed, since that's now a normal host-local port.
+    # The VPS firewall must still allow inbound TCP on the feeder range
+    # (see README.md) - host mode doesn't change that requirement.
+    network_mode: host
+    # Host mode means the container shares the VPS's own network stack, so
+    # the app's bind address is no longer sandboxed by Docker port publishing
+    # - pin the HTTP/admin surface to localhost explicitly (Caddy still
+    # proxies it from there) so it isn't reachable directly over plain HTTP.
+    # Feeder listeners are opened separately by the app itself on 0.0.0.0
+    # (see feed_ingest.py) since those are meant to be internet-reachable.
+    command: ["uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "8090"]
     volumes:
       - adsb-data:/data
     env_file:
