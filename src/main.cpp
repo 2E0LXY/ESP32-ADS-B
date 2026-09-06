@@ -375,6 +375,7 @@ String apiProvider = "opensky";
 String openSkyClientId;
 String openSkyClientSecret;
 String rapidApiKey;
+String aggregatorApiKey;
 bool soundAlerts = true;
 uint8_t brightnessPercent = 100;
 bool webServerReady = false;
@@ -2238,6 +2239,14 @@ void fetchAdsbV2Aircraft() {
     // directly - see the provider-terms comment above for why that matters
     // at more than a handful of devices. Same {"ac": [...]} response shape
     // as every other provider here, so no parsing changes needed.
+    // Requires a per-device key issued from the account dashboard at
+    // adsb.2e0lxy.uk/account - the backend rejects requests with no key.
+    if (!aggregatorApiKey.length()) {
+      finishFeedAttempt("API key required");
+      status("KEY", rgb(245,30,35));
+      present();
+      return;
+    }
     url = "https://adsb.2e0lxy.uk/v1/aircraft?lat=" + latitude + "&lon=" + longitude + "&radius=" + radius;
   } else if (apiProvider == "adsbfi") {
     url = "https://opendata.adsb.fi/api/v3/lat/" + latitude + "/lon/" + longitude + "/dist/" + radius;
@@ -2296,6 +2305,8 @@ void fetchAdsbV2Aircraft() {
   if (apiProvider == "adsbx") {
     http.addHeader("X-RapidAPI-Key", rapidApiKey);
     http.addHeader("X-RapidAPI-Host", "adsbexchange-com1.p.rapidapi.com");
+  } else if (apiProvider == "aggregator" && aggregatorApiKey.length()) {
+    http.addHeader("Authorization", "Bearer " + aggregatorApiKey);
   }
   const int code = http.GET();
   responseCode = code;
@@ -3071,6 +3082,7 @@ void handleStatusApi() {
   doc["hasOpenSkyClientId"] = openSkyClientId.length() > 0;
   doc["hasOpenSkyClientSecret"] = openSkyClientSecret.length() > 0;
   doc["hasRapidApiKey"] = rapidApiKey.length() > 0;
+  doc["hasAggregatorApiKey"] = aggregatorApiKey.length() > 0;
   doc["version"] = FIRMWARE_VERSION;
   doc["build"] = String(__DATE__) + " " + __TIME__;
   doc["updateSpace"] = ESP.getFreeSketchSpace();
@@ -3386,7 +3398,8 @@ void handleProviderSettings() {
   }
   if (webServer.arg("clientId").length() > 128 ||
       webServer.arg("clientSecret").length() > 256 ||
-      webServer.arg("rapidApiKey").length() > 256) {
+      webServer.arg("rapidApiKey").length() > 256 ||
+      webServer.arg("aggregatorApiKey").length() > 128) {
     sendMessage(400, "API credential fields are too long");
     return;
   }
@@ -3394,9 +3407,11 @@ void handleProviderSettings() {
     openSkyClientId = "";
     openSkyClientSecret = "";
     rapidApiKey = "";
+    aggregatorApiKey = "";
     settingsStore.putString("os-client", "");
     settingsStore.putString("os-secret", "");
     settingsStore.putString("rapid-key", "");
+    settingsStore.putString("agg-key", "");
   } else {
     if (webServer.hasArg("clientId") && webServer.arg("clientId").length()) {
       openSkyClientId = webServer.arg("clientId");
@@ -3409,6 +3424,10 @@ void handleProviderSettings() {
     if (webServer.hasArg("rapidApiKey") && webServer.arg("rapidApiKey").length()) {
       rapidApiKey = webServer.arg("rapidApiKey");
       settingsStore.putString("rapid-key", rapidApiKey);
+    }
+    if (webServer.hasArg("aggregatorApiKey") && webServer.arg("aggregatorApiKey").length()) {
+      aggregatorApiKey = webServer.arg("aggregatorApiKey");
+      settingsStore.putString("agg-key", aggregatorApiKey);
     }
   }
   apiProvider = provider;
@@ -4201,6 +4220,7 @@ void setup() {
   openSkyClientSecret = settingsStore.getString("os-secret", "");
 #endif
   rapidApiKey = settingsStore.getString("rapid-key", "");
+  aggregatorApiKey = settingsStore.getString("agg-key", "");
   aisApiKey = settingsStore.getString("ais-key", "");
   aisHubUsername = settingsStore.getString("aishub-user", "");
   myShipTrackingApiKey = settingsStore.getString("mst-key", "");
