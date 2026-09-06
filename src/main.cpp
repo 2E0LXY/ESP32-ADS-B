@@ -1177,13 +1177,35 @@ bool cacheOsmTile(uint8_t zoom, int tileX, int tileY, const String &path) {
 bool drawCachedOsmTile(const String &path, int screenX, int screenY) {
   fs::FS &cache = sdMounted ? static_cast<fs::FS &>(SDCARD) : static_cast<fs::FS &>(LittleFS);
   File file = cache.open(path, FILE_READ);
-  if (!file) return false;
+  // cacheOsmTile() trusts cache.exists() alone and never re-fetches a file
+  // once it's present, so a tile that's corrupt on disk - filesystem
+  // inconsistency (exists() said yes, open() disagrees) or a short read
+  // (truncated write, possibly from before the write-length check in
+  // cacheOsmTile() existed) - would otherwise report cached=1 drawn=0
+  // forever, surviving every reboot and reflash since neither touches the
+  // SD card. Evict it here too, not just on an actual PNG decode failure
+  // below, so the next attempt re-downloads a fresh copy instead of
+  // repeating the same failure indefinitely. A PSRAM allocation failure is
+  // deliberately excluded - that's transient memory pressure, not a bad
+  // file, and evicting a perfectly good tile over it would just waste
+  // bandwidth re-downloading something that was never the problem.
+  if (!file) {
+    cache.remove(path);
+    Serial.printf("Removed unopenable cached tile %s\n", path.c_str());
+    return false;
+  }
   const size_t size = file.size();
   uint8_t *data = static_cast<uint8_t *>(heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
   if (!data) { file.close(); return false; }
   const size_t read = file.read(data, size);
   file.close();
-  if (read != size) { heap_caps_free(data); return false; }
+  if (read != size) {
+    heap_caps_free(data);
+    cache.remove(path);
+    Serial.printf("Removed short-read cached tile %s (%u of %u bytes)\n", path.c_str(),
+                  static_cast<unsigned>(read), static_cast<unsigned>(size));
+    return false;
+  }
   pngTileScreenX = screenX;
   pngTileScreenY = screenY;
   const int opened = pngDecoder.openRAM(data, size, drawPngLine);
