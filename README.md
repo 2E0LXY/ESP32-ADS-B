@@ -74,7 +74,7 @@ Current firmware: **v2.5.1**
 ## Quick start
 
 1. Open the [online USB installer](https://2e0lxy.github.io/ESP32-ADS-B/) in desktop Chrome or Edge and connect the ESP32-S3 by USB.
-2. Install the factory image, restart the receiver, and connect to the `ADSBMAP` setup network if no saved Wi-Fi is available.
+2. Install the factory image, restart the receiver, and connect to the `ADSB_WIFI` setup network (open, no password) if no saved Wi-Fi is available.
 3. Choose a 2.4 GHz Wi-Fi network. The LCD waits for Wi-Fi and then displays the receiver's LAN address.
 4. Open that address, sign in with `admin` / `aircraft`, and immediately set a new password in **Device**.
 5. Set the receiver latitude, longitude, radius, and zoom in **Map**, then choose an aircraft feed in **Data API**.
@@ -120,7 +120,7 @@ After Wi-Fi connects, the LCD displays the address of the web interface. Open th
 | --- | --- |
 | Username | `admin` |
 | Password | `aircraft` |
-| Setup access point | `ADSBMAP` |
+| Setup access point | `ADSB_WIFI` (open, no password) |
 | Setup portal | `http://192.168.4.1/` |
 
 Change the management password in **Device** after installation. The replacement password must contain at least eight characters.
@@ -315,7 +315,7 @@ Map data is © OpenStreetMap contributors. The browser and LCD show attribution.
 ## Diagnostics and troubleshooting
 
 - If the boot screen says **Wi-Fi connecting**, wait for the LAN address before opening the admin interface. `192.168.4.1` is only the temporary setup portal address.
-- If Wi-Fi fails, connect to the `ADSBMAP` access point and open `http://192.168.4.1/`.
+- If Wi-Fi fails, connect to the `ADSB_WIFI` access point (open, no password) and open `http://192.168.4.1/`.
 - If the LCD says **Rebuilding LCD map**, leave the receiver powered while it downloads and caches tiles for the newly saved position, range, or zoom.
 - If aircraft stop updating, open **Data API**, run **Refresh / test feed**, and check the returned HTTP status and latency.
 - The browser map uses Leaflet and OpenStreetMap tiles loaded from the internet. On an isolated network the **Map** page shows a fallback message; every other page, and the LCD map, still work from cached tiles.

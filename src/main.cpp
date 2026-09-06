@@ -3827,7 +3827,7 @@ void beginWebControl() {
     webServer.on("/api/portal", HTTP_POST, []() {
       if (!requireWebAuthentication()) return;
       if (!requireCsrfToken()) return;
-      sendMessage(202, "Setup portal will start as ADSBMAP");
+      sendMessage(202, "Setup portal will start as ADSB_WIFI");
       setupPortalPending = true;
     });
     webServer.onNotFound([]() {
@@ -4272,7 +4272,7 @@ void networkTask(void *) {
       WiFiManager wm;
       wm.setWiFiAPChannel(6);
       wm.setConfigPortalTimeout(900);
-      wm.startConfigPortal("ADSBMAP", "aircraft");
+      wm.startConfigPortal("ADSB_WIFI");
       beginWebControl();
     }
     if (pageSavePending && static_cast<int32_t>(millis() - pageSaveAt) >= 0) {
@@ -4470,7 +4470,7 @@ void setup() {
     renderBootScreen("AP access: 192.168.4.1", rgb(245, 180, 35));
   });
   renderBootScreen("Wi-Fi connecting - please wait", rgb(53,169,244));
-  if (!wm.autoConnect("ADSBMAP", "aircraft")) {
+  if (!wm.autoConnect("ADSB_WIFI")) {
     renderBootScreen("Wi-Fi failed - setup required", rgb(255,65,65));
     delay(5000);
     restoreMap(); status("WIFI",rgb(245,30,35)); present();
