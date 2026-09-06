@@ -1,6 +1,6 @@
 import datetime
 
-from fastapi import APIRouter, Depends, Form, Header, Request, status
+from fastapi import APIRouter, Cookie, Depends, Form, Header, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
@@ -122,6 +122,7 @@ def account_dashboard(
     request: Request,
     account: models.Account = Depends(get_current_account),
     db: Session = Depends(get_db),
+    flash_key: str | None = Cookie(default=None),
 ):
     devices = db.query(models.Device).filter(models.Device.account_id == account.id).all()
     for device in devices:
@@ -132,11 +133,24 @@ def account_dashboard(
             .first()
         )
     feeder_keys = db.query(models.FeederKey).filter(models.FeederKey.account_id == account.id).all()
-    return templates.TemplateResponse(
+    # Read-once: a freshly reissued key rides here in a short-lived signed
+    # cookie (see reissue_key()) rather than being rendered directly by the
+    # POST handler, so refreshing this page can never resubmit "reissue" and
+    # silently revoke the key it just showed you.
+    new_key = None
+    if flash_key:
+        payload = security.read_flash_token(flash_key)
+        owned_device_ids = {d.id for d in devices}
+        if payload and payload.get("device_id") in owned_device_ids:
+            new_key = payload.get("key")
+    response = templates.TemplateResponse(
         request,
         "account_dashboard.html",
-        {"devices": devices, "feeder_keys": feeder_keys},
+        {"devices": devices, "feeder_keys": feeder_keys, "new_key": new_key},
     )
+    if flash_key:
+        response.delete_cookie("flash_key")
+    return response
 
 
 @router.post("/devices")
@@ -151,10 +165,9 @@ def add_device(
     return RedirectResponse("/account", status_code=status.HTTP_303_SEE_OTHER)
 
 
-@router.post("/devices/{device_id}/reissue-key", response_class=HTMLResponse)
+@router.post("/devices/{device_id}/reissue-key")
 def reissue_key(
     device_id: int,
-    request: Request,
     account: models.Account = Depends(get_current_account),
     db: Session = Depends(get_db),
 ):
@@ -169,20 +182,24 @@ def reissue_key(
     plaintext, prefix, digest = security.generate_api_key()
     db.add(models.ApiKey(device_id=device.id, key_prefix=prefix, key_hash=digest))
     db.commit()
-    devices = db.query(models.Device).filter(models.Device.account_id == account.id).all()
-    for d in devices:
-        d.active_key = (
-            db.query(models.ApiKey)
-            .filter(models.ApiKey.device_id == d.id, models.ApiKey.revoked_at.is_(None))
-            .order_by(models.ApiKey.created_at.desc())
-            .first()
-        )
-    feeder_keys = db.query(models.FeederKey).filter(models.FeederKey.account_id == account.id).all()
-    return templates.TemplateResponse(
-        request,
-        "account_dashboard.html",
-        {"devices": devices, "feeder_keys": feeder_keys, "new_key": plaintext},
+    # Redirect (not render directly) so refreshing the resulting page is a
+    # plain GET, not a resubmission of this POST - rendering the template
+    # here directly meant a browser refresh silently reissued (and thereby
+    # revoked) a brand new key every time, which is why a key that worked
+    # moments ago could 401 shortly after with nothing else having changed.
+    # The plaintext rides across that redirect in a short-lived signed
+    # cookie instead of a query string, so it's never persisted anywhere
+    # (browser history, server access logs) beyond this once-only hop.
+    response = RedirectResponse("/account", status_code=status.HTTP_303_SEE_OTHER)
+    response.set_cookie(
+        "flash_key",
+        security.create_flash_token(device.id, plaintext),
+        max_age=60,
+        httponly=True,
+        secure=True,
+        samesite="lax",
     )
+    return response
 
 
 @router.post("/devices/{device_id}/delete")

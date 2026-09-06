@@ -56,6 +56,27 @@ def read_session_token(token: str, expected_scope: str) -> str | None:
     return payload.get("sub")
 
 
+# Carries a freshly-issued plaintext API key across the POST->redirect->GET
+# hop after "Reissue key", so a page refresh can never resubmit the POST and
+# silently reissue (and thereby revoke) another key - see reissue_key() in
+# routers/public.py. Deliberately short-lived and read-once (the GET handler
+# clears the cookie immediately after reading it).
+def create_flash_token(device_id: int, plaintext_key: str) -> str:
+    expires = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=60)
+    payload = {"device_id": device_id, "key": plaintext_key, "scope": "flash", "exp": expires}
+    return jwt.encode(payload, SESSION_SECRET, algorithm=SESSION_ALGO)
+
+
+def read_flash_token(token: str) -> dict | None:
+    try:
+        payload = jwt.decode(token, SESSION_SECRET, algorithms=[SESSION_ALGO])
+    except JWTError:
+        return None
+    if payload.get("scope") != "flash":
+        return None
+    return payload
+
+
 # API keys: "adsb_" + 32 random URL-safe characters. Only the SHA-256 hash
 # is ever persisted (see ApiKey model) - the prefix is stored separately,
 # unhashed, purely so the admin panel can show "adsb_x7Hf..." to help a
