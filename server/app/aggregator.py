@@ -88,6 +88,14 @@ class AircraftCache:
                 result.append(entry.data)
         return result
 
+    async def query_by_source(self, source: str) -> list[dict]:
+        """Used by the "my feed" account page - only aircraft whose most
+        recently merged record came from this exact source tag, so a
+        feeder only ever sees what its own receiver actually contributed,
+        not the whole shared cache."""
+        async with self._lock:
+            return [entry.data for entry in self._by_hex.values() if entry.data.get("_source") == source]
+
     def size(self) -> int:
         return len(self._by_hex)
 

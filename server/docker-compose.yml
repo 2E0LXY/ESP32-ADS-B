@@ -5,8 +5,13 @@ services:
     restart: unless-stopped
     # Caddy already reverse-proxies 127.0.0.1:8090 to adsb.2e0lxy.uk from the
     # earlier setup - keep the same port so no Caddyfile change is needed.
+    # Feeder ports are raw TCP, not HTTP - Caddy can't proxy these, so they're
+    # published directly on all interfaces. Range must match FEEDER_PORT_RANGE_START/
+    # END in .env, and the VPS firewall must allow inbound TCP on the same range
+    # (see README.md).
     ports:
       - "127.0.0.1:8090:8090"
+      - "30100-30999:30100-30999"
     volumes:
       - adsb-data:/data
     env_file:

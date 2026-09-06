@@ -48,6 +48,17 @@ class Device(Base):
     firmware_version = Column(String(64), nullable=True)
     last_seen_at = Column(DateTime(timezone=True), nullable=True)
     last_seen_ip = Column(String(64), nullable=True)
+    # A customer's own physical receiver (already feeding FlightAware/FR24/
+    # etc.) can additionally push its raw SBS/BaseStation output straight to
+    # this backend - see app/feed_ingest.py. Each feeder gets one dedicated
+    # TCP port because standard feeder software (readsb, dump1090, PiAware)
+    # only knows how to open an outbound connection to a fixed host:port; it
+    # has no way to send a custom auth handshake first, so per-device ports
+    # are how every established feeder network (adsb.fi, FlightAware, etc.)
+    # actually tells feeds apart.
+    feeder_enabled = Column(Boolean, default=False, nullable=False)
+    feeder_port = Column(Integer, unique=True, nullable=True)
+    feeder_last_message_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
 
     account = relationship("Account", back_populates="devices")

@@ -7,6 +7,7 @@ from fastapi import FastAPI
 from . import models, security
 from .aggregator import Aggregator
 from .database import Base, SessionLocal, engine
+from .feed_ingest import FeedIngestManager
 from .routers import admin, public
 
 logging.basicConfig(level=logging.INFO)
@@ -59,10 +60,14 @@ async def startup():
     app.state.aggregator = Aggregator(home_lat, home_lon, home_radius_nm, SessionLocal)
     app.state.aggregator.start()
 
+    app.state.feed_ingest = FeedIngestManager(app.state.aggregator, SessionLocal)
+    await app.state.feed_ingest.sync_from_db()
+
 
 @app.on_event("shutdown")
 async def shutdown():
     await app.state.aggregator.stop()
+    await app.state.feed_ingest.stop_all()
 
 
 app.include_router(public.router)

@@ -9,6 +9,7 @@ from .. import models, security
 from ..aggregator import Aggregator
 from ..database import get_db
 from ..deps import get_current_account, require_device_api_key
+from ..feed_ingest import allocate_port
 
 router = APIRouter()
 templates = Jinja2Templates(directory="app/templates")
@@ -255,3 +256,74 @@ def _owned_device(db: Session, account: models.Account, device_id: int) -> model
         .filter(models.Device.id == device_id, models.Device.account_id == account.id)
         .first()
     )
+
+
+# --- Feeder ingestion (a customer's own receiver feeding this backend) -----
+
+
+@router.post("/devices/{device_id}/feeder/enable")
+async def enable_feeder(
+    device_id: int,
+    request: Request,
+    account: models.Account = Depends(get_current_account),
+    db: Session = Depends(get_db),
+):
+    device = _owned_device(db, account, device_id)
+    if not device:
+        return RedirectResponse("/account", status_code=status.HTTP_303_SEE_OTHER)
+    if not device.feeder_port:
+        port = allocate_port(db)
+        if port is None:
+            # Every port in the configured range is already assigned - a
+            # capacity problem for the operator to fix (widen the range),
+            # not something the customer can do anything about.
+            return RedirectResponse("/account", status_code=status.HTTP_303_SEE_OTHER)
+        device.feeder_port = port
+    device.feeder_enabled = True
+    db.commit()
+    await request.app.state.feed_ingest.start_for_device(device.id, device.feeder_port)
+    return RedirectResponse("/account", status_code=status.HTTP_303_SEE_OTHER)
+
+
+@router.post("/devices/{device_id}/feeder/disable")
+async def disable_feeder(
+    device_id: int,
+    request: Request,
+    account: models.Account = Depends(get_current_account),
+    db: Session = Depends(get_db),
+):
+    device = _owned_device(db, account, device_id)
+    if not device:
+        return RedirectResponse("/account", status_code=status.HTTP_303_SEE_OTHER)
+    device.feeder_enabled = False
+    port = device.feeder_port
+    db.commit()
+    await request.app.state.feed_ingest.stop_for_device(port)
+    return RedirectResponse("/account", status_code=status.HTTP_303_SEE_OTHER)
+
+
+@router.get("/account/my-feed/{device_id}", response_class=HTMLResponse)
+def my_feed_page(
+    device_id: int,
+    request: Request,
+    account: models.Account = Depends(get_current_account),
+    db: Session = Depends(get_db),
+):
+    device = _owned_device(db, account, device_id)
+    if not device:
+        return RedirectResponse("/account", status_code=status.HTTP_303_SEE_OTHER)
+    return templates.TemplateResponse(request, "my_feed.html", {"device": device})
+
+
+@router.get("/account/my-feed/{device_id}/aircraft")
+async def my_feed_aircraft(
+    device_id: int,
+    request: Request,
+    account: models.Account = Depends(get_current_account),
+    db: Session = Depends(get_db),
+):
+    device = _owned_device(db, account, device_id)
+    if not device:
+        return {"ac": []}
+    aircraft = await _aggregator(request).cache.query_by_source(f"feeder:{device.id}")
+    return {"ac": aircraft, "total": len(aircraft)}

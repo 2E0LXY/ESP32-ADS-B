@@ -40,6 +40,46 @@
 </div>
 
 <div class="panel">
+<h2>Feed your own receiver into this system</h2>
+<p class="sub">Already run a physical receiver (readsb, dump1090, PiAware) feeding FlightAware, FlightRadar24, or
+similar? Point one more output at this server and two things happen: you get a live map of exactly what your own
+receiver sees, and those aircraft are added into the shared feed every device (including yours) can see - useful
+for local coverage the public APIs might miss. This is separate from the donated API keys below - this is your
+receiver's own raw data, not a key to someone else's network.</p>
+<table>
+<thead><tr><th>Device</th><th>Status</th><th>Assigned port</th><th>Last message</th><th></th></tr></thead>
+<tbody>
+{% for device in devices %}
+<tr>
+<td>{{ device.name }}</td>
+<td>{% if device.feeder_enabled %}<span class="badge ok">Enabled</span>{% else %}<span class="badge bad">Off</span>{% endif %}</td>
+<td>{{ device.feeder_port or '--' }}</td>
+<td>{{ device.feeder_last_message_at.strftime('%Y-%m-%d %H:%M UTC') if device.feeder_last_message_at else 'Never' }}</td>
+<td>
+{% if device.feeder_enabled %}
+<a href="/account/my-feed/{{ device.id }}"><button type="button">View my feed</button></a>
+<form class="inline" method="post" action="/devices/{{ device.id }}/feeder/disable"><button class="danger" type="submit">Turn off</button></form>
+{% else %}
+<form class="inline" method="post" action="/devices/{{ device.id }}/feeder/enable"><button type="submit">Enable</button></form>
+{% endif %}
+</td>
+</tr>
+{% if device.feeder_enabled and device.feeder_port %}
+<tr><td colspan="5" class="sub" style="padding-top:0">
+Point your receiver's SBS/BaseStation output at <code>{{ request.url.hostname }}:{{ device.feeder_port }}</code>.
+For readsb/dump1090-fa, add to your config: <code>--net-connector={{ request.url.hostname }},{{ device.feeder_port }},sbs_out</code>
+(or the equivalent "additional SBS output" field if you're using a web-based config tool). No firewall changes needed
+on your end - your receiver connects out to us, nothing connects in to you.
+</td></tr>
+{% endif %}
+{% else %}
+<tr><td colspan="5" class="sub">Add a device above first.</td></tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+
+<div class="panel">
 <h2>Donated feeder keys</h2>
 <p class="sub">Already run your own receiver and feed adsb.fi, airplanes.live, or adsb.lol? Donate that personal
 key here and the aggregator will use it (within your own allowance) to help serve every device, yours included.
