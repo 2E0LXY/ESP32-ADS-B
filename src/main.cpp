@@ -376,6 +376,7 @@ String openSkyClientId;
 String openSkyClientSecret;
 String rapidApiKey;
 String aggregatorApiKey;
+String flyItalyApiKey;
 bool soundAlerts = true;
 uint8_t brightnessPercent = 100;
 bool webServerReady = false;
@@ -2264,6 +2265,20 @@ void fetchAdsbV2Aircraft() {
       return;
     }
     url = "https://adsbexchange-com1.p.rapidapi.com/v2/lat/" + latitude + "/lon/" + longitude + "/dist/" + radius + "/";
+  } else if (apiProvider == "flyitalyadsb") {
+    // FlyItalyADSB: CC BY-SA 4.0, commercial use explicitly permitted up to
+    // 100 requests/minute with attribution - see
+    // flyitalyadsb.com/api-documentation. Free key issued instantly by
+    // email; sent as X-Api-Key below. Its dist parameter is kilometres, not
+    // nautical miles, unlike every other provider here.
+    if (!flyItalyApiKey.length()) {
+      finishFeedAttempt("API key required");
+      status("KEY", rgb(245,30,35));
+      present();
+      return;
+    }
+    const String distanceKm = String(queryRadiusNm * 1.852f, 1);
+    url = "https://api.flyitalyadsb.com/v2/lat/" + latitude + "/lon/" + longitude + "/dist/" + distanceKm;
   } else {
     finishFeedAttempt("Unknown provider");
     status("FEED", rgb(245,30,35));
@@ -2307,6 +2322,8 @@ void fetchAdsbV2Aircraft() {
     http.addHeader("X-RapidAPI-Host", "adsbexchange-com1.p.rapidapi.com");
   } else if (apiProvider == "aggregator" && aggregatorApiKey.length()) {
     http.addHeader("Authorization", "Bearer " + aggregatorApiKey);
+  } else if (apiProvider == "flyitalyadsb" && flyItalyApiKey.length()) {
+    http.addHeader("X-Api-Key", flyItalyApiKey);
   }
   const int code = http.GET();
   responseCode = code;
@@ -3083,6 +3100,7 @@ void handleStatusApi() {
   doc["hasOpenSkyClientSecret"] = openSkyClientSecret.length() > 0;
   doc["hasRapidApiKey"] = rapidApiKey.length() > 0;
   doc["hasAggregatorApiKey"] = aggregatorApiKey.length() > 0;
+  doc["hasFlyItalyApiKey"] = flyItalyApiKey.length() > 0;
   doc["version"] = FIRMWARE_VERSION;
   doc["build"] = String(__DATE__) + " " + __TIME__;
   doc["updateSpace"] = ESP.getFreeSketchSpace();
@@ -3392,14 +3410,15 @@ void handleProviderSettings() {
   if (provider != "opensky" && provider != "adsbfi" &&
       provider != "airplaneslive" && provider != "adsblol" &&
       provider != "adsbone" && provider != "adsbx" &&
-      provider != "aggregator") {
+      provider != "aggregator" && provider != "flyitalyadsb") {
     sendMessage(400, "Unknown aircraft data provider");
     return;
   }
   if (webServer.arg("clientId").length() > 128 ||
       webServer.arg("clientSecret").length() > 256 ||
       webServer.arg("rapidApiKey").length() > 256 ||
-      webServer.arg("aggregatorApiKey").length() > 128) {
+      webServer.arg("aggregatorApiKey").length() > 128 ||
+      webServer.arg("flyItalyApiKey").length() > 128) {
     sendMessage(400, "API credential fields are too long");
     return;
   }
@@ -3408,10 +3427,12 @@ void handleProviderSettings() {
     openSkyClientSecret = "";
     rapidApiKey = "";
     aggregatorApiKey = "";
+    flyItalyApiKey = "";
     settingsStore.putString("os-client", "");
     settingsStore.putString("os-secret", "");
     settingsStore.putString("rapid-key", "");
     settingsStore.putString("agg-key", "");
+    settingsStore.putString("flyitaly-key", "");
   } else {
     if (webServer.hasArg("clientId") && webServer.arg("clientId").length()) {
       openSkyClientId = webServer.arg("clientId");
@@ -3428,6 +3449,10 @@ void handleProviderSettings() {
     if (webServer.hasArg("aggregatorApiKey") && webServer.arg("aggregatorApiKey").length()) {
       aggregatorApiKey = webServer.arg("aggregatorApiKey");
       settingsStore.putString("agg-key", aggregatorApiKey);
+    }
+    if (webServer.hasArg("flyItalyApiKey") && webServer.arg("flyItalyApiKey").length()) {
+      flyItalyApiKey = webServer.arg("flyItalyApiKey");
+      settingsStore.putString("flyitaly-key", flyItalyApiKey);
     }
   }
   apiProvider = provider;
@@ -4209,7 +4234,7 @@ void setup() {
   if (apiProvider != "opensky" && apiProvider != "adsbfi" &&
       apiProvider != "airplaneslive" && apiProvider != "adsblol" &&
       apiProvider != "adsbone" && apiProvider != "adsbx" &&
-      apiProvider != "aggregator") apiProvider = "opensky";
+      apiProvider != "aggregator" && apiProvider != "flyitalyadsb") apiProvider = "opensky";
   // Compiled-in credentials are opt-in. Without this flag a locally built
   // image carries no secret that `strings firmware.bin` could recover.
 #ifdef ADSB_BAKE_CREDENTIALS
@@ -4221,6 +4246,7 @@ void setup() {
 #endif
   rapidApiKey = settingsStore.getString("rapid-key", "");
   aggregatorApiKey = settingsStore.getString("agg-key", "");
+  flyItalyApiKey = settingsStore.getString("flyitaly-key", "");
   aisApiKey = settingsStore.getString("ais-key", "");
   aisHubUsername = settingsStore.getString("aishub-user", "");
   myShipTrackingApiKey = settingsStore.getString("mst-key", "");
