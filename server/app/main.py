@@ -1,0 +1,69 @@
+import logging
+import os
+import sys
+
+from fastapi import FastAPI
+
+from . import models, security
+from .aggregator import Aggregator
+from .database import Base, SessionLocal, engine
+from .routers import admin, public
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("main")
+
+DEBUG = os.environ.get("DEBUG") == "1"
+
+if security.SESSION_SECRET == "insecure-dev-secret-change-me" and not DEBUG:
+    sys.exit(
+        "Refusing to start: SESSION_SECRET is unset (or still the dev default). "
+        "Set a long random value in the environment (see .env.example), or set "
+        "DEBUG=1 to run locally without one."
+    )
+
+app = FastAPI(title="2E0LXY ADS-B Aggregator")
+
+
+def _bootstrap_admin(db):
+    """Creates the first admin account from the environment on a fresh
+    database, so there's a way in without shelling into the container to
+    insert a row by hand. No-ops once any admin user already exists."""
+    if db.query(models.AdminUser).count() > 0:
+        return
+    email = os.environ.get("ADMIN_BOOTSTRAP_EMAIL")
+    password = os.environ.get("ADMIN_BOOTSTRAP_PASSWORD")
+    if not email or not password:
+        logger.warning(
+            "No admin user exists yet and ADMIN_BOOTSTRAP_EMAIL/ADMIN_BOOTSTRAP_PASSWORD "
+            "are not set - the admin panel has no way to log in until you set them "
+            "(see .env.example) and restart."
+        )
+        return
+    db.add(models.AdminUser(email=email.strip().lower(), password_hash=security.hash_password(password)))
+    db.commit()
+    logger.info("Bootstrapped initial admin user %s", email)
+
+
+@app.on_event("startup")
+async def startup():
+    Base.metadata.create_all(bind=engine)
+    db = SessionLocal()
+    try:
+        _bootstrap_admin(db)
+    finally:
+        db.close()
+
+    home_lat = float(os.environ.get("HOME_LAT", "53.73"))
+    home_lon = float(os.environ.get("HOME_LON", "-1.57"))
+    home_radius_nm = float(os.environ.get("HOME_RADIUS_NM", "50"))
+    app.state.aggregator = Aggregator(home_lat, home_lon, home_radius_nm, SessionLocal)
+    app.state.aggregator.start()
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    await app.state.aggregator.stop()
+
+
+app.include_router(public.router)
+app.include_router(admin.router)

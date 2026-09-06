@@ -1,0 +1,16 @@
+services:
+  adsb-aggregator:
+    build: .
+    container_name: adsb-aggregator
+    restart: unless-stopped
+    # Caddy already reverse-proxies 127.0.0.1:8090 to adsb.2e0lxy.uk from the
+    # earlier setup - keep the same port so no Caddyfile change is needed.
+    ports:
+      - "127.0.0.1:8090:8090"
+    volumes:
+      - adsb-data:/data
+    env_file:
+      - .env
+
+volumes:
+  adsb-data:

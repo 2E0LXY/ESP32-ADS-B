@@ -1,0 +1,73 @@
+{% extends "base.html" %}
+{% block header_title %}My account{% endblock %}
+{% block nav %}<a href="/logout">Log out</a>{% endblock %}
+{% block content %}
+
+{% if new_key %}
+<div class="panel" style="border-color:var(--green)">
+<h2 style="color:var(--green)">Your new API key</h2>
+<p>Copy this now - it will never be shown again. Paste it into your device's admin page under
+<b>Data API &rarr; 2E0LXY Aggregator &rarr; API key</b>.</p>
+<code style="font-size:15px;display:block;padding:10px;word-break:break-all">{{ new_key }}</code>
+</div>
+{% endif %}
+
+<div class="panel">
+<h2>My devices</h2>
+<table>
+<thead><tr><th>Name</th><th>Last seen</th><th>Firmware</th><th>Key</th><th></th></tr></thead>
+<tbody>
+{% for device in devices %}
+<tr>
+<td>{{ device.name }}</td>
+<td>{{ device.last_seen_at.strftime('%Y-%m-%d %H:%M UTC') if device.last_seen_at else 'Never' }}</td>
+<td>{{ device.firmware_version or '--' }}</td>
+<td>{% if device.active_key %}<code>{{ device.active_key.key_prefix }}...</code>{% else %}<span class="sub">No key issued</span>{% endif %}</td>
+<td>
+<form class="inline" method="post" action="/devices/{{ device.id }}/reissue-key"><button type="submit">{{ 'Reissue key' if device.active_key else 'Issue key' }}</button></form>
+<form class="inline" method="post" action="/devices/{{ device.id }}/delete" onsubmit="return confirm('Delete this device and revoke its key?')"><button class="danger" type="submit">Delete</button></form>
+</td>
+</tr>
+{% else %}
+<tr><td colspan="5" class="sub">No devices yet - add one below.</td></tr>
+{% endfor %}
+</tbody>
+</table>
+<form method="post" action="/devices" style="margin-top:14px;display:flex;gap:10px;align-items:end">
+<div><label>New device name</label><input class="input" name="name" placeholder="Living room receiver" required></div>
+<button type="submit">Add device</button>
+</form>
+</div>
+
+<div class="panel">
+<h2>Donated feeder keys</h2>
+<p class="sub">Already run your own receiver and feed adsb.fi, airplanes.live, or adsb.lol? Donate that personal
+key here and the aggregator will use it (within your own allowance) to help serve every device, yours included.
+This never shares your credential with anyone else - it's only used server-side by this aggregator.</p>
+<table>
+<thead><tr><th>Provider</th><th>Label</th><th>Status</th><th></th></tr></thead>
+<tbody>
+{% for fk in feeder_keys %}
+<tr>
+<td>{{ fk.provider.value }}</td>
+<td>{{ fk.label or '--' }}</td>
+<td>{% if fk.enabled %}<span class="badge ok">Active</span>{% else %}<span class="badge bad">Disabled</span>{% endif %}</td>
+<td>
+<form class="inline" method="post" action="/feeder-keys/{{ fk.id }}/toggle"><button type="submit">{{ 'Disable' if fk.enabled else 'Enable' }}</button></form>
+<form class="inline" method="post" action="/feeder-keys/{{ fk.id }}/delete" onsubmit="return confirm('Remove this donated key?')"><button class="danger" type="submit">Remove</button></form>
+</td>
+</tr>
+{% else %}
+<tr><td colspan="4" class="sub">None donated yet.</td></tr>
+{% endfor %}
+</tbody>
+</table>
+<form method="post" action="/feeder-keys" style="margin-top:14px;display:flex;gap:10px;align-items:end;flex-wrap:wrap">
+<div><label>Provider</label><select class="input" name="provider"><option value="adsbfi">adsb.fi</option><option value="airplaneslive">airplanes.live</option><option value="adsblol">adsb.lol</option></select></div>
+<div><label>Your API key / credential</label><input class="input" name="credential" required></div>
+<div><label>Label (optional)</label><input class="input" name="label" placeholder="Home station"></div>
+<button type="submit">Donate key</button>
+</form>
+</div>
+
+{% endblock %}

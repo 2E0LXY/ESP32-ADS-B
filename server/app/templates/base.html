@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{% block title %}2E0LXY ADS-B{% endblock %}</title>
+<style>
+:root{color-scheme:dark;--bg:#06111d;--surface:#0b1b2a;--line:#29435a;--text:#eaf2f8;--muted:#91a8ba;--cyan:#35a9f4;--green:#38d278;--red:#ff5757;--amber:#f2bc3c}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 "Segoe UI",Inter,system-ui,sans-serif}
+header{padding:16px 24px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:16px}
+header b{font-size:16px;letter-spacing:.02em}
+header nav{display:flex;gap:16px;margin-left:auto}
+header nav a{color:var(--muted);text-decoration:none;font-weight:600}
+header nav a:hover{color:var(--cyan)}
+main{padding:24px;max-width:1100px;margin:0 auto}
+.panel{background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:18px;margin-bottom:18px}
+h2{margin-top:0;font-size:16px;color:var(--cyan)}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line)}
+th{color:var(--muted);font-weight:600}
+.input,button,select{background:#091725;border:1px solid var(--line);color:var(--text);border-radius:4px;padding:8px 10px;font:inherit}
+button{cursor:pointer;background:#123450;border-color:var(--cyan)}
+button:hover{background:#17436a}
+button.danger{border-color:var(--red);color:var(--red);background:transparent}
+button.danger:hover{background:#3a1414}
+form.inline{display:inline}
+.badge{display:inline-block;padding:2px 8px;border-radius:99px;font-size:11px;font-weight:700}
+.badge.ok{background:#0f3a24;color:var(--green)}
+.badge.bad{background:#3a1414;color:var(--red)}
+.flash{padding:10px 14px;border-radius:4px;margin-bottom:16px;background:#123450;border:1px solid var(--cyan)}
+.flash.error{background:#3a1414;border-color:var(--red)}
+.sub{color:var(--muted);font-size:12px}
+label{display:block;margin:10px 0 4px;color:var(--muted);font-size:12px}
+code{background:#091725;padding:2px 6px;border-radius:3px}
+</style>
+</head>
+<body>
+<header>
+<b>{% block header_title %}2E0LXY ADS-B{% endblock %}</b>
+<nav>{% block nav %}{% endblock %}</nav>
+</header>
+<main>
+{% if flash %}<div class="flash {{ 'error' if flash_error else '' }}">{{ flash }}</div>{% endif %}
+{% block content %}{% endblock %}
+</main>
+</body>
+</html>

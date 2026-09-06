@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block header_title %}2E0LXY ADS-B - Sign up{% endblock %}
+{% block content %}
+<div class="panel" style="max-width:400px;margin:40px auto">
+<h2>Create your account</h2>
+<form method="post" action="/signup">
+<label>Email</label>
+<input class="input" style="width:100%" type="email" name="email" required>
+<label>Password (min 8 characters)</label>
+<input class="input" style="width:100%" type="password" name="password" minlength="8" required>
+<button style="width:100%;margin-top:16px" type="submit">Sign up</button>
+</form>
+<p class="sub" style="margin-top:14px">Already have an account? <a href="/login" style="color:var(--cyan)">Log in</a></p>
+</div>
+{% endblock %}
