@@ -168,7 +168,7 @@ View the active connection, signal quality, LAN address, gateway, and DNS server
 
 ### Data API
 
-Select an aircraft provider and replace or clear the credentials required by that provider. Live feed health shows the last result, HTTP status, request time, aircraft count, and credential state, with a manual refresh test for troubleshooting.
+Select an aircraft provider and replace or clear the credentials required by that provider; the help text below the dropdown explains that provider's licence terms, commercial-use restrictions, and where to get a personal API key if one applies (see [Aircraft-data providers](#aircraft-data-providers)). Live feed health shows the last result, HTTP status, request time, aircraft count, and credential state, with a manual refresh test for troubleshooting.
 
 ![Data API page](docs/screenshots/api.png)
 
@@ -199,14 +199,18 @@ Review device identity, uptime, memory, network, display, and feed status; downl
 
 ## Aircraft-data providers
 
+Selecting a provider in **Data API** shows that provider's own help text below the dropdown, covering its licence, whether it permits commercial use, and where to get a personal API key if one is offered or required.
+
 | Web selection | Endpoint pattern | Credentials | Notes |
 | --- | --- | --- | --- |
-| OpenSky Network | `/api/states/all` | Optional OAuth client ID and secret | Uses a receiver-centred bounding box; falls back to anonymous access when credentials are blank. |
-| adsb.fi Open Data | `/api/v3/lat/.../lon/.../dist/...` | None | Free/open data endpoint. |
-| airplanes.live | `/v2/point/...` | None | ADS-B Exchange v2-compatible response. |
-| adsb.lol Open API | `/v2/point/...` | None currently | Free/open API; the key field is retained in case the service changes. |
-| ADSB One / API archive | `/v2/point/...` | None | Experimental legacy-compatible source. |
-| ADS-B Exchange via RapidAPI | `/v2/lat/.../lon/.../dist/...` | RapidAPI key | Requires the relevant RapidAPI subscription. |
+| 2E0LXY Aggregator (recommended) | `/v1/aircraft?lat=...&lon=...&radius=...` | Required API key | Our own backend at `adsb.2e0lxy.uk`; polls adsb.fi/airplanes.live/adsb.lol centrally on a shared cache so this device never queries those public APIs directly. Sign up and register the device at `adsb.2e0lxy.uk/account` to get a key. |
+| OpenSky Network | `/api/states/all` | Optional OAuth client ID and secret | Uses a receiver-centred bounding box; falls back to anonymous access when credentials are blank. OpenSky is an academic/research network - its terms require a separate paid licence for any for-profit or commercial use. |
+| adsb.fi Open Data | `/api/v3/lat/.../lon/.../dist/...` | None | Free/open data endpoint restricted to personal, non-commercial use (1 request/second limit, no redistribution) - see `github.com/adsbfi/opendata`. |
+| airplanes.live | `/v2/point/...` | None | ADS-B Exchange v2-compatible response. Personal/educational use only; blocks cloud/datacenter IP ranges and asks that anything beyond personal use be arranged via `contact@airplanes.live`. |
+| adsb.lol Open API | `/v2/point/...` | None | Free/open API licensed under the Open Database Licence (ODbL) - commercial use is explicitly permitted provided adsb.lol is credited as the data source. |
+| ADSB One / API archive | `/v2/point/...` | None | Experimental legacy-compatible source; its server may reject requests, so keep another provider available. |
+| ADS-B Exchange via RapidAPI | `/v2/lat/.../lon/.../dist/...` | RapidAPI key | Paid commercial subscription and key required. |
+| FlyItalyADSB | `/v2/lat/.../lon/.../dist/...` (kilometres, not nm) | Required API key | Community feed (1,800+ receivers, Mediterranean-focused). Licensed under CC BY-SA 4.0 - commercial use is explicitly permitted up to 100 requests/minute with attribution. Free key issued instantly by email - see `flyitalyadsb.com/api-documentation`. |
 
 The ESP32 stores credentials in Preferences/NVS. Existing secrets are never returned by the status API, and submitting an empty credential field preserves the stored value unless **Clear** is selected.
 

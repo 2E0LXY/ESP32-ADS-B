@@ -64,15 +64,19 @@ Then visit `https://adsb.2e0lxy.uk/admin/login` and log in with the
    and confirm `curl -H "Authorization: Bearer <key>" "https://adsb.2e0lxy.uk/v1/aircraft?lat=53.73&lon=-1.57&radius=50"`
    returns aircraft.
 
-## Firmware follow-up (not done yet)
+## Firmware side (done)
 
-The ESP32 firmware's `aggregator` provider currently sends **no** API key -
-it queries `/v1/aircraft` with no `Authorization` header, which this backend
-now requires. Until the firmware is updated to send one, requests from the
-device will get a 401. This needs a small firmware change (an "API key"
-field in the Data API admin page for the aggregator provider, sent as
-`Authorization: Bearer <key>`) - flag this back to whoever is working the
-firmware side.
+The ESP32 firmware's `aggregator` provider sends the device's API key as
+`Authorization: Bearer <key>` on every `/v1/aircraft` request, read from an
+"Aggregator API key" field on the Data API admin page. With no key saved,
+the firmware refuses to fetch and shows "API key required" rather than
+silently taking a 401. Nothing further is needed here - just issue each
+device a key from `/account` and paste it into that field.
+
+The firmware also gained a **FlyItalyADSB** provider (a separate, unrelated
+public feed - not part of this aggregator) with its own API key field, for
+users who'd rather use FlyItalyADSB's own key/endpoint directly instead of
+this backend.
 
 ## Feeder ingestion (customers' own receivers) - firewall requirement
 
