@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <strings.h>  // strncasecmp, used by the icon type-designator table
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/semphr.h>
@@ -396,6 +397,274 @@ struct RouteCacheEntry {
   bool hasRoute = false;
 };
 
+// ---------------------------------------------------------------------------
+// Icon shape selection.
+//
+// Two independent sources, in tar1090's order of preference:
+//   1. The ICAO type designator (exact airframe: B738, EC35, C172). tar1090
+//      gets this from a ~12 MB sharded local database because it decodes raw
+//      frames, where nothing on air ever says "Boeing 737". Every provider
+//      here has already done that hex -> registration -> type lookup and hands
+//      it over in the "t" field of each aircraft, so the exact airframe costs
+//      us no storage at all and the database is simply not needed.
+//   2. The ADS-B emitter category (DF17/18 TC 1-4, sets A/B/C/D code 0-7),
+//      which is coarse and, per the ADS-B spec's own reputation, frequently
+//      absent or mis-set - plenty of GA aircraft report A1 regardless.
+//   3. A generic silhouette when both miss.
+//
+// The type table is prefix-matched, longest match wins, which is what makes
+// short prefixes safe next to longer ones: "A109" (AgustaWestland) is tested
+// before "A10" (A-10 Thunderbolt), and "C172" before "C17" (Globemaster), so
+// neither pair collides. Only designators whose family is unambiguous at the
+// prefix given are listed; anything else falls through to the category, which
+// is the better answer for the cases this table deliberately omits.
+// ---------------------------------------------------------------------------
+enum class PlaneShape : uint8_t {
+  Generic,
+  LightProp,
+  Twin,
+  Airliner,
+  HeavyJet,
+  Fighter,
+  Helicopter,
+  Glider,
+  Balloon,
+  Drone,
+  Ground,
+};
+
+struct TypeShapeRule {
+  const char *prefix;
+  PlaneShape shape;
+};
+
+constexpr TypeShapeRule TYPE_SHAPE_RULES[] = {
+    // Rotorcraft. "EC" is safe as two characters: no Embraer designator
+    // starts with it (they are E110/E120/E135/E145/E17x/E19x/E29x).
+    {"EC", PlaneShape::Helicopter},   {"A109", PlaneShape::Helicopter},
+    {"A119", PlaneShape::Helicopter}, {"A139", PlaneShape::Helicopter},
+    {"A169", PlaneShape::Helicopter}, {"A189", PlaneShape::Helicopter},
+    {"AW09", PlaneShape::Helicopter}, {"AW13", PlaneShape::Helicopter},
+    {"AW16", PlaneShape::Helicopter}, {"AW18", PlaneShape::Helicopter},
+    {"AS32", PlaneShape::Helicopter}, {"AS35", PlaneShape::Helicopter},
+    {"AS50", PlaneShape::Helicopter}, {"AS55", PlaneShape::Helicopter},
+    {"AS65", PlaneShape::Helicopter}, {"BK17", PlaneShape::Helicopter},
+    {"EN48", PlaneShape::Helicopter}, {"B06", PlaneShape::Helicopter},
+    {"B47", PlaneShape::Helicopter},  {"B412", PlaneShape::Helicopter},
+    {"B429", PlaneShape::Helicopter}, {"B505", PlaneShape::Helicopter},
+    {"R22", PlaneShape::Helicopter},  {"R44", PlaneShape::Helicopter},
+    {"R66", PlaneShape::Helicopter},  {"S61", PlaneShape::Helicopter},
+    {"S64", PlaneShape::Helicopter},  {"S70", PlaneShape::Helicopter},
+    {"S76", PlaneShape::Helicopter},  {"S92", PlaneShape::Helicopter},
+    {"H12", PlaneShape::Helicopter},  {"H13", PlaneShape::Helicopter},
+    {"H14", PlaneShape::Helicopter},  {"H16", PlaneShape::Helicopter},
+    {"H17", PlaneShape::Helicopter},  {"MD50", PlaneShape::Helicopter},
+    {"MD52", PlaneShape::Helicopter}, {"MD53", PlaneShape::Helicopter},
+    {"CH47", PlaneShape::Helicopter}, {"UH60", PlaneShape::Helicopter},
+    {"LYNX", PlaneShape::Helicopter}, {"PUMA", PlaneShape::Helicopter},
+    {"GAZL", PlaneShape::Helicopter},
+    // Wide-bodies and other heavies. "A31" is deliberately absent: it would
+    // swallow the A318/A319 narrow-bodies, so the A310 is listed in full.
+    {"A30", PlaneShape::HeavyJet},    {"A310", PlaneShape::HeavyJet},
+    {"A33", PlaneShape::HeavyJet},    {"A34", PlaneShape::HeavyJet},
+    {"A35", PlaneShape::HeavyJet},    {"A38", PlaneShape::HeavyJet},
+    {"A124", PlaneShape::HeavyJet},   {"A225", PlaneShape::HeavyJet},
+    {"A400", PlaneShape::HeavyJet},   {"B74", PlaneShape::HeavyJet},
+    {"B76", PlaneShape::HeavyJet},    {"B77", PlaneShape::HeavyJet},
+    {"B78", PlaneShape::HeavyJet},    {"B52", PlaneShape::HeavyJet},
+    {"IL76", PlaneShape::HeavyJet},   {"IL96", PlaneShape::HeavyJet},
+    {"MD11", PlaneShape::HeavyJet},   {"C17", PlaneShape::HeavyJet},
+    {"C5M", PlaneShape::HeavyJet},    {"KC13", PlaneShape::HeavyJet},
+    {"C130", PlaneShape::HeavyJet},
+    // Narrow-body airliners, including the A4 "high-vortex large" B757.
+    {"A318", PlaneShape::Airliner},   {"A319", PlaneShape::Airliner},
+    {"A320", PlaneShape::Airliner},   {"A321", PlaneShape::Airliner},
+    {"A19N", PlaneShape::Airliner},   {"A20N", PlaneShape::Airliner},
+    {"A21N", PlaneShape::Airliner},   {"B73", PlaneShape::Airliner},
+    {"B38", PlaneShape::Airliner},    {"B39", PlaneShape::Airliner},
+    {"B70", PlaneShape::Airliner},    {"B71", PlaneShape::Airliner},
+    {"B72", PlaneShape::Airliner},    {"B75", PlaneShape::Airliner},
+    {"BCS1", PlaneShape::Airliner},   {"BCS3", PlaneShape::Airliner},
+    {"E17", PlaneShape::Airliner},    {"E19", PlaneShape::Airliner},
+    {"E29", PlaneShape::Airliner},    {"E75", PlaneShape::Airliner},
+    {"MD8", PlaneShape::Airliner},    {"MD9", PlaneShape::Airliner},
+    {"F70", PlaneShape::Airliner},    {"F100", PlaneShape::Airliner},
+    {"RJ1", PlaneShape::Airliner},    {"RJ7", PlaneShape::Airliner},
+    {"RJ8", PlaneShape::Airliner},    {"B461", PlaneShape::Airliner},
+    {"B462", PlaneShape::Airliner},   {"B463", PlaneShape::Airliner},
+    {"SU95", PlaneShape::Airliner},
+    // Regional turboprops, regional jets and business jets.
+    {"AT4", PlaneShape::Twin},        {"AT5", PlaneShape::Twin},
+    {"AT7", PlaneShape::Twin},        {"AT8", PlaneShape::Twin},
+    {"DH8", PlaneShape::Twin},        {"SF34", PlaneShape::Twin},
+    {"SB20", PlaneShape::Twin},       {"JS31", PlaneShape::Twin},
+    {"JS32", PlaneShape::Twin},       {"JS41", PlaneShape::Twin},
+    {"D228", PlaneShape::Twin},       {"D328", PlaneShape::Twin},
+    {"L410", PlaneShape::Twin},       {"SW4", PlaneShape::Twin},
+    {"E110", PlaneShape::Twin},       {"E120", PlaneShape::Twin},
+    {"E135", PlaneShape::Twin},       {"E145", PlaneShape::Twin},
+    {"E45X", PlaneShape::Twin},       {"CRJ", PlaneShape::Twin},
+    {"BE20", PlaneShape::Twin},       {"BE9", PlaneShape::Twin},
+    {"B190", PlaneShape::Twin},       {"B350", PlaneShape::Twin},
+    {"CL30", PlaneShape::Twin},       {"CL35", PlaneShape::Twin},
+    {"CL60", PlaneShape::Twin},       {"GLF", PlaneShape::Twin},
+    {"GL5", PlaneShape::Twin},        {"GL6", PlaneShape::Twin},
+    {"C25", PlaneShape::Twin},        {"C56", PlaneShape::Twin},
+    {"C68", PlaneShape::Twin},        {"C750", PlaneShape::Twin},
+    {"LJ", PlaneShape::Twin},         {"PRM1", PlaneShape::Twin},
+    {"F2TH", PlaneShape::Twin},       {"FA7X", PlaneShape::Twin},
+    {"FA8X", PlaneShape::Twin},       {"E55P", PlaneShape::Twin},
+    {"E50P", PlaneShape::Twin},       {"BE40", PlaneShape::Twin},
+    {"H25", PlaneShape::Twin},        {"PC24", PlaneShape::Twin},
+    {"P180", PlaneShape::Twin},
+    // Light aircraft. The Cessna singles are spelled out in full so "C17"
+    // above keeps meaning the Globemaster rather than a 172.
+    {"C150", PlaneShape::LightProp},  {"C152", PlaneShape::LightProp},
+    {"C162", PlaneShape::LightProp},  {"C170", PlaneShape::LightProp},
+    {"C172", PlaneShape::LightProp},  {"C175", PlaneShape::LightProp},
+    {"C177", PlaneShape::LightProp},  {"C180", PlaneShape::LightProp},
+    {"C182", PlaneShape::LightProp},  {"C185", PlaneShape::LightProp},
+    {"C206", PlaneShape::LightProp},  {"C207", PlaneShape::LightProp},
+    {"C208", PlaneShape::LightProp},  {"C210", PlaneShape::LightProp},
+    {"C337", PlaneShape::LightProp},  {"T206", PlaneShape::LightProp},
+    {"T210", PlaneShape::LightProp},  {"P28", PlaneShape::LightProp},
+    {"P32", PlaneShape::LightProp},   {"P46", PlaneShape::LightProp},
+    {"PA1", PlaneShape::LightProp},   {"PA2", PlaneShape::LightProp},
+    {"PA3", PlaneShape::LightProp},   {"PA4", PlaneShape::LightProp},
+    {"SR20", PlaneShape::LightProp},  {"SR22", PlaneShape::LightProp},
+    {"S22", PlaneShape::LightProp},   {"DA40", PlaneShape::LightProp},
+    {"DA42", PlaneShape::LightProp},  {"DA20", PlaneShape::LightProp},
+    {"DV20", PlaneShape::LightProp},  {"M20", PlaneShape::LightProp},
+    {"BE33", PlaneShape::LightProp},  {"BE35", PlaneShape::LightProp},
+    {"BE36", PlaneShape::LightProp},  {"BE55", PlaneShape::LightProp},
+    {"BE58", PlaneShape::LightProp},  {"AA5", PlaneShape::LightProp},
+    {"G115", PlaneShape::LightProp},  {"GA8", PlaneShape::LightProp},
+    {"RV", PlaneShape::LightProp},    {"TB9", PlaneShape::LightProp},
+    {"TB10", PlaneShape::LightProp},  {"TB20", PlaneShape::LightProp},
+    {"PC12", PlaneShape::LightProp},  {"TBM", PlaneShape::LightProp},
+    {"EV97", PlaneShape::LightProp},  {"VL3", PlaneShape::LightProp},
+    {"AT3", PlaneShape::LightProp},   {"F406", PlaneShape::LightProp},
+    {"DR40", PlaneShape::LightProp},  {"SF25", PlaneShape::LightProp},
+    {"WT9", PlaneShape::LightProp},   {"P208", PlaneShape::LightProp},
+    // Fast jets. "A10" is reachable because "A109" above is longer and wins
+    // the AgustaWestland case outright.
+    {"F15", PlaneShape::Fighter},     {"F16", PlaneShape::Fighter},
+    {"F18", PlaneShape::Fighter},     {"F22", PlaneShape::Fighter},
+    {"F35", PlaneShape::Fighter},     {"F14", PlaneShape::Fighter},
+    {"EUFI", PlaneShape::Fighter},    {"TOR", PlaneShape::Fighter},
+    {"HAWK", PlaneShape::Fighter},    {"T38", PlaneShape::Fighter},
+    {"GR4", PlaneShape::Fighter},     {"A10", PlaneShape::Fighter},
+    // Sailplanes and lighter-than-air.
+    {"AS21", PlaneShape::Glider},     {"AS25", PlaneShape::Glider},
+    {"AS26", PlaneShape::Glider},     {"DG1", PlaneShape::Glider},
+    {"DG4", PlaneShape::Glider},      {"DG8", PlaneShape::Glider},
+    {"LS4", PlaneShape::Glider},      {"LS8", PlaneShape::Glider},
+    {"JANU", PlaneShape::Glider},     {"VENT", PlaneShape::Glider},
+    {"DISC", PlaneShape::Glider},     {"NIMB", PlaneShape::Glider},
+    {"ARCU", PlaneShape::Glider},     {"DUOD", PlaneShape::Glider},
+    {"BALL", PlaneShape::Balloon},    {"ZEPP", PlaneShape::Balloon},
+};
+
+// Emitter category set A/B/C. Set A is the one that carries real weight; set
+// B covers the non-aeroplanes and set C is surface traffic, which should never
+// be drawn as something airborne.
+PlaneShape shapeForCategory(const char *category) {
+  if (!category || !category[0] || !category[1]) return PlaneShape::Generic;
+  const char set = static_cast<char>(toupper(static_cast<unsigned char>(category[0])));
+  const char code = category[1];
+  if (set == 'A') {
+    switch (code) {
+      case '1': return PlaneShape::LightProp;   // < 15.5t
+      case '2': return PlaneShape::Twin;        // 15.5-75t
+      case '3': return PlaneShape::Airliner;    // 75-300t
+      case '4': return PlaneShape::Airliner;    // high-vortex large (B757)
+      case '5': return PlaneShape::HeavyJet;    // > 300t
+      case '6': return PlaneShape::Fighter;     // high performance
+      case '7': return PlaneShape::Helicopter;  // rotorcraft
+      default: return PlaneShape::Generic;      // A0, no information
+    }
+  }
+  if (set == 'B') {
+    switch (code) {
+      case '1': return PlaneShape::Glider;
+      case '2': return PlaneShape::Balloon;     // lighter-than-air
+      case '4': return PlaneShape::LightProp;   // ultralight/hang-glider
+      case '6': return PlaneShape::Drone;       // UAV
+      default: return PlaneShape::Generic;      // B0/B3 skydiver/B7 space
+    }
+  }
+  if (set == 'C') return PlaneShape::Ground;    // surface vehicles, obstacles
+  return PlaneShape::Generic;
+}
+
+// OpenSky reports its own flat 0-20 category enum rather than the ADS-B
+// set/code pair every other provider here uses. This used to be written
+// straight out as "C<n>", which reads as ADS-B category set C - surface
+// vehicles - for every aircraft in the sky. It went unnoticed while the
+// shape table ignored anything it didn't recognise; it does not now.
+void openSkyCategoryToAdsb(int openSkyCategory, char *out, size_t outSize) {
+  const char *mapped = "A0";
+  switch (openSkyCategory) {
+    case 2: mapped = "A1"; break;   // light
+    case 3: mapped = "A2"; break;   // small
+    case 4: mapped = "A3"; break;   // large
+    case 5: mapped = "A4"; break;   // high vortex large
+    case 6: mapped = "A5"; break;   // heavy
+    case 7: mapped = "A6"; break;   // high performance
+    case 8: mapped = "A7"; break;   // rotorcraft
+    case 9: mapped = "B1"; break;   // glider / sailplane
+    case 10: mapped = "B2"; break;  // lighter-than-air
+    case 11: mapped = "B3"; break;  // parachutist
+    case 12: mapped = "B4"; break;  // ultralight / hang-glider
+    case 14: mapped = "B6"; break;  // UAV
+    case 15: mapped = "B7"; break;  // space / trans-atmospheric
+    case 16:
+    case 17:
+    case 18:
+    case 19:
+    case 20: mapped = "C1"; break;  // surface vehicles and obstacles
+    default: mapped = "A0"; break;  // 0/1 no information, 13 reserved
+  }
+  strncpy(out, mapped, outSize - 1);
+  out[outSize - 1] = 0;
+}
+
+// Stable identifiers for the browser map, which renders whichever silhouette
+// the device has already resolved rather than repeating the lookup itself.
+const char *planeShapeName(PlaneShape shape) {
+  switch (shape) {
+    case PlaneShape::LightProp: return "light";
+    case PlaneShape::Twin: return "twin";
+    case PlaneShape::Airliner: return "airliner";
+    case PlaneShape::HeavyJet: return "heavy";
+    case PlaneShape::Fighter: return "fighter";
+    case PlaneShape::Helicopter: return "helicopter";
+    case PlaneShape::Glider: return "glider";
+    case PlaneShape::Balloon: return "balloon";
+    case PlaneShape::Drone: return "drone";
+    case PlaneShape::Ground: return "ground";
+    case PlaneShape::Generic: break;
+  }
+  return "generic";
+}
+
+PlaneShape shapeForAircraft(const char *typeDesignator, const char *category) {
+  PlaneShape shape = PlaneShape::Generic;
+  size_t bestPrefix = 0;
+  if (typeDesignator && typeDesignator[0]) {
+    for (const TypeShapeRule &rule : TYPE_SHAPE_RULES) {
+      const size_t length = strlen(rule.prefix);
+      if (length <= bestPrefix) continue;  // a longer match already won
+      if (strncasecmp(typeDesignator, rule.prefix, length) == 0) {
+        bestPrefix = length;
+        shape = rule.shape;
+      }
+    }
+  }
+  if (bestPrefix) return shape;
+  return shapeForCategory(category);
+}
+
 struct AircraftDisplay {
   int x;
   int y;
@@ -421,6 +690,9 @@ struct AircraftDisplay {
   char operatorName[36];
   char country[28];
   char emergency[16];
+  // Resolved once per fetch rather than per frame - the type table is a
+  // linear scan and icons are redrawn several times a second.
+  PlaneShape iconShape = PlaneShape::Generic;
 };
 
 struct VesselDisplay {
@@ -1809,22 +2081,6 @@ void drawOperatorBadge(int x, int y, const char *flight, const char *hex) {
   text5(x-8,y-3,code,rgb(255,255,255));
 }
 
-// The ADS-B emitter category (A0-A7/B0-B7/C0-C7) picks a recognisable
-// silhouette instead of every aircraft drawing as the same blob; an empty or
-// unrecognised category (common on feeds that omit it) falls back to the
-// airliner shape since that's the majority of what's actually in the air.
-enum class PlaneShape : uint8_t { Jet, Light, Helicopter, Military };
-
-PlaneShape planeShapeForCategory(const char *category) {
-  if (!category || !category[0]) return PlaneShape::Jet;
-  if (!strcmp(category, "A7")) return PlaneShape::Helicopter;
-  if (!strcmp(category, "A6")) return PlaneShape::Military;
-  if (!strcmp(category, "A1") || !strcmp(category, "A2") ||
-      !strcmp(category, "B1") || !strcmp(category, "B2") ||
-      !strcmp(category, "B3") || !strcmp(category, "B4")) return PlaneShape::Light;
-  return PlaneShape::Jet;
-}
-
 // Every shape is built from filledTriangle()/disc() - solid, not outlined -
 // so it actually reads as a plane silhouette on the panel instead of a faint
 // wireframe; a thin line() outline (the original version of this function)
@@ -1853,13 +2109,13 @@ void drawPlaneIcon(int x, int y, float heading, PlaneShape shape, uint16_t colou
       pixel(x, y, white);
       break;
     }
-    case PlaneShape::Military:
+    case PlaneShape::Fighter:
       // Narrower and more sharply swept than the standard jet silhouette.
       filledTriangle(tx(13,0), ty(13,0), tx(-6,-4), ty(-6,-4), tx(-10,0), ty(-10,0), colour);
       filledTriangle(tx(13,0), ty(13,0), tx(-10,0), ty(-10,0), tx(-6,4), ty(-6,4), colour);
       pixel(x, y, white);
       break;
-    case PlaneShape::Light:
+    case PlaneShape::LightProp:
       // Straight, unswept wings crossing a slim fuselage - a small prop
       // aircraft, not the swept dart shape used for everything else.
       filledTriangle(tx(10,0), ty(10,0), tx(-10,-2), ty(-10,-2), tx(-10,2), ty(-10,2), colour);
@@ -1867,28 +2123,133 @@ void drawPlaneIcon(int x, int y, float heading, PlaneShape shape, uint16_t colou
       filledTriangle(tx(2,0), ty(2,0), tx(-2,0), ty(-2,0), tx(0,8), ty(0,8), colour);
       pixel(x, y, white);
       break;
-    case PlaneShape::Jet:
-    default:
+    case PlaneShape::Twin:
+      // Regional/business twin: shorter than an airliner, wings only lightly
+      // swept, with a squarer tailplane so it reads as a smaller machine.
+      filledTriangle(tx(10,0), ty(10,0), tx(-7,-6), ty(-7,-6), tx(-4,0), ty(-4,0), colour);
+      filledTriangle(tx(10,0), ty(10,0), tx(-4,0), ty(-4,0), tx(-7,6), ty(-7,6), colour);
+      line(tx(-8,-4), ty(-8,-4), tx(-8,4), ty(-8,4), colour);
+      pixel(x, y, white);
+      break;
+    case PlaneShape::HeavyJet:
+      // Wide-body: longer fuselage and a noticeably greater span than the
+      // narrow-body dart, plus a full-width tailplane.
+      filledTriangle(tx(15,0), ty(15,0), tx(-10,-8), ty(-10,-8), tx(-6,0), ty(-6,0), colour);
+      filledTriangle(tx(15,0), ty(15,0), tx(-6,0), ty(-6,0), tx(-10,8), ty(-10,8), colour);
+      filledTriangle(tx(-9,-5), ty(-9,-5), tx(-13,0), ty(-13,0), tx(-9,5), ty(-9,5), colour);
+      pixel(x, y, white);
+      break;
+    case PlaneShape::Glider:
+      // Very high aspect ratio: a long thin span on a tiny fuselage is the
+      // whole visual signature of a sailplane.
+      line(tx(0,-16), ty(0,-16), tx(0,16), ty(0,16), colour);
+      line(tx(-1,-16), ty(-1,-16), tx(-1,16), ty(-1,16), colour);
+      filledTriangle(tx(8,0), ty(8,0), tx(-7,-2), ty(-7,-2), tx(-7,2), ty(-7,2), colour);
+      pixel(x, y, white);
+      break;
+    case PlaneShape::Balloon: {
+      // Lighter-than-air drifts with the wind, so heading is meaningless
+      // here - drawn unrotated, envelope over basket.
+      disc(x, y - 3, 7, colour);
+      filledRect(x - 2, y + 5, 5, 4, colour);
+      pixel(x, y - 3, white);
+      break;
+    }
+    case PlaneShape::Drone: {
+      // Quadrotor: a small body with four rotor discs, unrotated for the
+      // same reason a helicopter's rotor is - the airframe has no
+      // meaningful "nose" at this size.
+      filledRect(x - 3, y - 3, 7, 7, colour);
+      disc(x - 7, y - 7, 2, colour);
+      disc(x + 7, y - 7, 2, colour);
+      disc(x - 7, y + 7, 2, colour);
+      disc(x + 7, y + 7, 2, colour);
+      pixel(x, y, white);
+      break;
+    }
+    case PlaneShape::Ground:
+      // Surface vehicles and obstacles are not aircraft and should never be
+      // mistaken for one at a glance: a plain square, no heading.
+      filledRect(x - 5, y - 5, 11, 11, colour);
+      filledRect(x - 2, y - 2, 5, 5, white);
+      break;
+    case PlaneShape::Airliner:
       // Swept-wing airliner dart - the same outline every icon used to draw,
       // now filled solid via its two diagonal-split triangles.
       filledTriangle(tx(12,0), ty(12,0), tx(-9,-5), ty(-9,-5), tx(-5,0), ty(-5,0), colour);
       filledTriangle(tx(12,0), ty(12,0), tx(-5,0), ty(-5,0), tx(-9,5), ty(-9,5), colour);
       pixel(x, y, white);
       break;
+    case PlaneShape::Generic:
+    default:
+      // Nothing known about the airframe: a neutral arrow that shows heading
+      // and claims nothing else.
+      filledTriangle(tx(9,0), ty(9,0), tx(-6,-5), ty(-6,-5), tx(-6,5), ty(-6,5), colour);
+      pixel(x, y, white);
+      break;
   }
 }
 
-// Replaces the old drawAdsbLogo/drawMlatPlane pair: shape identifies the
-// aircraft type from its ADS-B category, colour flags MLAT (estimated,
-// non-ADS-B) position in red the same way the table's A/M source column
-// already does, and falls back to the operator's brand colour otherwise.
-void drawAircraftIcon(int x, int y, float heading, const char *flight,
-                       const char *hex, const char *category, bool isMlat) {
-  char code[4] = {'?','?','?',0};
-  const char *src = (flight && strlen(flight) >= 3) ? flight : hex;
-  for (int i = 0; i < 3 && src && src[i]; ++i) code[i] = toupper(static_cast<unsigned char>(src[i]));
-  const uint16_t colour = isMlat ? rgb(245, 30, 35) : operatorColour(code);
-  drawPlaneIcon(x, y, heading, planeShapeForCategory(category), colour);
+// ---------------------------------------------------------------------------
+// Icon colour.
+//
+// None of this comes off the air - like every other tracker, colour here is
+// derived. Altitude drives the base hue on a 16-entry RGB565 ramp indexed by
+// alt >> 11 (2,048 ft per step, saturating at the top step), which is a pure
+// function needing no lookup beyond the table itself. State then overrides:
+// an emergency squawk wins outright, aircraft on the ground go earth-grey,
+// and MLAT or stale tracks are dimmed rather than recoloured so that "less
+// certain" reads as less prominent without inventing a new colour meaning.
+// ---------------------------------------------------------------------------
+struct IconRgb {
+  uint8_t r, g, b;
+};
+
+constexpr IconRgb ALTITUDE_RAMP[16] = {
+    {255, 60, 40},   {255, 110, 30},  {255, 160, 25},  {255, 205, 30},
+    {240, 240, 40},  {190, 240, 45},  {130, 235, 55},  {70, 225, 90},
+    {45, 220, 150},  {40, 215, 200},  {45, 200, 240},  {60, 165, 250},
+    {85, 130, 250},  {120, 105, 245}, {160, 95, 240},  {200, 100, 235},
+};
+
+uint16_t aircraftIconColour(const AircraftDisplay &a) {
+  // An emergency squawk is the one thing that must never be mistaken for a
+  // shade of altitude, so it is returned before anything else can dim it.
+  const bool emergencySquawk = a.squawk[0] && (!strcmp(a.squawk, "7500") ||
+                                               !strcmp(a.squawk, "7600") ||
+                                               !strcmp(a.squawk, "7700"));
+  const bool emergencyFlag = a.emergency[0] && strcmp(a.emergency, "none") != 0;
+  if (emergencySquawk || emergencyFlag) return rgb(255, 0, 0);
+
+  IconRgb colour;
+  if (a.onGround || a.altitudeFt < 0) {
+    colour = {150, 120, 90};  // earth-grey: on the surface, or no altitude yet
+  } else {
+    const int step = min(15, a.altitudeFt >> 11);
+    colour = ALTITUDE_RAMP[step < 0 ? 0 : step];
+  }
+
+  // MLAT is a computed position rather than a reported one, and a track with
+  // no recent update is a guess about where something used to be. Both stay
+  // on the altitude ramp - just quieter, so certainty reads as brightness.
+  uint16_t scale = 100;
+  if (a.positionSource == 2) scale = 55;
+  if (a.ageSeconds > 60.0f) scale = scale > 60 ? 60 : 45;
+  if (scale != 100) {
+    colour.r = static_cast<uint8_t>(colour.r * scale / 100);
+    colour.g = static_cast<uint8_t>(colour.g * scale / 100);
+    colour.b = static_cast<uint8_t>(colour.b * scale / 100);
+  }
+  return rgb(colour.r, colour.g, colour.b);
+}
+
+// Shape says what the aircraft is (type designator first, emitter category
+// second - see shapeForAircraft), colour says where it is and how much to
+// trust it (see aircraftIconColour). The two are independent on purpose:
+// nothing about the airframe should change with altitude, and nothing about
+// altitude should change the silhouette.
+void drawAircraftIcon(int x, int y, const AircraftDisplay &a) {
+  drawPlaneIcon(x, y, a.track, a.iconShape, aircraftIconColour(a));
 }
 
 // Records where an icon was just drawn against which entry in latestAircraft,
@@ -1988,8 +2349,7 @@ void renderOverviewPage() {
     AircraftDisplay &display = latestAircraft[i];
     if (display.x < 0 || display.x >= OVERVIEW_MAP_WIDTH - 10) continue;
     if (display.y < 0 || display.y >= H) continue;
-    drawAircraftIcon(display.x, display.y, display.track, display.flight, display.hex,
-                      display.category, display.positionSource == 2);
+    drawAircraftIcon(display.x, display.y, display);
     recordIconHit(display.x, display.y, i);
   }
 
@@ -2040,8 +2400,7 @@ void renderMapPage() {
   for (int i=0; i<lastCount; ++i) {
     AircraftDisplay &display = latestAircraft[i];
     if (display.x < 0 || display.x >= W || display.y < 0 || display.y >= H) continue;
-    drawAircraftIcon(display.x, display.y, display.track, display.flight, display.hex,
-                      display.category, display.positionSource == 2);
+    drawAircraftIcon(display.x, display.y, display);
     recordIconHit(display.x, display.y, i);
     if (display.positionSource != 2) {
       drawRouteLabel(display.x,display.y,cachedRoute(display.flight));
@@ -2259,8 +2618,7 @@ void renderRadarPage() {
     if (outside) {
       disc(x, y, 3, rgb(255, 65, 65));
     } else {
-      drawAircraftIcon(x, y, aircraft.track, aircraft.flight, aircraft.hex,
-                        aircraft.category, aircraft.positionSource == 2);
+      drawAircraftIcon(x, y, aircraft);
       recordIconHit(x, y, i);
     }
     if (outside) continue;
@@ -2695,6 +3053,10 @@ void fetchAdsbV2Aircraft() {
     strncpy(display.operatorName, aircraft["ownOp"] | "", sizeof(display.operatorName) - 1);
     strncpy(display.country, aircraft["cou"] | "", sizeof(display.country) - 1);
     strncpy(display.emergency, aircraft["emergency"] | "none", sizeof(display.emergency) - 1);
+    // Resolve the silhouette once, here, rather than on every redraw: the
+    // type table is a linear scan and these icons are drawn several times a
+    // second.
+    display.iconShape = shapeForAircraft(display.aircraftType, display.category);
     JsonArray mlatFields = aircraft["mlat"].as<JsonArray>();
     display.positionSource = !mlatFields.isNull() && mlatFields.size() ? 2 : 0;
     ++lastCount;
@@ -2862,8 +3224,10 @@ void fetchAircraft() {
       const char *squawk = state[14] | "";
       strncpy(display.squawk, squawk, sizeof(display.squawk) - 1);
     }
-    if (!state[17].isNull()) snprintf(display.category, sizeof(display.category), "C%d", state[17].as<int>());
+    if (!state[17].isNull()) openSkyCategoryToAdsb(state[17].as<int>(), display.category,
+                                                   sizeof(display.category));
     strcpy(display.emergency, "none");
+    display.iconShape = shapeForAircraft(display.aircraftType, display.category);
     ++lastCount;
   }
   sortAircraftByDistance();
@@ -3454,6 +3818,18 @@ void handleAircraftApi() {
     item["aircraftType"] = display.aircraftType;
     item["squawk"] = display.squawk;
     item["category"] = display.category;
+    // The browser map draws the same silhouette and colour as the panel, and
+    // both come from here rather than being worked out twice: duplicating the
+    // type-designator table into JavaScript would be a second copy to keep in
+    // step with this one, and it would drift.
+    item["shape"] = planeShapeName(display.iconShape);
+    const uint16_t iconColour = aircraftIconColour(display);
+    char iconColourHex[8];
+    snprintf(iconColourHex, sizeof(iconColourHex), "#%02X%02X%02X",
+             static_cast<unsigned>((iconColour >> 11) & 0x1F) * 255 / 31,
+             static_cast<unsigned>((iconColour >> 5) & 0x3F) * 255 / 63,
+             static_cast<unsigned>(iconColour & 0x1F) * 255 / 31);
+    item["iconColour"] = iconColourHex;
     item["operator"] = display.operatorName;
     item["country"] = display.country;
     item["emergency"] = display.emergency;
