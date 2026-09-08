@@ -252,6 +252,8 @@ This builds the default `waveshare_esp32_s3_lcd_4` environment (the 480 × 480 W
 pio run -e ws_lcd_7_app
 ```
 
+The **first** WS7 build after checking out this branch compiles ESP-IDF from source and takes tens of minutes. That is expected: `ws_lcd_7_app` sets `custom_sdkconfig` to enable `CONFIG_LCD_RGB_RESTART_IN_VSYNC` and the RGB/GDMA IRAM-safe options, without which the panel cannot recover from a DMA desync and the display stays rolled (the top of the picture drawn at the bottom) until the next reboot. Subsequent builds reuse the cached libraries and are as fast as before. The boot log prints `RGB vsync restart supported: yes` once the rebuilt libraries are in use.
+
 The OTA image is generated at:
 
 ```text
