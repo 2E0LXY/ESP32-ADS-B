@@ -2081,90 +2081,256 @@ void drawOperatorBadge(int x, int y, const char *flight, const char *hex) {
   text5(x-8,y-3,code,rgb(255,255,255));
 }
 
-// Every shape is built from filledTriangle()/disc() - solid, not outlined -
-// so it actually reads as a plane silhouette on the panel instead of a faint
-// wireframe; a thin line() outline (the original version of this function)
-// all but disappeared against the map at normal viewing distance.
+// --- icon-geometry-begin ---
+// Aircraft silhouettes.
+//
+// Each airframe is one closed outline traced from the nose down the
+// starboard side to the tail, in a local frame where +x is the nose and +y
+// is starboard, and mirrored about the centreline when it is drawn. Tracing
+// a single outline (rather than assembling a few triangles, which is what
+// made every icon read as a bare arrowhead) means the fuselage, the swept
+// wing, the nacelle line and the tailplane are all part of one silhouette,
+// so the shape still looks like an aeroplane at 24 px.
+//
+// Half-outlines only, so the two sides can never drift apart, and the first
+// and last points must sit on the centreline (y == 0) or the mirror will
+// leave a notch at the nose or tail.
+struct IconPoint {
+  float x, y;
+};
+
+// Airliner: narrow-body twin - pointed nose, clearly swept wing, swept
+// tailplane. The baseline every other jet shape is judged against.
+constexpr IconPoint OUTLINE_AIRLINER[] = {
+    {13.0f, 0.0f},  {10.5f, 1.8f}, {5.0f, 2.2f},   {-3.0f, 10.5f},
+    {-5.5f, 11.0f}, {-2.0f, 2.8f}, {-7.0f, 2.4f},  {-9.5f, 6.0f},
+    {-11.5f, 6.2f}, {-11.5f, 2.0f}, {-12.5f, 0.0f},
+};
+
+// Wide-body: longer, fatter fuselage and a span half again as wide, which
+// is the difference a viewer actually notices between a 737 and a 777.
+constexpr IconPoint OUTLINE_HEAVY[] = {
+    {16.0f, 0.0f},  {13.0f, 2.4f}, {6.0f, 3.0f},   {-4.0f, 13.5f},
+    {-7.5f, 14.0f}, {-2.5f, 3.6f}, {-8.5f, 3.2f},  {-11.5f, 8.0f},
+    {-14.0f, 8.2f}, {-14.0f, 2.6f}, {-15.5f, 0.0f},
+};
+
+// Regional twin / business jet: short body, only slightly swept wing set
+// well forward, so it reads as a smaller machine than the airliner.
+constexpr IconPoint OUTLINE_TWIN[] = {
+    {11.0f, 0.0f}, {9.0f, 1.8f},  {3.5f, 2.0f},   {1.0f, 9.5f},
+    {-1.5f, 9.8f}, {-1.0f, 2.6f}, {-6.5f, 2.2f},  {-8.5f, 6.0f},
+    {-10.0f, 6.2f}, {-10.0f, 1.8f}, {-11.0f, 0.0f},
+};
+
+// Light single: slim fuselage, unswept wings, generous tailplane. Drawn
+// with a propeller arc across the nose (see drawPlaneIcon).
+constexpr IconPoint OUTLINE_LIGHT[] = {
+    {9.0f, 0.0f},  {7.5f, 1.5f},  {2.5f, 1.6f},  {2.0f, 10.0f},
+    {-0.5f, 10.0f}, {-1.0f, 1.6f}, {-6.0f, 1.4f}, {-7.5f, 5.0f},
+    {-9.0f, 5.0f}, {-9.0f, 1.4f}, {-9.5f, 0.0f},
+};
+
+// Fast jet: cranked delta, sharply swept, narrow span, small all-moving
+// tail - deliberately the most aggressive outline in the set.
+constexpr IconPoint OUTLINE_FIGHTER[] = {
+    {13.0f, 0.0f}, {10.0f, 1.4f}, {5.0f, 1.8f},  {-6.0f, 8.0f},
+    {-8.0f, 8.0f}, {-6.0f, 2.6f}, {-9.0f, 2.6f}, {-10.5f, 4.5f},
+    {-11.5f, 4.5f}, {-11.0f, 1.8f}, {-11.5f, 0.0f},
+};
+
+// Sailplane: the span is the whole signature, so it is nearly twice the
+// airliner's on a body barely wider than a line.
+constexpr IconPoint OUTLINE_GLIDER[] = {
+    {9.0f, 0.0f},  {7.0f, 1.3f},  {2.2f, 1.6f},  {1.0f, 15.0f},
+    {-1.2f, 15.0f}, {-1.2f, 1.6f}, {-7.0f, 1.3f}, {-8.5f, 4.5f},
+    {-9.5f, 4.5f}, {-9.5f, 1.2f}, {-10.0f, 0.0f},
+};
+
+// Unidentified airframe: a plain aeroplane, moderate everything. It has to
+// claim nothing about the type while still not looking like an arrow.
+constexpr IconPoint OUTLINE_GENERIC[] = {
+    {11.0f, 0.0f}, {9.0f, 1.6f},  {4.0f, 2.0f},  {-2.0f, 9.0f},
+    {-4.5f, 9.4f}, {-1.5f, 2.4f}, {-6.0f, 2.0f}, {-8.5f, 5.5f},
+    {-10.0f, 5.7f}, {-10.0f, 1.6f}, {-11.0f, 0.0f},
+};
+
+// Helicopter body: cabin, tapering tail boom, tail fin. The rotor is drawn
+// separately because it turns independently of the track.
+constexpr IconPoint OUTLINE_HELI[] = {
+    {7.5f, 0.0f},  {6.5f, 2.6f},  {3.0f, 4.2f},  {-1.0f, 4.2f},
+    {-3.5f, 2.2f}, {-11.0f, 1.3f}, {-11.5f, 4.2f}, {-13.5f, 4.2f},
+    {-13.5f, 0.0f},
+};
+
+// Fills an arbitrary simple polygon by sorted-scanline crossings. Needed
+// because a plane silhouette is concave (wing roots and the tail waist),
+// which filledTriangle() cannot express without splitting the outline into
+// pieces whose shared edges show as seams.
+void fillPolygon(const float *px, const float *py, int n, uint16_t c) {
+  if (n < 3) return;
+  float minY = py[0], maxY = py[0];
+  for (int i = 1; i < n; ++i) {
+    if (py[i] < minY) minY = py[i];
+    if (py[i] > maxY) maxY = py[i];
+  }
+  const int y0 = static_cast<int>(floorf(minY)), y1 = static_cast<int>(ceilf(maxY));
+  for (int y = y0; y <= y1; ++y) {
+    const float sy = y + 0.5f;
+    float xs[16];
+    int count = 0;
+    for (int i = 0; i < n && count < 16; ++i) {
+      const int j = (i + 1 == n) ? 0 : i + 1;
+      const float ya = py[i], yb = py[j];
+      // Half-open test: a vertex counts for the edge below it only, so a
+      // scanline through a vertex crosses once, not twice or zero times.
+      if ((ya <= sy && yb > sy) || (yb <= sy && ya > sy))
+        xs[count++] = px[i] + (sy - ya) * (px[j] - px[i]) / (yb - ya);
+    }
+    for (int i = 1; i < count; ++i) {
+      const float key = xs[i];
+      int j = i - 1;
+      while (j >= 0 && xs[j] > key) { xs[j + 1] = xs[j]; --j; }
+      xs[j + 1] = key;
+    }
+    for (int i = 0; i + 1 < count; i += 2) {
+      const int xa = lroundf(xs[i]), xb = lroundf(xs[i + 1]);
+      for (int x = xa; x <= xb; ++x) pixel(x, y, c);
+    }
+  }
+  // Stroke the edges as well. At icon size a wing root or a tail boom is
+  // only a pixel or two across, and once the shape is rotated off the axes
+  // a pure scanline fill drops those spans entirely - the silhouette comes
+  // apart into disconnected blobs. Drawing the outline guarantees every
+  // feature stays connected whatever the heading.
+  for (int i = 0; i < n; ++i) {
+    const int j = (i + 1 == n) ? 0 : i + 1;
+    line(lroundf(px[i]), lroundf(py[i]), lroundf(px[j]), lroundf(py[j]), c);
+  }
+}
+
+// Mirrors a half-outline about the centreline, rotates it onto the screen
+// and fills it. Scale lets the same geometry serve a full-size map icon and
+// a smaller one without a second table.
+template <size_t N>
+void fillOutline(int x, int y, float cs, float sn, const IconPoint (&half)[N],
+                 uint16_t colour, float scale = 1.0f) {
+  constexpr int total = static_cast<int>(N) * 2 - 2;  // both ends are shared
+  float px[static_cast<int>(N) * 2 - 2], py[static_cast<int>(N) * 2 - 2];
+  int n = 0;
+  auto emit = [&](float lx, float ly) {
+    lx *= scale;
+    ly *= scale;
+    px[n] = x + (lx * cs - ly * sn);
+    py[n] = y + (lx * sn + ly * cs);
+    ++n;
+  };
+  for (size_t i = 0; i < N; ++i) emit(half[i].x, half[i].y);
+  for (int i = static_cast<int>(N) - 2; i >= 1; --i) emit(half[i].x, -half[i].y);
+  fillPolygon(px, py, n < total ? n : total, colour);
+}
+
+// Aircraft icons: a real top-down silhouette per airframe class, filled
+// solid in the altitude colour. The outline tables above carry the shape;
+// this function only places, rotates and decorates them (engine nacelles,
+// a propeller arc, a turning rotor) and handles the three markers that are
+// not aeroplanes and therefore are not rotated at all.
 void drawPlaneIcon(int x, int y, float heading, PlaneShape shape, uint16_t colour) {
   const float a = radians(heading - 90.0f), cs = cosf(a), sn = sinf(a);
   auto tx = [&](float px, float py) { return x + lroundf(px * cs - py * sn); };
   auto ty = [&](float px, float py) { return y + lroundf(px * sn + py * cs); };
   const uint16_t white = rgb(255, 255, 255);
+  // A nacelle is a stubby block slung under the wing; two per side reads as
+  // a four-engine widebody, one per side as a twin.
+  auto nacelle = [&](float cx, float cy, float halfLen, float halfWid) {
+    const float lx[4] = {cx + halfLen, cx + halfLen, cx - halfLen, cx - halfLen};
+    const float ly[4] = {cy - halfWid, cy + halfWid, cy + halfWid, cy - halfWid};
+    float px[4], py[4];
+    for (int i = 0; i < 4; ++i) {
+      px[i] = x + (lx[i] * cs - ly[i] * sn);
+      py[i] = y + (lx[i] * sn + ly[i] * cs);
+    }
+    fillPolygon(px, py, 4, colour);
+  };
   switch (shape) {
     case PlaneShape::Helicopter: {
-      // The rotor spins independent of track; a short tail boom still shows
-      // which way the aircraft is actually heading. A real rotor blade is
-      // thin, so this is the one shape that stays as lines (doubled for
-      // weight) rather than a fill.
+      // The rotor turns regardless of track, so it is animated; the tail
+      // boom is what actually shows the heading.
       static float rotorAngle = 0.0f;
       rotorAngle += 35.0f;
       if (rotorAngle >= 360.0f) rotorAngle -= 360.0f;
+      // Blades first, body over them, so the rotor reads as passing behind
+      // the cabin instead of cutting the machine into a starfish. Thin
+      // filled bars rather than line() strokes - a single-pixel blade all
+      // but vanishes on the panel.
       const float ra = radians(rotorAngle);
-      const int r1x = x + lroundf(cosf(ra) * 13), r1y = y + lroundf(sinf(ra) * 13);
-      const int r2x = x - lroundf(cosf(ra) * 13), r2y = y - lroundf(sinf(ra) * 13);
-      disc(x, y, 4, colour);
-      line(r1x, r1y, r2x, r2y, colour);
-      line(r1x, r1y + 1, r2x, r2y + 1, colour);
-      line(x, y, tx(-11, 0), ty(-11, 0), colour);
+      for (int blade = 0; blade < 2; ++blade) {
+        const float ba = ra + blade * 1.5707963f;
+        const float bc = cosf(ba) * 13.0f, bs = sinf(ba) * 13.0f;
+        const float nx = -sinf(ba), ny = cosf(ba);
+        const float bx[4] = {x + bc + nx, x + bc - nx, x - bc - nx, x - bc + nx};
+        const float by[4] = {y + bs + ny, y + bs - ny, y - bs - ny, y - bs + ny};
+        fillPolygon(bx, by, 4, colour);
+      }
+      fillOutline(x, y, cs, sn, OUTLINE_HELI, colour);
+      disc(x, y, 3, colour);
       pixel(x, y, white);
       break;
     }
     case PlaneShape::Fighter:
-      // Narrower and more sharply swept than the standard jet silhouette.
-      filledTriangle(tx(13,0), ty(13,0), tx(-6,-4), ty(-6,-4), tx(-10,0), ty(-10,0), colour);
-      filledTriangle(tx(13,0), ty(13,0), tx(-10,0), ty(-10,0), tx(-6,4), ty(-6,4), colour);
+      fillOutline(x, y, cs, sn, OUTLINE_FIGHTER, colour);
       pixel(x, y, white);
       break;
     case PlaneShape::LightProp:
-      // Straight, unswept wings crossing a slim fuselage - a small prop
-      // aircraft, not the swept dart shape used for everything else.
-      filledTriangle(tx(10,0), ty(10,0), tx(-10,-2), ty(-10,-2), tx(-10,2), ty(-10,2), colour);
-      filledTriangle(tx(2,0), ty(2,0), tx(0,-8), ty(0,-8), tx(-2,0), ty(-2,0), colour);
-      filledTriangle(tx(2,0), ty(2,0), tx(-2,0), ty(-2,0), tx(0,8), ty(0,8), colour);
+      fillOutline(x, y, cs, sn, OUTLINE_LIGHT, colour);
+      // Propeller arc: two pixels thick so it survives the panel, and set
+      // ahead of the spinner rather than through it.
+      line(tx(9.0f, -4.0f), ty(9.0f, -4.0f), tx(9.0f, 4.0f), ty(9.0f, 4.0f), colour);
+      line(tx(10.0f, -3.0f), ty(10.0f, -3.0f), tx(10.0f, 3.0f), ty(10.0f, 3.0f), colour);
       pixel(x, y, white);
       break;
     case PlaneShape::Twin:
-      // Regional/business twin: shorter than an airliner, wings only lightly
-      // swept, with a squarer tailplane so it reads as a smaller machine.
-      filledTriangle(tx(10,0), ty(10,0), tx(-7,-6), ty(-7,-6), tx(-4,0), ty(-4,0), colour);
-      filledTriangle(tx(10,0), ty(10,0), tx(-4,0), ty(-4,0), tx(-7,6), ty(-7,6), colour);
-      line(tx(-8,-4), ty(-8,-4), tx(-8,4), ty(-8,4), colour);
+      fillOutline(x, y, cs, sn, OUTLINE_TWIN, colour);
+      // Turboprops and regional jets alike carry their engines out on the
+      // wing, which is most of what separates this from the light single.
+      nacelle(0.5f, 5.5f, 3.0f, 1.3f);
+      nacelle(0.5f, -5.5f, 3.0f, 1.3f);
       pixel(x, y, white);
       break;
     case PlaneShape::HeavyJet:
-      // Wide-body: longer fuselage and a noticeably greater span than the
-      // narrow-body dart, plus a full-width tailplane.
-      filledTriangle(tx(15,0), ty(15,0), tx(-10,-8), ty(-10,-8), tx(-6,0), ty(-6,0), colour);
-      filledTriangle(tx(15,0), ty(15,0), tx(-6,0), ty(-6,0), tx(-10,8), ty(-10,8), colour);
-      filledTriangle(tx(-9,-5), ty(-9,-5), tx(-13,0), ty(-13,0), tx(-9,5), ty(-9,5), colour);
+      fillOutline(x, y, cs, sn, OUTLINE_HEAVY, colour);
+      nacelle(-1.0f, 6.5f, 3.2f, 1.5f);
+      nacelle(-1.0f, -6.5f, 3.2f, 1.5f);
+      nacelle(-3.5f, 10.5f, 2.8f, 1.4f);
+      nacelle(-3.5f, -10.5f, 2.8f, 1.4f);
       pixel(x, y, white);
       break;
     case PlaneShape::Glider:
-      // Very high aspect ratio: a long thin span on a tiny fuselage is the
-      // whole visual signature of a sailplane.
-      line(tx(0,-16), ty(0,-16), tx(0,16), ty(0,16), colour);
-      line(tx(-1,-16), ty(-1,-16), tx(-1,16), ty(-1,16), colour);
-      filledTriangle(tx(8,0), ty(8,0), tx(-7,-2), ty(-7,-2), tx(-7,2), ty(-7,2), colour);
+      fillOutline(x, y, cs, sn, OUTLINE_GLIDER, colour);
       pixel(x, y, white);
       break;
     case PlaneShape::Balloon: {
       // Lighter-than-air drifts with the wind, so heading is meaningless
       // here - drawn unrotated, envelope over basket.
-      disc(x, y - 3, 7, colour);
-      filledRect(x - 2, y + 5, 5, 4, colour);
-      pixel(x, y - 3, white);
+      disc(x, y - 4, 7, colour);
+      filledRect(x - 2, y + 4, 5, 5, colour);
+      line(x - 4, y + 2, x - 2, y + 5, colour);
+      line(x + 4, y + 2, x + 2, y + 5, colour);
+      pixel(x, y - 4, white);
       break;
     }
     case PlaneShape::Drone: {
-      // Quadrotor: a small body with four rotor discs, unrotated for the
-      // same reason a helicopter's rotor is - the airframe has no
-      // meaningful "nose" at this size.
+      // Quadrotor: an X of arms with a rotor disc on each end, unrotated
+      // for the same reason the helicopter's rotor is - at this size the
+      // airframe has no meaningful nose.
+      for (int i = 0; i < 4; ++i) {
+        const int dx = (i & 1) ? 7 : -7, dy = (i & 2) ? 7 : -7;
+        line(x, y, x + dx, y + dy, colour);
+        line(x, y + 1, x + dx, y + dy + 1, colour);
+        disc(x + dx, y + dy, 3, colour);
+        disc(x + dx, y + dy, 1, white);
+      }
       filledRect(x - 3, y - 3, 7, 7, colour);
-      disc(x - 7, y - 7, 2, colour);
-      disc(x + 7, y - 7, 2, colour);
-      disc(x - 7, y + 7, 2, colour);
-      disc(x + 7, y + 7, 2, colour);
-      pixel(x, y, white);
       break;
     }
     case PlaneShape::Ground:
@@ -2174,21 +2340,20 @@ void drawPlaneIcon(int x, int y, float heading, PlaneShape shape, uint16_t colou
       filledRect(x - 2, y - 2, 5, 5, white);
       break;
     case PlaneShape::Airliner:
-      // Swept-wing airliner dart - the same outline every icon used to draw,
-      // now filled solid via its two diagonal-split triangles.
-      filledTriangle(tx(12,0), ty(12,0), tx(-9,-5), ty(-9,-5), tx(-5,0), ty(-5,0), colour);
-      filledTriangle(tx(12,0), ty(12,0), tx(-5,0), ty(-5,0), tx(-9,5), ty(-9,5), colour);
+      fillOutline(x, y, cs, sn, OUTLINE_AIRLINER, colour);
+      nacelle(0.0f, 5.5f, 3.0f, 1.4f);
+      nacelle(0.0f, -5.5f, 3.0f, 1.4f);
       pixel(x, y, white);
       break;
     case PlaneShape::Generic:
     default:
-      // Nothing known about the airframe: a neutral arrow that shows heading
-      // and claims nothing else.
-      filledTriangle(tx(9,0), ty(9,0), tx(-6,-5), ty(-6,-5), tx(-6,5), ty(-6,5), colour);
+      fillOutline(x, y, cs, sn, OUTLINE_GENERIC, colour);
       pixel(x, y, white);
       break;
   }
 }
+
+// --- icon-geometry-end ---
 
 // ---------------------------------------------------------------------------
 // Icon colour.
