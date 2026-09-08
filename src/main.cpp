@@ -963,6 +963,33 @@ void logHeapDiagnostics(const char *tag) {
                 static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)));
 }
 
+// Where a fetch cycle's wall-clock time actually goes. The networkTask
+// already reported that one fetch blocked it for 121186 ms, but a single
+// total says nothing about which of the half-dozen blocking calls inside a
+// fetch ran long - every one of them is separately bounded, so the total
+// being two minutes means one of those bounds is not holding, and guessing
+// which is not good enough. These accumulate per cycle and are printed by
+// networkTask on any cycle that runs long, including the ones that return
+// early, which a summary line at the end of fetchAircraft would miss.
+struct FetchPhaseTimings {
+  uint32_t aisPauseMs = 0;
+  uint32_t connectMs = 0;   // http.begin() + GET, i.e. DNS + TCP + TLS + headers
+  uint32_t bodyMs = 0;
+  uint32_t parseMs = 0;
+  uint32_t routeMs = 0;     // the whole per-aircraft enrichment loop
+  uint32_t routeWorstMs = 0;
+  uint32_t routeSaveMs = 0; // flash write; also disables the cache, see below
+  uint32_t renderMs = 0;
+  uint8_t attempts = 0;
+  uint8_t routeLookups = 0;
+  void reset() { *this = FetchPhaseTimings{}; }
+};
+FetchPhaseTimings fetchPhases;
+
+// Anything past this and the breakdown is worth the serial bandwidth. A
+// healthy cycle on a working feed completes in well under a second.
+constexpr uint32_t FETCH_PHASE_REPORT_MS = 5000;
+
 // One User-Agent for every outbound request, always matching the running
 // build. OpenStreetMap's tile policy requires an identifying, accurate UA.
 const String &userAgent() {
@@ -3094,6 +3121,8 @@ void fetchAdsbV2Aircraft() {
     // closes a real gap even though it may not be the sole cause of a stall
     // long enough to still trip the 60s watchdog.
     http.setTimeout(9000); http.setConnectTimeout(9000);
+    ++fetchPhases.attempts;
+    const uint32_t connectStartedAt = millis();
     if (!http.begin(client, url)) {
       finishFeedAttempt("Connection failed");
       status("API", rgb(245,30,35));
@@ -3115,6 +3144,9 @@ void fetchAdsbV2Aircraft() {
     static const char *bodyFramingHeaders[] = {"Transfer-Encoding", "Content-Encoding"};
     http.collectHeaders(bodyFramingHeaders, 2);
     code = http.GET();
+    // Covers DNS, TCP connect, the TLS handshake and the response headers -
+    // everything setConnectTimeout(9000) is supposed to bound.
+    fetchPhases.connectMs += millis() - connectStartedAt;
     responseCode = code;
     if (code == HTTP_CODE_TOO_MANY_REQUESTS) {
       nextFetchAt = millis() + 60000UL;
@@ -3142,8 +3174,11 @@ void fetchAdsbV2Aircraft() {
     size_t received = 0;
     const BodyRead bodyOutcome = readResponseBody(http, body, expected, received, chunked);
     const uint32_t bodyMs = millis() - bodyStartedAt;
+    fetchPhases.bodyMs += bodyMs;
     doc.clear();
+    const uint32_t parseStartedAt = millis();
     error = deserializeJson(doc, body.data(), body.size(), DeserializationOption::Filter(filter));
+    fetchPhases.parseMs += millis() - parseStartedAt;
     bodySize = body.size();
     http.end();
     const bool parsed = !error && doc["ac"].is<JsonArray>();
@@ -3229,6 +3264,7 @@ void fetchAdsbV2Aircraft() {
   }
   sortAircraftByDistance();
   int routeLookups = 0;
+  const uint32_t routeLoopStartedAt = millis();
   for (int i = 0; i < lastCount; ++i) {
     AircraftDisplay &display = latestAircraft[i];
     if (display.positionSource == 2) ++lastMlat;
@@ -3256,7 +3292,25 @@ void fetchAdsbV2Aircraft() {
       HTTPClient routeHttp;
       routeHttp.setTimeout(6000);
       routeHttp.setConnectTimeout(6000);
+      // Per-lookup timing and the internal-heap headroom going into the
+      // handshake. The recurring "PK verify failed with error 0x4290" on
+      // these lookups decodes as MBEDTLS_ERR_RSA_PUBLIC_FAILED plus
+      // MBEDTLS_ERR_MPI_ALLOC_FAILED - an allocation failure inside the
+      // certificate signature check, not a bad certificate - so what matters
+      // is how much contiguous internal RAM was free at that instant.
+      const uint32_t lookupStartedAt = millis();
+      const int lookupsBefore = routeLookups;
       routeForCallsign(display.flight, routeLookups, routeClient, routeHttp);
+      if (routeLookups > lookupsBefore) {
+        const uint32_t lookupMs = millis() - lookupStartedAt;
+        fetchPhases.routeLookups = static_cast<uint8_t>(routeLookups);
+        if (lookupMs > fetchPhases.routeWorstMs) fetchPhases.routeWorstMs = lookupMs;
+        if (lookupMs > 2000)
+          Serial.printf("Route %s took %lu ms (largestInternal=%u)\n", display.flight,
+                        static_cast<unsigned long>(lookupMs),
+                        static_cast<unsigned>(heap_caps_get_largest_free_block(
+                            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)));
+      }
       routeHttp.end();
       routeClient.stop();
       if (webServerReady) webServer.handleClient();
@@ -3265,16 +3319,26 @@ void fetchAdsbV2Aircraft() {
       rgbpanel->restartAtNextVsync();
     }
   }
+  fetchPhases.routeMs = millis() - routeLoopStartedAt;
   logHeapDiagnostics("fetch-end");
-  if (routeLookups > 0) saveRouteCacheToStorage();
+  if (routeLookups > 0) {
+    // A flash write disables the instruction cache while it runs, which is
+    // also what starves the RGB panel's bounce-buffer refill - so this one is
+    // timed both as a fetch cost and as a suspect for the frame roll.
+    const uint32_t saveStartedAt = millis();
+    saveRouteCacheToStorage();
+    fetchPhases.routeSaveMs = millis() - saveStartedAt;
+  }
   if (aircraftAtZeroMiles) beepAlert();
   lastFetchCompletedAt = millis();
   finishFeedAttempt("OK", responseCode);
-  renderCurrentPage();
+  { const uint32_t renderStartedAt = millis(); renderCurrentPage();
+    fetchPhases.renderMs = millis() - renderStartedAt; }
   Serial.printf("Displayed %d aircraft (%d MLAT) from %s\n", lastCount, lastMlat, apiProvider.c_str());
 }
 
 void fetchAircraft() {
+  fetchPhases.reset();
   logHeapDiagnostics("fetch-start");
   const bool retriedAuth = openSkyAuthRetryPending;
   openSkyAuthRetryPending = false;
@@ -3399,6 +3463,7 @@ void fetchAircraft() {
   doc.clear();
   }
   int routeLookups = 0;
+  const uint32_t routeLoopStartedAt = millis();
   for (int i=0; i<lastCount; ++i) {
     AircraftDisplay &display = latestAircraft[i];
     if (display.positionSource == 2) {
@@ -3424,7 +3489,25 @@ void fetchAircraft() {
       HTTPClient routeHttp;
       routeHttp.setTimeout(6000);
       routeHttp.setConnectTimeout(6000);
+      // Per-lookup timing and the internal-heap headroom going into the
+      // handshake. The recurring "PK verify failed with error 0x4290" on
+      // these lookups decodes as MBEDTLS_ERR_RSA_PUBLIC_FAILED plus
+      // MBEDTLS_ERR_MPI_ALLOC_FAILED - an allocation failure inside the
+      // certificate signature check, not a bad certificate - so what matters
+      // is how much contiguous internal RAM was free at that instant.
+      const uint32_t lookupStartedAt = millis();
+      const int lookupsBefore = routeLookups;
       routeForCallsign(display.flight, routeLookups, routeClient, routeHttp);
+      if (routeLookups > lookupsBefore) {
+        const uint32_t lookupMs = millis() - lookupStartedAt;
+        fetchPhases.routeLookups = static_cast<uint8_t>(routeLookups);
+        if (lookupMs > fetchPhases.routeWorstMs) fetchPhases.routeWorstMs = lookupMs;
+        if (lookupMs > 2000)
+          Serial.printf("Route %s took %lu ms (largestInternal=%u)\n", display.flight,
+                        static_cast<unsigned long>(lookupMs),
+                        static_cast<unsigned>(heap_caps_get_largest_free_block(
+                            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)));
+      }
       routeHttp.end();
       routeClient.stop();
       if (webServerReady) webServer.handleClient();
@@ -3433,12 +3516,21 @@ void fetchAircraft() {
       rgbpanel->restartAtNextVsync();
     }
   }
+  fetchPhases.routeMs = millis() - routeLoopStartedAt;
   logHeapDiagnostics("fetch-end");
-  if (routeLookups > 0) saveRouteCacheToStorage();
+  if (routeLookups > 0) {
+    // A flash write disables the instruction cache while it runs, which is
+    // also what starves the RGB panel's bounce-buffer refill - so this one is
+    // timed both as a fetch cost and as a suspect for the frame roll.
+    const uint32_t saveStartedAt = millis();
+    saveRouteCacheToStorage();
+    fetchPhases.routeSaveMs = millis() - saveStartedAt;
+  }
   if (aircraftAtZeroMiles) beepAlert();
   lastFetchCompletedAt = millis();
   finishFeedAttempt("OK", HTTP_CODE_OK);
-  renderCurrentPage();
+  { const uint32_t renderStartedAt = millis(); renderCurrentPage();
+    fetchPhases.renderMs = millis() - renderStartedAt; }
   Serial.printf("Displayed %d aircraft (%d MLAT), OpenSky credits remaining: %ld\n",lastCount,lastMlat,creditsRemaining);
 }
 
@@ -5022,14 +5114,45 @@ void networkTask(void *) {
       // duration is the difference between the feed working at all and not;
       // AISstream tolerates the brief reconnect (it re-subscribes on connect).
       const bool pauseAis = marineProvider == "aisstream" && aisWebSocket.isConnected();
+      const uint32_t aisPauseStartedAt = millis();
       if (pauseAis) { aisIntentionalDisconnect = true; aisWebSocket.disconnect(); }
+      const uint32_t aisPauseMs = millis() - aisPauseStartedAt;
       { MutexGuard guard(dataMutex); fetchAircraft(); }
+      // fetchAircraft() resets the phase counters, so this has to be folded
+      // in afterwards rather than before.
+      fetchPhases.aisPauseMs = aisPauseMs;
       // This was a known-good, already-connected session we paused ourselves,
       // not a failure - reconnect immediately rather than waiting on the
       // failure backoff, which doesn't apply here.
       if (pauseAis) connectAisWebSocket();
+      const uint32_t blockedMs = millis() - fetchStartedAt;
       Serial.printf("fetchAircraft blocked the network task for %lu ms\n",
-                    static_cast<unsigned long>(millis() - fetchStartedAt));
+                    static_cast<unsigned long>(blockedMs));
+      // Every blocking call inside a fetch is separately bounded (9s connect,
+      // 6s per route lookup, an explicit deadline on the body read), so a
+      // cycle in the tens of seconds means one of those bounds is not
+      // holding. Print where the time went so the next long cycle names the
+      // culprit instead of leaving it to inference. Anything the phases do
+      // not account for shows up as "other" - which is itself the answer if
+      // it is the large number.
+      if (blockedMs > FETCH_PHASE_REPORT_MS) {
+        const uint32_t accounted = fetchPhases.aisPauseMs + fetchPhases.connectMs +
+                                   fetchPhases.bodyMs + fetchPhases.parseMs +
+                                   fetchPhases.routeMs + fetchPhases.routeSaveMs +
+                                   fetchPhases.renderMs;
+        Serial.printf(
+            "  slow fetch breakdown: ais=%lu connect=%lu(x%u) body=%lu parse=%lu "
+            "routes=%lu(x%u worst=%lu) save=%lu render=%lu other=%lu\n",
+            static_cast<unsigned long>(fetchPhases.aisPauseMs),
+            static_cast<unsigned long>(fetchPhases.connectMs), fetchPhases.attempts,
+            static_cast<unsigned long>(fetchPhases.bodyMs),
+            static_cast<unsigned long>(fetchPhases.parseMs),
+            static_cast<unsigned long>(fetchPhases.routeMs), fetchPhases.routeLookups,
+            static_cast<unsigned long>(fetchPhases.routeWorstMs),
+            static_cast<unsigned long>(fetchPhases.routeSaveMs),
+            static_cast<unsigned long>(fetchPhases.renderMs),
+            static_cast<unsigned long>(blockedMs > accounted ? blockedMs - accounted : 0));
+      }
       if (openSkyAuthRetryPending) nextFetchAt = millis() + 1000UL;
       else if (static_cast<int32_t>(millis() - nextFetchAt) >= 0) nextFetchAt = millis() + REFRESH_MS;
     }
