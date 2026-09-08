@@ -21,6 +21,13 @@
 // different panel lays out correctly without a second set of drawing code.
 namespace layout {
 
+// GPIO 0 carries RGB data on the 800x480 panels (G3), so it cannot also be a
+// button there. Catch a board header that sets both at build time rather than
+// leaving it to a comment and a display glitch nobody traces back to here.
+#if BOARD_HAS_BOOT_BUTTON && PANEL_WIDTH == 800
+#error "BOARD_HAS_BOOT_BUTTON cannot be set on the 800x480 boards: GPIO 0 is the G3 RGB data line."
+#endif
+
 constexpr int W = PANEL_WIDTH;
 constexpr int H = PANEL_HEIGHT;
 

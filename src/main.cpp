@@ -4499,10 +4499,6 @@ void handleFirmwareUpload() {
     firmwareUploadStarted = true;
     firmwareUploadComplete = false;
     firmwareUploadBytes = 0;
-    if (webServer.arg("upload") != "1") {
-      firmwareUploadError = "Firmware upload request is missing its upload marker";
-      return;
-    }
     if (githubInstallPending || Update.isRunning()) {
       firmwareUploadError = "Another firmware operation is already in progress";
       return;
@@ -5246,10 +5242,14 @@ void setup() {
   brightnessPercent = settingsStore.getUChar("brightness", 100);
   brightnessPercent = constrain(brightnessPercent, 10, 100);
   generateCsrfToken();
-  pinMode(0, INPUT_PULLUP);
 #if BOARD_HAS_BOOT_BUTTON
+  // Only claim GPIO 0 on boards where it is actually a free button. On the
+  // 800x480 panels it is the G3 data line, so even the pinMode() call - which
+  // used to run unconditionally here - was reconfiguring a pin the RGB
+  // peripheral owns, ahead of panel init reclaiming it.
+  pinMode(0, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(0), onBootButtonFalling, FALLING);
-#endif  // GPIO 0 is an RGB data line on the 800x480 boards
+#endif
   delay(300);
 #if BOARD_EXPANDER_CH32
   if (!WS_CH32_IO::begin(Wire, BOARD_I2C_SDA, BOARD_I2C_SCL,
