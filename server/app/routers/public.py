@@ -165,6 +165,22 @@ def add_device(
     return RedirectResponse("/account", status_code=status.HTTP_303_SEE_OTHER)
 
 
+@router.post("/devices/{device_id}/rename")
+def rename_device(
+    device_id: int,
+    name: str = Form(...),
+    account: models.Account = Depends(get_current_account),
+    db: Session = Depends(get_db),
+):
+    device = _owned_device(db, account, device_id)
+    if device:
+        # Same trim/limit/fallback as add_device(), so a device can never end
+        # up with a name that could not have been given to it at creation.
+        device.name = name.strip()[:120] or "My receiver"
+        db.commit()
+    return RedirectResponse("/account", status_code=status.HTTP_303_SEE_OTHER)
+
+
 @router.post("/devices/{device_id}/reissue-key")
 def reissue_key(
     device_id: int,

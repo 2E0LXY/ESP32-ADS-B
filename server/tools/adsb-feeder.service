@@ -1,0 +1,49 @@
+# Debian/Ubuntu/Raspberry Pi OS install:
+#
+#   sudo mkdir -p /opt/adsb-feeder
+#   sudo cp adsb_feeder.py /opt/adsb-feeder/
+#   sudo cp adsb-feeder.service /etc/systemd/system/
+#   sudo systemctl edit adsb-feeder      # set SERVER and PORT, see below
+#   sudo systemctl enable --now adsb-feeder
+#   systemctl status adsb-feeder
+#   journalctl -u adsb-feeder -f
+#
+# "systemctl edit" opens a drop-in; put your own values there rather than
+# editing this file, so a later copy of it does not overwrite them:
+#
+#   [Service]
+#   Environment=ADSB_SERVER=feed.example.com
+#   Environment=ADSB_PORT=30117
+#
+[Unit]
+Description=ADS-B feeder - forwards local SBS output to the aggregator
+Documentation=https://github.com/2E0LXY/ESP32-ADS-B
+# Start after the network is up, but do not require it: the client retries
+# on its own, so a slow interface must not stop the service from starting.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=ADSB_SERVER=changeme.example.com
+Environment=ADSB_PORT=0
+Environment=ADSB_RECEIVER=127.0.0.1
+Environment=ADSB_RECEIVER_PORT=30003
+ExecStart=/usr/bin/python3 /opt/adsb-feeder/adsb_feeder.py \
+    --server ${ADSB_SERVER} --port ${ADSB_PORT} \
+    --receiver ${ADSB_RECEIVER} --receiver-port ${ADSB_RECEIVER_PORT}
+Restart=always
+RestartSec=10
+# Nothing here needs privileges, a home directory, or write access anywhere.
+DynamicUser=yes
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+MemoryMax=64M
+
+[Install]
+WantedBy=multi-user.target

@@ -19,7 +19,12 @@
 <tbody>
 {% for device in devices %}
 <tr>
-<td>{{ device.name }}</td>
+<td>
+<form class="inline" method="post" action="/devices/{{ device.id }}/rename">
+<input class="input" name="name" value="{{ device.name }}" maxlength="120" required style="width:180px">
+<button type="submit">Rename</button>
+</form>
+</td>
 <td>{{ device.last_seen_at.strftime('%Y-%m-%d %H:%M UTC') if device.last_seen_at else 'Never' }}</td>
 <td>{{ device.firmware_version or '--' }}</td>
 <td>{% if device.active_key %}<code>{{ device.active_key.key_prefix }}...</code>{% else %}<span class="sub">No key issued</span>{% endif %}</td>
@@ -70,6 +75,10 @@ Point your receiver's SBS/BaseStation output at <code>{{ request.url.hostname }}
 For readsb/dump1090-fa, add to your config: <code>--net-connector={{ request.url.hostname }},{{ device.feeder_port }},sbs_out</code>
 (or the equivalent "additional SBS output" field if you're using a web-based config tool). No firewall changes needed
 on your end - your receiver connects out to us, nothing connects in to you.
+<br>If your receiver software can't push SBS out on its own - most Windows setups, or a managed image whose
+config you'd rather not edit - run the small feeder client instead: see <code>server/tools/README.md</code>
+for Debian and Windows instructions. It needs only <code>{{ request.url.hostname }}</code> and port
+<code>{{ device.feeder_port }}</code>.
 </td></tr>
 {% endif %}
 {% else %}

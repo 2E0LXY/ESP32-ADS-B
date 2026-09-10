@@ -128,6 +128,21 @@ raw data being pushed straight into this backend.
 
 ## Known gaps / next steps
 
+Devices can be renamed from the account dashboard at any time; the name is
+cosmetic and does not affect the API key or the feeder port.
+
+Customers whose receiver software cannot push SBS out on its own can run the
+feeder client in `tools/` instead - a dependency-free Python script with a
+systemd unit for Debian and a batch launcher for Windows. See
+`tools/README.md`.
+
+Tests live in `tests/` and run against the real app through TestClient:
+
+```
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt httpx pytest
+.venv/bin/python -m pytest tests/ -q
+```
+
 - Feeder ingestion has no authentication beyond "knowing which port was
   assigned to you" - standard feeder software (readsb, dump1090, PiAware)
   has no way to send a custom auth handshake before its SBS stream, which
