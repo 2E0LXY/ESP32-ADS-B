@@ -252,7 +252,7 @@ This builds the default `waveshare_esp32_s3_lcd_4` environment (the 480 × 480 W
 pio run -e ws_lcd_7_app
 ```
 
-The WS7 build uses the prebuilt Arduino ESP-IDF libraries and is quick. An earlier revision set `custom_sdkconfig` to enable `CONFIG_LCD_RGB_RESTART_IN_VSYNC` and the RGB/GDMA IRAM-safe options, so that the panel's DMA-desync recovery (`restartAtNextVsync()`, which is otherwise a silent no-op — the boot log prints `RGB vsync restart supported: no`) would actually run. It does run, but the board then boot-loops with `Cache disabled but cached memory region accessed`: an IRAM-safe RGB ISR may not touch cached memory, while this panel's bounce-buffer refill reads the framebuffer from PSRAM on every scanline. The two are mutually exclusive on this hardware, so the options are not set. See the comment in `platformio.ini` for the full reasoning.
+The WS7 build uses the prebuilt Arduino ESP-IDF libraries and is quick. Those libraries already enable `CONFIG_LCD_RGB_RESTART_IN_VSYNC`, so the panel's DMA-desync recovery (`restartAtNextVsync()`) works as shipped and the boot log prints `RGB vsync restart supported: yes`. An earlier revision set `custom_sdkconfig` to turn that option plus the RGB/GDMA IRAM-safe flags on, in the mistaken belief the restart was a no-op. It changed nothing and boot-looped the board with `Cache disabled but cached memory region accessed`, because an IRAM-safe RGB ISR cannot read a framebuffer that lives in PSRAM. Those options are not set. The frame roll remains an open defect - see the comment in `platformio.ini`.
 
 The OTA image is generated at:
 
