@@ -2099,6 +2099,29 @@ void drawMlatPlane(int x, int y, float heading) {
   pixel(x,y,white);
 }
 
+// The square operator tile on the screensaver's departure board, standing in
+// for the airline logo in the reference design. Real logos are not shippable
+// here - there are thousands of operators, each would need a licensed bitmap,
+// and the flash budget is already carrying the map tiles - so the tile is the
+// airline's colour with its ICAO prefix reversed out of it, which reads at a
+// glance from across a room in the same way the logo does.
+void drawOperatorTile(int x, int y, int size, const char *flight, const char *hex) {
+  char code[4] = {'?', '?', '?', 0};
+  const char *src = (flight && strlen(flight) >= 3) ? flight : hex;
+  for (int i = 0; i < 3 && src && src[i]; ++i) code[i] = toupper(static_cast<unsigned char>(src[i]));
+  const uint16_t tint = operatorColour(code);
+  filledRect(x, y, size, size, tint);
+  // A darker inner border keeps the tile from bleeding into the black
+  // background on the colours that are already near-black (BAW, RYR).
+  filledRect(x + 3, y + 3, size - 6, 2, rgb(255, 255, 255));
+  filledRect(x + 3, y + size - 5, size - 6, 2, rgb(255, 255, 255));
+  // Centre the three glyphs: text5 advances 6*scale per character, and the
+  // glyph box is 5*scale wide by 7*scale tall.
+  const int scale = size / 26 > 1 ? size / 26 : 1;
+  const int textW = 3 * 6 * scale - scale;
+  text5(x + (size - textW) / 2, y + (size - 7 * scale) / 2, code, rgb(255, 255, 255), scale);
+}
+
 void drawOperatorBadge(int x, int y, const char *flight, const char *hex) {
   char code[4] = {'?','?','?',0};
   const char *src = (flight && strlen(flight)>=3) ? flight : hex;
@@ -2894,9 +2917,16 @@ void renderAircraftDetailCard(int aircraftIndex) {
 // operator badge, callsign, route and type, plus a phase guess (departing/
 // arriving/en route) derived from altitude and vertical rate - the feed has
 // no explicit flight-phase field to read instead.
+// Truncates in place to what will actually fit, so a long operator name or
+// airport pair clips cleanly instead of running off the panel. text5()
+// advances 6*scale pixels per character.
+void fitText(char *text, int xLeft, int scale) {
+  const int maxChars = (W - xLeft - 6) / (6 * scale);
+  if (maxChars > 0 && static_cast<int>(strlen(text)) > maxChars) text[maxChars] = 0;
+}
+
 void renderScreensaverPage() {
   filledRect(0, 0, W, H, rgb(0, 0, 0));
-  text5(10, 8, "SCREENSAVER - TAP OR SWIPE TO RETURN", rgb(80, 100, 120));
   // Overhead only: something you could plausibly see or hear from the
   // receiver location, not just anything within the full query radius.
   // Ground distance alone isn't enough - an airliner at cruise altitude can
@@ -2915,41 +2945,125 @@ void renderScreensaverPage() {
   }
   if (overheadCount == 0) {
     text5(20, H / 2 - 6, "NO OVERHEAD AIRCRAFT", rgb(120, 140, 160), 2);
+    text5(20, H / 2 + 24, "TAP OR SWIPE TO RETURN", rgb(70, 90, 110));
     present();
     return;
   }
   AircraftDisplay &a = latestAircraft[overheadMatches[screensaverAircraftIndex % overheadCount]];
-  const char *identity = a.flight[0] ? a.flight : a.hex;
-
-  const int iconX = 40, iconY = H / 2 - 34, textX = iconX + 34;
-  drawOperatorBadge(iconX, iconY, a.flight, a.hex);
-  text5(textX, H / 2 - 70, identity, rgb(255, 255, 255), 3);
-
   RouteCacheEntry *route = cachedRoute(a.flight);
-  char routeLabel[40];
-  buildRouteLabel(route, routeLabel, sizeof(routeLabel), (W - textX - 10) / 12);
-  text5(textX, H / 2 - 30, routeLabel, rgb(130, 210, 255), 2);
-  text5(textX, H / 2 - 4, a.aircraftType[0] ? a.aircraftType : "UNKNOWN TYPE", rgb(200, 210, 220), 2);
-
   const bool hasRoute = route && route->hasRoute;
-  const char *originLabel = hasRoute ? (route->originName[0] ? route->originName : route->origin) : nullptr;
-  const char *destinationLabel = hasRoute ? (route->destinationName[0] ? route->destinationName : route->destination) : nullptr;
-  char status[64];
-  if (a.onGround) {
-    snprintf(status, sizeof(status), "ON GROUND");
-  } else if (a.altitudeFt >= 0 && a.altitudeFt < 5000 && a.verticalRateFpm > 300 && originLabel) {
-    snprintf(status, sizeof(status), "DEPARTING FROM %s", originLabel);
-  } else if (a.altitudeFt >= 0 && a.altitudeFt < 6000 && a.verticalRateFpm < -300 && destinationLabel) {
-    snprintf(status, sizeof(status), "ARRIVING AT %s", destinationLabel);
-  } else if (destinationLabel) {
-    snprintf(status, sizeof(status), "EN ROUTE TO %s", destinationLabel);
+
+  // Departure-board layout: a colour tile standing in for the airline logo,
+  // three identity lines beside it, then the telemetry rows underneath at
+  // full width. Everything is derived from W/H so the 480x480 board gets the
+  // same design at a smaller scale rather than a clipped copy of this one.
+  const int margin = W / 40;
+  const int tile = H / 3;
+  const int tileY = margin + H / 24;
+  const int textX = margin + tile + W / 40;
+  const uint16_t white = rgb(255, 255, 255);
+  const uint16_t cyan = rgb(120, 205, 255);
+  const uint16_t dim = rgb(150, 165, 180);
+
+  drawOperatorTile(margin, tileY, tile, a.flight, a.hex);
+
+  // Line 1 - who. The operator name when the feed carries one, otherwise the
+  // callsign, which is the most identifying thing left.
+  char line[64];
+  snprintf(line, sizeof(line), "%s", a.operatorName[0] ? a.operatorName : (a.flight[0] ? a.flight : a.hex));
+  const int nameScale = W >= 800 ? 3 : 2;
+  fitText(line, textX, nameScale);
+  text5(textX, tileY, line, white, nameScale);
+
+  // Line 2 - where. Airport codes are the headline; the full names go in a
+  // lower row where there is room for them.
+  if (hasRoute) snprintf(line, sizeof(line), "%s-%s", route->origin, route->destination);
+  else snprintf(line, sizeof(line), "%s", a.flight[0] ? a.flight : a.hex);
+  const int routeScale = W >= 800 ? 5 : 3;
+  fitText(line, textX, routeScale);
+  text5(textX, tileY + 10 * nameScale, line, cyan, routeScale);
+
+  // Line 3 - what. Type, registration and callsign together, since the
+  // callsign is no longer the headline when a route resolved.
+  snprintf(line, sizeof(line), "%s  %s  %s",
+           a.aircraftType[0] ? a.aircraftType : "UNKNOWN",
+           a.registration[0] ? a.registration : a.hex,
+           a.flight[0] ? a.flight : "");
+  fitText(line, textX, 2);
+  text5(textX, tileY + 10 * nameScale + 11 * routeScale, line, dim, 2);
+
+  int y = tileY + tile + H / 16;
+  const int rowScale = W >= 800 ? 3 : 2;
+  const int rowStep = 11 * rowScale;
+
+  // The two headline telemetry rows, in the reference's own units: thousands
+  // of feet, miles per hour, degrees true, and feet per second rather than
+  // per minute.
+  const float altKft = a.altitudeFt > 0 ? a.altitudeFt / 1000.0f : 0.0f;
+  const int speedMph = static_cast<int>(lroundf(a.speedKnots * 1.15078f));
+  const int verticalFtPerSec = static_cast<int>(lroundf(a.verticalRateFpm / 60.0f));
+  snprintf(line, sizeof(line), "ALT:%.1fKFT, SPD:%dMPH", altKft, speedMph);
+  fitText(line, margin, rowScale);
+  text5(margin, y, line, white, rowScale);
+  y += rowStep;
+  snprintf(line, sizeof(line), "TRK:%dDEG, VR:%+dFT/S",
+           static_cast<int>(lroundf(a.track)), verticalFtPerSec);
+  fitText(line, margin, rowScale);
+  text5(margin, y, line, white, rowScale);
+  y += rowStep;
+
+  // Everything else the feed gives us for this airframe. Squawk is shown in
+  // red when it is one of the three emergency codes, which is the one value
+  // on this screen worth interrupting someone for.
+  const bool emergencySquawk = a.squawk[0] && (!strcmp(a.squawk, "7500") ||
+                                               !strcmp(a.squawk, "7600") ||
+                                               !strcmp(a.squawk, "7700"));
+  snprintf(line, sizeof(line), "DIST:%.1fMI  SQK:%s  SIG:%.0fDB  MSGS:%lu",
+           a.distanceMiles, a.squawk[0] ? a.squawk : "----",
+           a.signalDb > -900 ? a.signalDb : 0.0f,
+           static_cast<unsigned long>(a.messages));
+  fitText(line, margin, 2);
+  text5(margin, y, line, emergencySquawk ? rgb(255, 60, 60) : dim, 2);
+  y += 24;
+
+  // Full airport names, which is what makes the route mean something to
+  // someone who does not read IATA codes.
+  if (hasRoute) {
+    const char *from = route->originName[0] ? route->originName : route->origin;
+    const char *to = route->destinationName[0] ? route->destinationName : route->destination;
+    snprintf(line, sizeof(line), "%s > %s", from, to);
   } else {
-    snprintf(status, sizeof(status), "%d FT  %d KT", a.altitudeFt, static_cast<int>(lroundf(a.speedKnots)));
+    snprintf(line, sizeof(line), "%s", route ? "NO ROUTE ON FILE" : "ROUTE LOOKUP QUEUED");
   }
-  // text5() doesn't wrap; truncate rather than overrun the panel edge.
-  const int maxStatusChars = (W - 20) / 12;
-  if (static_cast<int>(strlen(status)) > maxStatusChars) status[maxStatusChars] = 0;
-  text5(10, H - 34, status, rgb(255, 255, 255), 2);
+  fitText(line, margin, 2);
+  text5(margin, y, line, cyan, 2);
+  y += 24;
+
+  // Provenance: how the position was derived, how stale it is, and where the
+  // aircraft is registered - the details that say how much to trust the rest.
+  snprintf(line, sizeof(line), "%s  %s  %.0fS AGO  %s",
+           a.hex, a.positionSource == 2 ? "MLAT" : "ADS-B",
+           a.ageSeconds >= 0 ? a.ageSeconds : 0.0f,
+           a.country[0] ? a.country : "");
+  fitText(line, margin, 2);
+  text5(margin, y, line, rgb(110, 130, 150), 2);
+
+  y += 24;
+
+  // Position and the barometric/geometric altitude pair. The two altitudes
+  // differ by the local pressure error, so showing both is the honest
+  // version of a single "altitude" number.
+  snprintf(line, sizeof(line), "%.4f %.4f  BARO:%dFT  GEOM:%dFT",
+           a.latitude, a.longitude, a.altitudeFt,
+           a.geometricAltitudeFt >= 0 ? a.geometricAltitudeFt : a.altitudeFt);
+  fitText(line, margin, 2);
+  text5(margin, y, line, rgb(110, 130, 150), 2);
+
+  // Which of the overhead aircraft this is, and the way out.
+  char footer[48];
+  snprintf(footer, sizeof(footer), "%d/%d OVERHEAD - TAP OR SWIPE TO RETURN",
+           (screensaverAircraftIndex % overheadCount) + 1, overheadCount);
+  text5(margin, H - 14, footer, rgb(70, 90, 110));
   present();
 }
 
