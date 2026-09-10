@@ -76,26 +76,62 @@ Arduino_DataBus *bus = new Arduino_SWSPI(
     GFX_NOT_DEFINED);
 #endif
 
-Arduino_ESP32RGBPanel *rgbpanel = new Arduino_ESP32RGBPanel(
-    PANEL_PIN_DE, PANEL_PIN_VSYNC, PANEL_PIN_HSYNC, PANEL_PIN_PCLK,
-    PANEL_PINS_R, PANEL_PINS_G, PANEL_PINS_B,
-    PANEL_HSYNC_POLARITY, PANEL_HSYNC_FRONT_PORCH, PANEL_HSYNC_PULSE_WIDTH,
-    PANEL_HSYNC_BACK_PORCH,
-    PANEL_VSYNC_POLARITY, PANEL_VSYNC_FRONT_PORCH, PANEL_VSYNC_PULSE_WIDTH,
-    PANEL_VSYNC_BACK_PORCH,
-    PANEL_PCLK_ACTIVE_NEG, PANEL_PCLK_HZ);
+// The pixel clock is settable from the web UI rather than fixed at
+// PANEL_PCLK_HZ, because it is the one lever on the frame roll and the
+// flickering scanlines that can be tested without a rebuild each time. Both
+// faults are the RGB bounce-buffer refill missing its deadline while the CPU
+// saturates the same PSRAM bus; a slower pixel clock asks for fewer bytes per
+// line and gives the refill more slack, at the cost of refresh rate. Which
+// value is enough is an empirical question about this panel and this
+// workload, so it belongs in a dropdown, not a #define.
+//
+// esp_lcd captures the clock when the panel is initialised, so this is
+// applied at boot and a change reboots the device. The board's own
+// PANEL_PCLK_HZ remains the default and the value NVS is seeded with.
+uint32_t panelPclkHz = PANEL_PCLK_HZ;
 
+// Selectable values, coarse enough to tell apart on a panel and bounded so a
+// bad entry cannot leave the display unusable and the web UI unreachable.
+constexpr uint32_t PANEL_PCLK_CHOICES[] = {
+    9000000L, 10000000L, 11000000L, 12000000L, 13000000L,
+    14000000L, 15000000L, 16000000L, 16500000L, 18000000L, 21000000L,
+};
+
+// Constructed in setup() once the stored clock has been read, not at static
+// init - hence pointers assigned later rather than initialisers here.
+Arduino_ESP32RGBPanel *rgbpanel = nullptr;
+Arduino_RGB_Display *gfx = nullptr;
+
+void createDisplay(uint32_t pclkHz) {
+  rgbpanel = new Arduino_ESP32RGBPanel(
+      PANEL_PIN_DE, PANEL_PIN_VSYNC, PANEL_PIN_HSYNC, PANEL_PIN_PCLK,
+      PANEL_PINS_R, PANEL_PINS_G, PANEL_PINS_B,
+      PANEL_HSYNC_POLARITY, PANEL_HSYNC_FRONT_PORCH, PANEL_HSYNC_PULSE_WIDTH,
+      PANEL_HSYNC_BACK_PORCH,
+      PANEL_VSYNC_POLARITY, PANEL_VSYNC_FRONT_PORCH, PANEL_VSYNC_PULSE_WIDTH,
+      PANEL_VSYNC_BACK_PORCH,
+      PANEL_PCLK_ACTIVE_NEG, static_cast<int32_t>(pclkHz));
 #if PANEL_NEEDS_SPI_INIT
-// The ST7701 needs an SPI register sequence before its RGB interface works.
-Arduino_RGB_Display *gfx = new Arduino_RGB_Display(
-    PANEL_WIDTH, PANEL_HEIGHT, rgbpanel, PANEL_ROTATION, true,
-    bus, GFX_NOT_DEFINED, st7701_type1_init_operations,
-    sizeof(st7701_type1_init_operations));
+  // The ST7701 needs an SPI register sequence before its RGB interface works.
+  gfx = new Arduino_RGB_Display(
+      PANEL_WIDTH, PANEL_HEIGHT, rgbpanel, PANEL_ROTATION, true,
+      bus, GFX_NOT_DEFINED, st7701_type1_init_operations,
+      sizeof(st7701_type1_init_operations));
 #else
-// The ST7262 is a plain RGB driver with no configuration bus.
-Arduino_RGB_Display *gfx = new Arduino_RGB_Display(
-    PANEL_WIDTH, PANEL_HEIGHT, rgbpanel, PANEL_ROTATION, true);
+  // The ST7262 is a plain RGB driver with no configuration bus.
+  gfx = new Arduino_RGB_Display(PANEL_WIDTH, PANEL_HEIGHT, rgbpanel, PANEL_ROTATION, true);
 #endif
+}
+
+// Approximate refresh rate for a given pixel clock, so the UI can say what
+// the trade costs. Total line and frame lengths include the blanking.
+float panelRefreshHz(uint32_t pclkHz) {
+  const uint32_t lineTicks = PANEL_WIDTH + PANEL_HSYNC_FRONT_PORCH +
+                             PANEL_HSYNC_PULSE_WIDTH + PANEL_HSYNC_BACK_PORCH;
+  const uint32_t frameLines = PANEL_HEIGHT + PANEL_VSYNC_FRONT_PORCH +
+                              PANEL_VSYNC_PULSE_WIDTH + PANEL_VSYNC_BACK_PORCH;
+  return static_cast<float>(pclkHz) / static_cast<float>(lineTicks * frameLines);
+}
 
 #if !ADSB_TLS_INSECURE
 // Declared at global scope on purpose: an unnamed namespace would give these
@@ -4149,6 +4185,8 @@ void handleStatusApi() {
   doc["sound"] = soundAlerts;
   doc["screensaverEnabled"] = screensaverEnabled;
   doc["screensaverIdleMinutes"] = screensaverIdleMinutes;
+  doc["pclkKhz"] = panelPclkHz / 1000UL;
+  doc["pclkRefreshHz"] = roundf(panelRefreshHz(panelPclkHz) * 10.0f) / 10.0f;
   doc["screensaverActive"] = screensaverActive;
   doc["page"] = displayPageName();
   doc["latitude"] = homeLatitude;
@@ -4348,6 +4386,25 @@ void handleDisplaySettings() {
     screensaverIdleMinutes = static_cast<uint16_t>(minutes);
     settingsStore.putUShort("ssaver-min", screensaverIdleMinutes);
     lastInteractionAt = millis();
+  }
+  if (webServer.hasArg("pclkKhz")) {
+    long khz = 0;
+    bool known = false;
+    if (parseStrictLong(webServer.arg("pclkKhz"), khz))
+      for (uint32_t choice : PANEL_PCLK_CHOICES)
+        if (choice == static_cast<uint32_t>(khz) * 1000UL) { known = true; break; }
+    if (!known) {
+      sendMessage(400, "Unsupported pixel clock");
+      return;
+    }
+    settingsStore.putULong("pclk-khz", static_cast<uint32_t>(khz));
+    // The clock is latched when esp_lcd initialises the panel, so it cannot
+    // be changed on a running display - save it and restart. Long enough a
+    // delay for this response to reach the browser first.
+    restartPending = true;
+    restartAt = millis() + 1500;
+    sendMessage(202, "Pixel clock saved - rebooting to apply");
+    return;
   }
   // The brightness slider is gone: the CH422G drives the backlight enable as a
   // plain switch with no PWM channel, so any value between 10 and 100 looked
@@ -5374,6 +5431,20 @@ void setup() {
     Serial.println("Rev4 display helper unavailable");
   }
   applyBrightness(brightnessPercent);
+  // Read before the panel exists: esp_lcd latches the pixel clock at init, so
+  // a change only takes effect on the next boot. An unknown stored value (a
+  // downgrade, a corrupted key) falls back to the board default rather than
+  // initialising the panel with something it cannot drive.
+  {
+    const uint32_t storedKhz = settingsStore.getULong("pclk-khz", PANEL_PCLK_HZ / 1000UL);
+    const uint32_t storedHz = storedKhz * 1000UL;
+    panelPclkHz = PANEL_PCLK_HZ;
+    for (uint32_t choice : PANEL_PCLK_CHOICES)
+      if (choice == storedHz) { panelPclkHz = storedHz; break; }
+  }
+  createDisplay(panelPclkHz);
+  Serial.printf("Panel pixel clock: %.1f MHz (~%.1f Hz refresh)\n",
+                panelPclkHz / 1000000.0f, panelRefreshHz(panelPclkHz));
   if (!gfx->begin()) {
     Serial.println("Display initialization failed");
     while (true) delay(1000);
