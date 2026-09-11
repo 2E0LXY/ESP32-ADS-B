@@ -29,7 +29,7 @@
 <td>
 {% set loc = device.location() %}
 {% if loc %}<code>{{ '%.4f'|format(loc[0]) }}, {{ '%.4f'|format(loc[1]) }}</code> · {{ loc[2]|int }} nm<br>
-<span class="sub">{{ 'reported by the receiver' if device.reported_lat is not none else 'set here' }}</span>
+<span class="sub">{{ device.location_source() }}{% if device.inferred_lat is not none and device.reported_lat is none and device.manual_lat is none %} (±{{ device.inferred_spread_nm|int }} nm){% endif %}</span>
 {% else %}<span class="sub">Not set - using the server default</span>{% endif %}
 </td>
 <td>{{ device.firmware_version or '--' }}</td>
@@ -48,6 +48,7 @@ Location:
 <button type="submit">Save</button>
 </form>
 &nbsp;Only needed until the receiver reports its own position - it sends one with every request. Clear both coordinates to fall back to the server default.
+{% if device.inferred_lat is not none %}<br>&nbsp;Your feed puts this receiver near <code>{{ '%.4f'|format(device.inferred_lat) }}, {{ '%.4f'|format(device.inferred_lon) }}</code>, estimated from the low-altitude aircraft it hears. Used only while nothing better is known.{% endif %}
 </td></tr>
 {% else %}
 <tr><td colspan="6" class="sub">No devices yet - add one below.</td></tr>

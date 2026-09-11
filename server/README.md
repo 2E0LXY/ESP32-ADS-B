@@ -132,7 +132,11 @@ Each device has its own location, so the aggregator polls the areas its
 devices are actually in rather than one global point. A device reports its
 position with every `/v1/aircraft` request, so a receiver that moves follows
 itself; the account dashboard can set one for a device that has never
-reported. `HOME_LAT`/`HOME_LON`/`HOME_RADIUS_NM` remain the fallback for a
+reported. A feeder's receiver position is also estimated from the low-altitude
+aircraft it reports (`app/site_estimate.py`), which ranks below both of
+those - an SBS stream carries no station position, but an antenna only hears
+what is above its horizon, so low traffic gives the site away.
+`HOME_LAT`/`HOME_LON`/`HOME_RADIUS_NM` remain the fallback for a
 deployment with no located devices. Nearby devices are merged into one poll
 area, and the number of areas per cycle is capped by `MAX_POLL_REGIONS`
 (default 6), rotating across cycles beyond that so no free upstream API is

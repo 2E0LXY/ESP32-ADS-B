@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 from . import models
 from .aggregator import Aggregator
 from .sbs import StreamDecoder
+from .site_estimate import SiteSampler
 
 logger = logging.getLogger("feed_ingest")
 
@@ -27,6 +28,7 @@ PORT_RANGE_START = int(os.environ.get("FEEDER_PORT_RANGE_START", "30100"))
 PORT_RANGE_END = int(os.environ.get("FEEDER_PORT_RANGE_END", "30999"))
 MERGE_INTERVAL_SECONDS = 2
 DB_TOUCH_INTERVAL_SECONDS = 15  # how often a live connection updates feeder_last_message_at
+SITE_ESTIMATE_INTERVAL_SECONDS = 300  # how often the receiver-position estimate is rewritten
 
 
 def allocate_port(db: Session) -> int | None:
@@ -65,6 +67,10 @@ class FeedIngestManager:
             peer = writer.get_extra_info("peername")
             logger.info("feeder %s: connection from %s", device_id, peer)
             decoder = StreamDecoder()
+            # An SBS stream never says where the receiver is, but the low
+            # aircraft it hears do - see app/site_estimate.py.
+            sampler = SiteSampler()
+            last_site_write = 0.0
 
             async def read_loop():
                 while True:
@@ -89,11 +95,21 @@ class FeedIngestManager:
                     positioned = [s.to_dict() for s in decoder.aircraft.values() if s.has_position()]
                     if positioned:
                         await self.aggregator.cache.merge(source, positioned)
+                    for state in decoder.aircraft.values():
+                        if state.has_position():
+                            sampler.add(state.hex, state.lat, state.lon, state.alt_baro, state.updated_at)
                     decoder.prune_older_than(300)
                     now = loop.time()
                     if now - last_db_touch >= DB_TOUCH_INTERVAL_SECONDS:
                         last_db_touch = now
                         self._touch_device(device_id)
+                    # Re-estimating on every merge would rewrite the row every
+                    # two seconds for a value that barely moves.
+                    if now - last_site_write >= SITE_ESTIMATE_INTERVAL_SECONDS:
+                        last_site_write = now
+                        estimate = sampler.estimate()
+                        if estimate:
+                            self._store_site_estimate(device_id, estimate, len(sampler))
 
             reader_task = asyncio.ensure_future(read_loop())
             merger_task = asyncio.ensure_future(merge_loop())
@@ -124,6 +140,26 @@ class FeedIngestManager:
                 {"feeder_last_message_at": datetime.datetime.now(datetime.timezone.utc)}
             )
             db.commit()
+        finally:
+            db.close()
+
+    def _store_site_estimate(self, device_id: int, estimate, samples: int):
+        lat, lon, spread = estimate
+        db = self._session_factory()
+        try:
+            db.query(models.Device).filter(models.Device.id == device_id).update(
+                {
+                    "inferred_lat": lat,
+                    "inferred_lon": lon,
+                    "inferred_spread_nm": spread,
+                    "inferred_at": datetime.datetime.now(datetime.timezone.utc),
+                }
+            )
+            db.commit()
+            logger.info(
+                "feeder %s: receiver estimated at %.4f, %.4f (+/- %.0f nm, %d airframes)",
+                device_id, lat, lon, spread, samples,
+            )
         finally:
             db.close()
 

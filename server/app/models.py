@@ -77,6 +77,14 @@ class Device(Base):
     manual_lat = Column(Float, nullable=True)
     manual_lon = Column(Float, nullable=True)
     manual_radius_nm = Column(Float, nullable=True)
+    # Estimated from the aircraft this device's feeder reports - see
+    # app/site_estimate.py. Ranks below both of the above: it is a guess, and
+    # a receiver that states its own position or an owner who typed one in
+    # both know better than we do.
+    inferred_lat = Column(Float, nullable=True)
+    inferred_lon = Column(Float, nullable=True)
+    inferred_spread_nm = Column(Float, nullable=True)
+    inferred_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
 
     def location(self) -> tuple[float, float, float] | None:
@@ -87,7 +95,21 @@ class Device(Base):
             return (self.reported_lat, self.reported_lon, self.reported_radius_nm or 50.0)
         if self.manual_lat is not None and self.manual_lon is not None:
             return (self.manual_lat, self.manual_lon, self.manual_radius_nm or 50.0)
+        if self.inferred_lat is not None and self.inferred_lon is not None:
+            # The spread is how scattered the evidence was, not how far this
+            # receiver reaches, so poll a normal radius around it rather than
+            # treating a tight estimate as a tiny coverage area.
+            return (self.inferred_lat, self.inferred_lon, 50.0)
         return None
+
+    def location_source(self) -> str:
+        if self.reported_lat is not None and self.reported_lon is not None:
+            return "reported by the receiver"
+        if self.manual_lat is not None and self.manual_lon is not None:
+            return "set here"
+        if self.inferred_lat is not None and self.inferred_lon is not None:
+            return "estimated from your feed"
+        return "server default"
 
     account = relationship("Account", back_populates="devices")
     api_keys = relationship("ApiKey", back_populates="device", cascade="all, delete-orphan")
