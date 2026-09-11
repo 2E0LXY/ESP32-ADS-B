@@ -33,6 +33,10 @@ logger = logging.getLogger("aggregator")
 
 USER_AGENT = "2E0LXY-ADSB-Aggregator/1.0 (+https://github.com/2E0LXY/ESP32-ADS-B)"
 POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "15"))
+# How long a source is still credited with an aircraft after last reporting
+# it. Long enough to ride out a gap between messages from a single receiver,
+# short enough that a feeder that goes offline stops claiming the sky.
+SOURCE_ATTRIBUTION_SECONDS = 60
 STALE_AFTER_SECONDS = 5 * 60  # matches the ESP32 firmware's own MLAT/route cache staleness window
 # Per-device polling areas. A device asking for a 5 nm radius still needs the
 # cache filled a bit wider than that, or an aircraft is only cached once it
@@ -50,6 +54,15 @@ class CachedAircraft:
     hex: str
     data: dict
     seen_at: float
+    # Every source that has recently reported this aircraft, and when, kept
+    # independently of whose record currently wins the freshness comparison
+    # in merge(). Attribution used to be a single field on the winning
+    # record, which meant an aircraft a customer's own receiver was tracking
+    # vanished from their "my feed" map the moment an upstream API reported
+    # it a fraction of a second fresher - so the aircraft nearest the
+    # receiver, the ones the aggregator also polls for, were exactly the
+    # ones that disappeared.
+    sources: dict = field(default_factory=dict)
 
 
 class AircraftCache:
@@ -74,10 +87,17 @@ class AircraftCache:
                 # from the upstream API, smaller is fresher) rather than
                 # simply "last source polled wins" - two sources can both
                 # report the same aircraft at different staleness.
+                # Record that this source saw it whatever happens next: who
+                # reported it and whose values are freshest are two different
+                # questions, and conflating them lost aircraft.
+                sources = existing.sources if existing else {}
+                sources[source] = now
                 if existing is None or ac.get("seen", 1e9) <= existing.data.get("seen", 1e9):
                     ac = dict(ac)
                     ac["_source"] = source
-                    self._by_hex[hex_id] = CachedAircraft(hex_id, ac, now)
+                    self._by_hex[hex_id] = CachedAircraft(hex_id, ac, now, sources)
+                else:
+                    existing.sources = sources
 
     async def prune(self):
         cutoff = time.time() - STALE_AFTER_SECONDS
@@ -99,12 +119,22 @@ class AircraftCache:
         return result
 
     async def query_by_source(self, source: str) -> list[dict]:
-        """Used by the "my feed" account page - only aircraft whose most
-        recently merged record came from this exact source tag, so a
-        feeder only ever sees what its own receiver actually contributed,
-        not the whole shared cache."""
+        """Used by the "my feed" account page - aircraft this source has
+        reported recently, so a feeder sees what its own receiver actually
+        contributed rather than the whole shared cache.
+
+        Asks "has this source reported it lately", not "did this source win
+        the last merge". The latter hid an aircraft from its own feeder
+        whenever an upstream API happened to report it fractionally fresher,
+        which is most likely for the traffic closest to the receiver.
+        """
+        cutoff = time.time() - SOURCE_ATTRIBUTION_SECONDS
         async with self._lock:
-            return [entry.data for entry in self._by_hex.values() if entry.data.get("_source") == source]
+            return [
+                entry.data
+                for entry in self._by_hex.values()
+                if entry.sources.get(source, 0) >= cutoff
+            ]
 
     def size(self) -> int:
         return len(self._by_hex)
