@@ -175,6 +175,15 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt httpx pytest
   token. Acceptable for now (a port number isn't guessable, and it's shown
   only to the logged-in owner), but if abuse becomes a problem, an
   allowlist of expected source IPs per device would tighten this further.
+- A public share link (`/share/<token>`) is unlisted, not access-controlled:
+  anyone holding the URL sees that receiver's live map, which is the whole
+  point of it. It is served with `X-Robots-Tag: noindex` so a link pasted
+  somewhere public does not become findable in search, and it exposes only
+  the station name and its aircraft - no account, key, port or other device.
+  Revoking clears the token, so the old URL genuinely stops resolving.
+  Worth knowing before sharing one: a map of what a single station hears
+  implies roughly where that station is, so it is not a way to publish a
+  feed anonymously.
 - No email sending yet - signup has no email verification, and there's no
   "forgot password" flow. Fine for an invite-only or early-access launch;
   add an SMTP/transactional-email integration before fully open self-serve

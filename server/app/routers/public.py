@@ -2,7 +2,7 @@ import asyncio
 import datetime
 
 from fastapi import APIRouter, Cookie, Depends, Form, Header, Request, status
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
 
@@ -431,7 +431,15 @@ def my_feed_page(
     device = _owned_device(db, account, device_id)
     if not device:
         return RedirectResponse("/account", status_code=status.HTTP_303_SEE_OTHER)
-    return templates.TemplateResponse(request, "my_feed.html", {"device": device})
+    return templates.TemplateResponse(
+        request,
+        "feed_map.html",
+        {
+            "device": device,
+            "shared": False,
+            "aircraft_url": f"/account/my-feed/{device.id}/aircraft",
+        },
+    )
 
 
 @router.get("/account/my-feed/{device_id}/aircraft")
@@ -449,3 +457,92 @@ async def my_feed_aircraft(
         return {"ac": []}
     aircraft = await _aggregator(request).cache.query_by_source(f"feeder:{device.id}")
     return {"ac": aircraft, "total": len(aircraft)}
+
+
+# --- Public share links ---------------------------------------------------
+#
+# A read-only view of one receiver's live map that needs no account. The
+# token in the URL is the entire credential, so these routes deliberately
+# expose nothing else about the owner: no email, no API key, no port, no
+# other device. Revoking is deleting the token, not hiding a flag, so an
+# old link genuinely stops working.
+
+
+@router.post("/devices/{device_id}/share")
+def enable_share(
+    device_id: int,
+    account: models.Account = Depends(get_current_account),
+    db: Session = Depends(get_db),
+):
+    """Mints a link, or replaces the existing one.
+
+    Rotating and creating are the same operation on purpose: "give me a new
+    link" is what you want after sharing one too widely, and it should not
+    need a separate button that could be confused with revoking.
+    """
+    device = _owned_device(db, account, device_id)
+    if device:
+        device.share_token = security.generate_share_token()
+        device.share_created_at = datetime.datetime.now(datetime.timezone.utc)
+        db.commit()
+    return RedirectResponse("/account", status_code=status.HTTP_303_SEE_OTHER)
+
+
+@router.post("/devices/{device_id}/share/revoke")
+def revoke_share(
+    device_id: int,
+    account: models.Account = Depends(get_current_account),
+    db: Session = Depends(get_db),
+):
+    device = _owned_device(db, account, device_id)
+    if device:
+        device.share_token = None
+        device.share_created_at = None
+        db.commit()
+    return RedirectResponse("/account", status_code=status.HTTP_303_SEE_OTHER)
+
+
+def _shared_device(db: Session, token: str) -> models.Device | None:
+    # Guard against the empty/short token that a truncated paste or a bare
+    # /share/ would otherwise turn into a query for "any device with a null
+    # token", which is every device that has never been shared.
+    if not token or len(token) < 16:
+        return None
+    return db.query(models.Device).filter(models.Device.share_token == token).first()
+
+
+# Unlisted, not secret-proof: anyone holding the link can open it, which is
+# what the owner asked for. Keeping it out of search results is still worth
+# doing, since a link pasted into a public forum would otherwise be indexed
+# and become findable by people the owner never sent it to.
+NO_INDEX = {"X-Robots-Tag": "noindex, nofollow, noarchive"}
+
+
+@router.get("/share/{token}", response_class=HTMLResponse)
+async def shared_feed_page(token: str, request: Request, db: Session = Depends(get_db)):
+    device = await asyncio.to_thread(_shared_device, db, token)
+    if not device:
+        return templates.TemplateResponse(
+            request, "share_missing.html", {}, status_code=status.HTTP_404_NOT_FOUND,
+            headers=NO_INDEX,
+        )
+    return templates.TemplateResponse(
+        request,
+        "feed_map.html",
+        {
+            "device": device,
+            "shared": True,
+            "aircraft_url": f"/share/{token}/aircraft",
+        },
+        headers=NO_INDEX,
+    )
+
+
+@router.get("/share/{token}/aircraft")
+async def shared_feed_aircraft(token: str, request: Request, db: Session = Depends(get_db)):
+    device = await asyncio.to_thread(_shared_device, db, token)
+    if not device:
+        return JSONResponse({"ac": [], "total": 0}, status_code=status.HTTP_404_NOT_FOUND,
+                            headers=NO_INDEX)
+    aircraft = await _aggregator(request).cache.query_by_source(f"feeder:{device.id}")
+    return JSONResponse({"ac": aircraft, "total": len(aircraft)}, headers=NO_INDEX)

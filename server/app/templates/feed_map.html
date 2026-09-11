@@ -1,11 +1,18 @@
 {% extends "base.html" %}
-{% block header_title %}My feed - {{ device.name }}{% endblock %}
-{% block nav %}<a href="/account">Back to account</a>{% endblock %}
+{% block title %}{{ device.name }} - live ADS-B feed{% endblock %}
+{% block header_title %}{{ device.name }}{% if not shared %} - my feed{% endif %}{% endblock %}
+{% block nav %}{% if not shared %}<a href="/account">Back to account</a>{% endif %}{% endblock %}
 {% block content %}
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="anonymous">
 <div class="panel">
 <h2>{{ device.name }} - live feed</h2>
-<p class="sub">Only aircraft your own receiver is currently reporting - not the shared aggregated feed. <span id="count">0</span> aircraft right now. Icons point along the track and are coloured by altitude; click one for everything the feed carries about it.</p>
+<p class="sub">
+{% if shared %}
+Live aircraft from this receiver, shared by its owner. Not the aggregated feed - every aircraft here was picked up by this one station.
+{% else %}
+Only aircraft your own receiver is currently reporting - not the shared aggregated feed.
+{% endif %}
+<span id="count">0</span> aircraft right now. Icons point along the track and are coloured by altitude; click one for everything the feed carries about it.</p>
 <div id="map" style="height:520px;border-radius:4px"></div>
 </div>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin="anonymous"></script>
@@ -87,7 +94,7 @@ function details(a) {
 
 async function poll() {
   try {
-    const res = await fetch('/account/my-feed/{{ device.id }}/aircraft', {cache: 'no-store'});
+    const res = await fetch('{{ aircraft_url }}', {cache: 'no-store'});
     const data = await res.json();
     // Keep whichever popup is open across the three-second refresh -
     // rebuilding the layer would otherwise close it while being read.

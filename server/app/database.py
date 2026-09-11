@@ -100,3 +100,26 @@ def add_missing_columns(base):
                 ddl = column.type.compile(engine.dialect)
                 connection.execute(text(f'ALTER TABLE {table.name} ADD COLUMN {column.name} {ddl}'))
                 logger.info("added column %s.%s", table.name, column.name)
+
+    # ALTER TABLE ADD COLUMN carries no index with it, so a newly added
+    # column declared index=True or unique=True had neither on an upgraded
+    # deployment - only on a database created fresh from the models. That is
+    # a silent difference between the two, and for a column looked up on
+    # every request (a share token, say) it is the difference between an
+    # index seek and a table scan.
+    inspector = inspect(engine)  # re-inspect: the columns above are new
+    for table in base.metadata.sorted_tables:
+        if table.name not in existing_tables:
+            continue
+        present = {i["name"] for i in inspector.get_indexes(table.name)}
+        for index in table.indexes:
+            if index.name in present:
+                continue
+            try:
+                index.create(bind=engine)
+                logger.info("added index %s", index.name)
+            except Exception as exc:  # noqa: BLE001
+                # A duplicate value already in the table can make a unique
+                # index impossible to add. Worth saying loudly; not worth
+                # refusing to boot over.
+                logger.error("could not add index %s: %s", index.name, exc)

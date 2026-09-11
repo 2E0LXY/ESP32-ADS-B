@@ -85,6 +85,16 @@ class Device(Base):
     inferred_lon = Column(Float, nullable=True)
     inferred_spread_nm = Column(Float, nullable=True)
     inferred_at = Column(DateTime(timezone=True), nullable=True)
+    # A read-only public link to this receiver's live map, for anyone the
+    # owner chooses to send it to - a club, a forum post, a family member.
+    #
+    # The token is the whole credential, so it is long and random rather
+    # than derived from the device id: a guessable link is a public link
+    # whether the owner meant it or not. Kept nullable and cleared rather
+    # than flagged off, so revoking really does mean the old link stops
+    # resolving, and re-enabling mints a different one.
+    share_token = Column(String(64), unique=True, nullable=True, index=True)
+    share_created_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
 
     def location(self) -> tuple[float, float, float] | None:

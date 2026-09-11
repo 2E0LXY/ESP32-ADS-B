@@ -69,7 +69,7 @@ receiver sees, and those aircraft are added into the shared feed every device (i
 for local coverage the public APIs might miss. This is separate from the donated API keys below - this is your
 receiver's own raw data, not a key to someone else's network.</p>
 <table>
-<thead><tr><th>Device</th><th>Status</th><th>Assigned port</th><th>Last message</th><th></th></tr></thead>
+<thead><tr><th>Device</th><th>Status</th><th>Assigned port</th><th>Last message</th><th>Public link</th><th></th></tr></thead>
 <tbody>
 {% for device in devices %}
 <tr>
@@ -83,6 +83,19 @@ receiver's own raw data, not a key to someone else's network.</p>
 <td>{{ device.feeder_port or '--' }}</td>
 <td>{{ device.feeder_last_message_at.strftime('%Y-%m-%d %H:%M UTC') if device.feeder_last_message_at else 'Never' }}</td>
 <td>
+{% if device.share_token %}
+<input class="input" readonly style="width:230px;font-size:11px"
+       value="{{ request.url.scheme }}://{{ request.url.netloc }}/share/{{ device.share_token }}"
+       onclick="this.select()">
+<div class="sub" style="margin-top:4px">
+<form class="inline" method="post" action="/devices/{{ device.id }}/share"><button type="submit">New link</button></form>
+<form class="inline" method="post" action="/devices/{{ device.id }}/share/revoke"><button class="danger" type="submit">Revoke</button></form>
+</div>
+{% else %}
+<form class="inline" method="post" action="/devices/{{ device.id }}/share"><button type="submit">Create link</button></form>
+{% endif %}
+</td>
+<td>
 {% if device.feeder_enabled %}
 <a href="/account/my-feed/{{ device.id }}"><button type="button">View my feed</button></a>
 <form class="inline" method="post" action="/devices/{{ device.id }}/feeder/disable"><button class="danger" type="submit">Turn off</button></form>
@@ -92,7 +105,7 @@ receiver's own raw data, not a key to someone else's network.</p>
 </td>
 </tr>
 {% if device.feeder_enabled and device.feeder_port %}
-<tr><td colspan="5" class="sub" style="padding-top:0">
+<tr><td colspan="6" class="sub" style="padding-top:0">
 Point your receiver's SBS/BaseStation output at <code>{{ request.url.hostname }}:{{ device.feeder_port }}</code>.
 For readsb/dump1090-fa, add to your config: <code>--net-connector={{ request.url.hostname }},{{ device.feeder_port }},sbs_out</code>
 (or the equivalent "additional SBS output" field if you're using a web-based config tool). No firewall changes needed
@@ -104,7 +117,7 @@ for Debian and Windows instructions. It needs only <code>{{ request.url.hostname
 </td></tr>
 {% endif %}
 {% else %}
-<tr><td colspan="5" class="sub">Add a device above first.</td></tr>
+<tr><td colspan="6" class="sub">Add a device above first.</td></tr>
 {% endfor %}
 </tbody>
 </table>

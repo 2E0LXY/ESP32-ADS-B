@@ -37,6 +37,17 @@ def verify_password(password: str, password_hash: str) -> bool:
         return False
 
 
+def generate_share_token() -> str:
+    """The credential behind a public feed link.
+
+    24 random bytes, URL-safe, so the link can be pasted anywhere and the
+    only way in is to have been given it. Not signed or expiring: the owner
+    revokes it by deleting it, which is the behaviour people expect from a
+    "anyone with the link" URL.
+    """
+    return secrets.token_urlsafe(24)
+
+
 def create_session_token(subject: str, scope: str) -> str:
     """scope is "admin" or "account" - kept inside the signed token itself
     so a customer session can never be replayed against admin routes even
