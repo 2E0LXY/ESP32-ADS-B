@@ -101,6 +101,13 @@ public:
   // if no vsync arrived within the timeout, in which case the caller should
   // draw anyway rather than stall. See the comment in the .cpp.
   bool waitForVsync(uint32_t timeout_ms = 50);
+  // Bounce-buffer height in scanlines, applied when the panel is created.
+  // 0 disables bounce buffers, so the LCD DMA streams straight from the
+  // PSRAM framebuffer and there is no refill deadline to miss. Settable at
+  // runtime (before begin()) rather than only by -D so the value can be
+  // tried from the web UI instead of costing a rebuild each time.
+  static void setBounceBufferLines(uint16_t lines) { _bounce_buffer_lines = lines; }
+  static uint16_t bounceBufferLines() { return _bounce_buffer_lines; }
 
 protected:
 private:
@@ -125,6 +132,7 @@ private:
 
   esp_lcd_panel_handle_t _panel_handle = NULL;
   SemaphoreHandle_t _vsync_sem = NULL;
+  static uint16_t _bounce_buffer_lines;
 };
 
 #endif // #if defined(ESP32) && (CONFIG_IDF_TARGET_ESP32S3)

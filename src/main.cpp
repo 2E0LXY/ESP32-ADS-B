@@ -92,6 +92,23 @@ uint32_t panelPclkHz = PANEL_PCLK_HZ;
 
 // Selectable values, coarse enough to tell apart on a panel and bounded so a
 // bad entry cannot leave the display unusable and the web UI unreachable.
+// Bounce-buffer height, in scanlines, for the same reason the pixel clock
+// is settable: the display faults have to be tested against the hardware,
+// and a rebuild per value is not a workable loop.
+//
+// esp_lcd allocates TWO buffers of lines*width*2 bytes from internal DMA
+// RAM, so 20 lines costs 64 KB at 800 px wide and 40 costs 128 KB - against
+// roughly 40 KB of largest contiguous internal block free at idle and the
+// ~32 KB mbedTLS needs per TLS handshake. Going up trades HTTPS for display
+// stability; going to 0 removes bounce buffers altogether, which frees that
+// internal RAM and removes the refill deadline entirely, at the cost of the
+// LCD DMA reading PSRAM directly.
+// Seeded from the panel driver's own compiled-in default rather than the
+// build flag: only ws_lcd_7_app passes -DRGB_BOUNCE_BUFFER_LINES, and the
+// library already resolves its own default when the flag is absent.
+uint16_t panelBounceLines = 0;
+constexpr uint16_t PANEL_BOUNCE_CHOICES[] = {0, 10, 20, 30, 40};
+
 constexpr uint32_t PANEL_PCLK_CHOICES[] = {
     9000000L, 10000000L, 11000000L, 12000000L, 13000000L,
     14000000L, 15000000L, 16000000L, 16500000L, 18000000L, 21000000L,
@@ -4330,6 +4347,8 @@ void handleStatusApi() {
   doc["screensaverIdleMinutes"] = screensaverIdleMinutes;
   doc["pclkKhz"] = panelPclkHz / 1000UL;
   doc["pclkRefreshHz"] = roundf(panelRefreshHz(panelPclkHz) * 10.0f) / 10.0f;
+  doc["bounceLines"] = panelBounceLines;
+  doc["bounceKb"] = 2UL * panelBounceLines * W * 2UL / 1024UL;
   doc["screensaverActive"] = screensaverActive;
   doc["page"] = displayPageName();
   doc["latitude"] = homeLatitude;
@@ -4529,6 +4548,24 @@ void handleDisplaySettings() {
     screensaverIdleMinutes = static_cast<uint16_t>(minutes);
     settingsStore.putUShort("ssaver-min", screensaverIdleMinutes);
     lastInteractionAt = millis();
+  }
+  if (webServer.hasArg("bounceLines")) {
+    long lines = 0;
+    bool known = false;
+    if (parseStrictLong(webServer.arg("bounceLines"), lines))
+      for (uint16_t choice : PANEL_BOUNCE_CHOICES)
+        if (choice == static_cast<uint16_t>(lines)) { known = true; break; }
+    if (!known) {
+      sendMessage(400, "Unsupported bounce buffer size");
+      return;
+    }
+    settingsStore.putUShort("bounce-lines", static_cast<uint16_t>(lines));
+    // Allocated when esp_lcd creates the panel, so like the pixel clock it
+    // only takes effect on the next boot.
+    restartPending = true;
+    restartAt = millis() + 1500;
+    sendMessage(202, "Bounce buffer saved - rebooting to apply");
+    return;
   }
   if (webServer.hasArg("pclkKhz")) {
     long khz = 0;
@@ -5585,9 +5622,18 @@ void setup() {
     for (uint32_t choice : PANEL_PCLK_CHOICES)
       if (choice == storedHz) { panelPclkHz = storedHz; break; }
   }
+  {
+    const uint16_t buildDefault = Arduino_ESP32RGBPanel::bounceBufferLines();
+    const uint16_t storedLines = settingsStore.getUShort("bounce-lines", buildDefault);
+    panelBounceLines = buildDefault;
+    for (uint16_t choice : PANEL_BOUNCE_CHOICES)
+      if (choice == storedLines) { panelBounceLines = storedLines; break; }
+    Arduino_ESP32RGBPanel::setBounceBufferLines(panelBounceLines);
+  }
   createDisplay(panelPclkHz);
-  Serial.printf("Panel pixel clock: %.1f MHz (~%.1f Hz refresh)\n",
-                panelPclkHz / 1000000.0f, panelRefreshHz(panelPclkHz));
+  Serial.printf("Panel pixel clock: %.1f MHz (~%.1f Hz refresh), bounce buffer %u lines (%u KB internal)\n",
+                panelPclkHz / 1000000.0f, panelRefreshHz(panelPclkHz), panelBounceLines,
+                static_cast<unsigned>(2UL * panelBounceLines * W * 2UL / 1024UL));
   if (!gfx->begin()) {
     Serial.println("Display initialization failed");
     while (true) delay(1000);

@@ -47,6 +47,8 @@ bool Arduino_ESP32RGBPanel::begin(int32_t speed)
   return true;
 }
 
+uint16_t Arduino_ESP32RGBPanel::_bounce_buffer_lines = RGB_BOUNCE_BUFFER_LINES;
+
 uint16_t *Arduino_ESP32RGBPanel::getFrameBuffer(int16_t w, int16_t h)
 {
   esp_lcd_rgb_panel_config_t panel_config = {
@@ -84,7 +86,7 @@ uint16_t *Arduino_ESP32RGBPanel::getFrameBuffer(int16_t w, int16_t h)
       // On the 800x480 boards that starves mbedTLS and every HTTPS request
       // fails with MBEDTLS_ERR_SSL_ALLOC_FAILED (-32512). Override with
       // -DRGB_BOUNCE_BUFFER_LINES=<n>; 0 disables bounce buffers entirely.
-      .bounce_buffer_size_px = static_cast<size_t>(RGB_BOUNCE_BUFFER_LINES) * static_cast<size_t>(w),
+      .bounce_buffer_size_px = static_cast<size_t>(_bounce_buffer_lines) * static_cast<size_t>(w),
 #endif
       .sram_trans_align = 8,
       .psram_trans_align = 64,
