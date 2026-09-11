@@ -2115,6 +2115,20 @@ void abbreviateAirport(const char *cityName, const char *fullAirportName, char *
 // Marked resolvedAt so the entry ages out normally; if the server later
 // stops sending routes (an older deployment), the device falls back to
 // looking it up itself once this expires.
+// Set the first time the aggregator supplies a route with an aircraft. From
+// then on this device stops asking adsbdb itself, because the hardware shows
+// what those lookups cost: each is a full TLS handshake that drops the
+// largest contiguous internal block from 31732 to 14324 bytes, which is
+// where mbedTLS reports "BIGNUM - Memory allocation failed" and the
+// certificate bundle reports 0x4290 - an allocation failure inside the
+// signature check, not a bad certificate. They also block the network task
+// for 2-2.8 seconds a time, and that burst is when the panel slips.
+//
+// Latched rather than assumed from the provider name: a deployment that has
+// not been updated yet sends no route field, and the device must keep
+// resolving routes itself until it sees evidence the server will.
+bool serverSuppliesRoutes = false;
+
 bool adoptServerRoute(const char *rawCallsign, JsonObjectConst route) {
   if (!routeCache.data) return false;
   if (route.isNull()) return false;
@@ -2159,6 +2173,7 @@ bool adoptServerRoute(const char *rawCallsign, JsonObjectConst route) {
     abbreviateAirport(slot->destinationCity, slot->destinationName, slot->destinationAbbrev,
                       sizeof(slot->destinationAbbrev));
   slot->hasRoute = true;
+  serverSuppliesRoutes = true;
   return true;
 }
 
@@ -3713,6 +3728,9 @@ void fetchAdsbV2Aircraft() {
       // Nudges the panel to resync mid-loop against PSRAM-DMA starvation -
       // see the tile-rebuild loop's comment on restartAtNextVsync() above.
       rgbpanel->restartAtNextVsync();
+      // Nothing to ask: the aggregator already attached the route to this
+      // aircraft, or will on a later poll once its own lookup completes.
+      if (serverSuppliesRoutes) continue;
       // A prior version kept one keep-alive connection open across every
       // lookup in this loop (HTTPClient::setReuse(true)) to save handshakes.
       // Every watchdog reboot logged after switching provider away from
@@ -3910,6 +3928,9 @@ void fetchAircraft() {
       // Nudges the panel to resync mid-loop against PSRAM-DMA starvation -
       // see the tile-rebuild loop's comment on restartAtNextVsync() above.
       rgbpanel->restartAtNextVsync();
+      // Nothing to ask: the aggregator already attached the route to this
+      // aircraft, or will on a later poll once its own lookup completes.
+      if (serverSuppliesRoutes) continue;
       // A prior version kept one keep-alive connection open across every
       // lookup in this loop (HTTPClient::setReuse(true)) to save handshakes.
       // Every watchdog reboot logged after switching provider away from
