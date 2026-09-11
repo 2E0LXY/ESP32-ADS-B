@@ -9,7 +9,7 @@ Firmware for the **Waveshare ESP32-S3 Touch-LCD-4 Rev 4.0, 480 × 480, non-touch
 
 Also runs on the **Waveshare ESP32-S3-Touch-LCD-7 / -4.3, 800 × 480, GT911 touch** boards; see [Supported hardware](#supported-hardware).
 
-Current firmware: **v2.5.1**
+Current firmware: **v2.6.0**
 
 ### Unreleased
 
