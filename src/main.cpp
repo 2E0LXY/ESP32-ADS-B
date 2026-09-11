@@ -3182,24 +3182,37 @@ void fitText(char *text, int xLeft, int scale) {
   if (maxChars > 0 && static_cast<int>(strlen(text)) > maxChars) text[maxChars] = 0;
 }
 
-void renderScreensaverPage() {
-  filledRect(0, 0, W, H, rgb(0, 0, 0));
-  // Overhead only: something you could plausibly see or hear from the
-  // receiver location, not just anything within the full query radius.
-  // Ground distance alone isn't enough - an airliner at cruise altitude can
-  // be 0 miles away horizontally (directly above) and still be far too high
-  // to see or hear, so filter on slant range (distance and altitude
-  // combined) instead.
+// Overhead only: something you could plausibly see or hear from the
+// receiver location, not just anything within the full query radius. Ground
+// distance alone isn't enough - an airliner at cruise altitude can be 0
+// miles away horizontally (directly above) and still be far too high to see
+// or hear, so filter on slant range (distance and altitude combined).
+//
+// Split out of renderScreensaverPage() so the rotate timer can ask how many
+// there are without repainting the screen to find out.
+int collectOverheadAircraft(int *matches, int capacity) {
   constexpr float OVERHEAD_MAX_SLANT_MILES = 5.0f;
-  int overheadMatches[32];
-  int overheadCount = 0;
-  for (int i = 0; i < lastCount && overheadCount < 32; ++i) {
+  int count = 0;
+  for (int i = 0; i < lastCount && count < capacity; ++i) {
     const AircraftDisplay &candidate = latestAircraft[i];
     if (candidate.onGround) continue;
     const float altitudeMiles = candidate.altitudeFt > 0 ? candidate.altitudeFt / 5280.0f : 0.0f;
-    const float slantMiles = sqrtf(candidate.distanceMiles * candidate.distanceMiles + altitudeMiles * altitudeMiles);
-    if (slantMiles <= OVERHEAD_MAX_SLANT_MILES) overheadMatches[overheadCount++] = i;
+    const float slantMiles =
+        sqrtf(candidate.distanceMiles * candidate.distanceMiles + altitudeMiles * altitudeMiles);
+    if (slantMiles <= OVERHEAD_MAX_SLANT_MILES) matches[count++] = i;
   }
+  return count;
+}
+
+int overheadAircraftCount() {
+  int matches[32];
+  return collectOverheadAircraft(matches, 32);
+}
+
+void renderScreensaverPage() {
+  filledRect(0, 0, W, H, rgb(0, 0, 0));
+  int overheadMatches[32];
+  const int overheadCount = collectOverheadAircraft(overheadMatches, 32);
   if (overheadCount == 0) {
     text5(20, H / 2 - 6, "NO OVERHEAD AIRCRAFT", rgb(120, 140, 160), 2);
     text5(20, H / 2 + 24, "TAP OR SWIPE TO RETURN", rgb(70, 90, 110));
@@ -5939,10 +5952,18 @@ void loop() {
     MutexGuard guard(dataMutex);
     renderCurrentPage();
   } else if (screensaverActive && static_cast<int32_t>(millis() - screensaverRotateAt) >= 0) {
-    ++screensaverAircraftIndex;
     screensaverRotateAt = millis() + 6000UL;
-    MutexGuard guard(dataMutex);
-    renderCurrentPage();
+    // Rotating through one aircraft, or none, redraws an identical frame.
+    // Every one of those repaints clears the full screen - 768 KB of writes
+    // across the bus the panel refills its bounce buffers from - so it is a
+    // burst of exactly the kind that makes the picture slip, spent on a
+    // frame no one can tell from the one already on screen. Only redraw
+    // when the content will actually differ.
+    if (overheadAircraftCount() > 1) {
+      ++screensaverAircraftIndex;
+      MutexGuard guard(dataMutex);
+      renderCurrentPage();
+    }
   }
   delay(15);
 }
