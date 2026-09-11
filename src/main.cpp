@@ -3069,7 +3069,7 @@ void renderScreensaverPage() {
     const char *to = route->destinationName[0] ? route->destinationName : route->destination;
     snprintf(line, sizeof(line), "%s > %s", from, to);
   } else {
-    snprintf(line, sizeof(line), "%s", route ? "NO ROUTE ON FILE" : "ROUTE LOOKUP QUEUED");
+    snprintf(line, sizeof(line), "%s", route ? "NO SCHEDULED ROUTE" : "LOOKING UP ROUTE...");
   }
   fitText(line, margin, 2);
   text5(margin, y, line, cyan, 2);
