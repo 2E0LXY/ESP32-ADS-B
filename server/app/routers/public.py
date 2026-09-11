@@ -19,6 +19,10 @@ def _aggregator(request: Request) -> Aggregator:
     return request.app.state.aggregator
 
 
+def _routes(request: Request):
+    return request.app.state.routes
+
+
 @router.get("/", response_class=HTMLResponse)
 def root():
     # The device's own admin page links customers to their product's site,
@@ -37,6 +41,17 @@ async def get_aircraft(
 ):
     aggregator = _aggregator(request)
     aircraft = await aggregator.cache.query(lat, lon, radius)
+    # Attach the route to each aircraft so the device does not have to ask
+    # adsbdb itself - on the ESP32 that cost ~2.2s of blocked network task
+    # per callsign and needed more contiguous internal RAM than it had.
+    # lookup() never blocks: an unknown callsign is queued and comes back
+    # with a route on a later poll.
+    resolver = _routes(request)
+    enriched = []
+    for entry in aircraft:
+        route = resolver.lookup(entry.get("flight"))
+        enriched.append({**entry, "route": route} if route else entry)
+    aircraft = enriched
     device.last_seen_at = datetime.datetime.now(datetime.timezone.utc)
     device.last_seen_ip = request.client.host if request.client else None
     db.add(

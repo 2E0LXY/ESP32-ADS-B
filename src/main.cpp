@@ -2006,6 +2006,63 @@ void abbreviateAirport(const char *cityName, const char *fullAirportName, char *
   else snprintf(output, outSize, "%s", cityPart);
 }
 
+// Stores a route the aggregator resolved for us, into the same cache
+// routeForCallsign() fills. The server does the adsbdb lookup on behalf of
+// every device that can see the flight, which is why this exists: on this
+// hardware each lookup cost ~2.2 s of blocked network task and wanted more
+// contiguous internal RAM for the TLS handshake than was free, so they were
+// throttled to two per refresh and failed intermittently. A route that
+// arrives with the aircraft costs nothing.
+//
+// Marked resolvedAt so the entry ages out normally; if the server later
+// stops sending routes (an older deployment), the device falls back to
+// looking it up itself once this expires.
+bool adoptServerRoute(const char *rawCallsign, JsonObjectConst route) {
+  if (route.isNull()) return false;
+  const char *origin = route["origin"] | "";
+  const char *destination = route["destination"] | "";
+  if (!origin[0] || !destination[0]) return false;
+
+  char callsign[9];
+  normalizeCallsign(rawCallsign, callsign);
+  if (strlen(callsign) < 3) return false;
+
+  RouteCacheEntry *slot = nullptr;
+  for (auto &entry : routeCache)
+    if (entry.occupied && !strcmp(entry.callsign, callsign)) { slot = &entry; break; }
+  if (!slot)
+    for (auto &entry : routeCache) if (!entry.occupied) { slot = &entry; break; }
+  if (!slot) {
+    slot = &routeCache[0];
+    for (auto &entry : routeCache) if (entry.lastUsed < slot->lastUsed) slot = &entry;
+  }
+  // Already holding this exact route: just keep it fresh rather than
+  // rebuilding the abbreviations on every single fetch.
+  if (slot->occupied && !strcmp(slot->callsign, callsign) && slot->hasRoute &&
+      !strcmp(slot->origin, origin) && !strcmp(slot->destination, destination)) {
+    slot->resolvedAt = slot->lastUsed = millis();
+    return true;
+  }
+
+  memset(slot, 0, sizeof(*slot));
+  strncpy(slot->callsign, callsign, sizeof(slot->callsign) - 1);
+  slot->occupied = true;
+  slot->resolvedAt = slot->lastUsed = millis();
+  strncpy(slot->origin, origin, sizeof(slot->origin) - 1);
+  strncpy(slot->destination, destination, sizeof(slot->destination) - 1);
+  strncpy(slot->originName, route["origin_name"] | "", sizeof(slot->originName) - 1);
+  strncpy(slot->destinationName, route["destination_name"] | "", sizeof(slot->destinationName) - 1);
+  strncpy(slot->originCity, route["origin_city"] | "", sizeof(slot->originCity) - 1);
+  strncpy(slot->destinationCity, route["destination_city"] | "", sizeof(slot->destinationCity) - 1);
+  if (slot->originCity[0] && slot->originName[0])
+    abbreviateAirport(slot->originCity, slot->originName, slot->originAbbrev, sizeof(slot->originAbbrev));
+  if (slot->destinationCity[0] && slot->destinationName[0])
+    abbreviateAirport(slot->destinationCity, slot->destinationName, slot->destinationAbbrev,
+                      sizeof(slot->destinationAbbrev));
+  slot->hasRoute = true;
+  return true;
+}
+
 RouteCacheEntry *routeForCallsign(const char *rawCallsign, int &lookupsUsed,
                                   WiFiClientSecure &client, HTTPClient &http) {
   char callsign[9];
@@ -3280,6 +3337,14 @@ void fetchAdsbV2Aircraft() {
                           "seen", "rssi", "messages", "flight", "hex", "r", "t",
                           "squawk", "category", "ownOp", "cou", "emergency", "mlat"};
   for (const char *field : fields) aircraftFilter[field] = true;
+  // The aggregator resolves callsign->route server-side and attaches it
+  // here, so this device never opens its own connection to adsbdb. A
+  // filter drops anything not named, and this is a nested object rather
+  // than a scalar, so it needs its own entry.
+  JsonObject routeFilter = aircraftFilter["route"].to<JsonObject>();
+  for (const char *field : {"origin", "destination", "origin_name",
+                            "destination_name", "origin_city", "destination_city"})
+    routeFilter[field] = true;
   JsonDocument doc(&psramJsonAllocator);
   DeserializationError error = DeserializationError::IncompleteInput;
   int code = 0;
@@ -3446,6 +3511,7 @@ void fetchAdsbV2Aircraft() {
     // type table is a linear scan and these icons are drawn several times a
     // second.
     display.iconShape = shapeForAircraft(display.aircraftType, display.category);
+    adoptServerRoute(display.flight, aircraft["route"].as<JsonObject>());
     JsonArray mlatFields = aircraft["mlat"].as<JsonArray>();
     display.positionSource = !mlatFields.isNull() && mlatFields.size() ? 2 : 0;
     ++lastCount;

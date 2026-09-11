@@ -128,6 +128,13 @@ raw data being pushed straight into this backend.
 
 ## Known gaps / next steps
 
+Routes (callsign -> origin/destination) are resolved server-side and attached
+to each aircraft in `/v1/aircraft`, so devices never query adsbdb themselves.
+One resolution is shared by every customer who can see that flight. Lookups
+are queued and never block a device request: an unresolved callsign simply
+comes back without a route and picks one up on a later poll. See
+`app/routes.py`.
+
 Devices can be renamed from the account dashboard at any time; the name is
 cosmetic and does not affect the API key or the feeder port.
 

@@ -6,6 +6,7 @@ from fastapi import FastAPI
 
 from . import models, security
 from .aggregator import Aggregator
+from .routes import RouteResolver
 from .database import Base, SessionLocal, engine
 from .feed_ingest import FeedIngestManager
 from .routers import admin, public
@@ -60,12 +61,18 @@ async def startup():
     app.state.aggregator = Aggregator(home_lat, home_lon, home_radius_nm, SessionLocal)
     app.state.aggregator.start()
 
+    # Resolves callsign -> route on behalf of every device, so the ESP32
+    # never opens its own TLS connection to adsbdb. See app/routes.py.
+    app.state.routes = RouteResolver()
+    app.state.routes.start()
+
     app.state.feed_ingest = FeedIngestManager(app.state.aggregator, SessionLocal)
     await app.state.feed_ingest.sync_from_db()
 
 
 @app.on_event("shutdown")
 async def shutdown():
+    await app.state.routes.stop()
     await app.state.aggregator.stop()
     await app.state.feed_ingest.stop_all()
 
