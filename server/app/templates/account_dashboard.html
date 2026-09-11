@@ -15,7 +15,7 @@
 <div class="panel">
 <h2>My devices</h2>
 <table>
-<thead><tr><th>Name</th><th>Last seen</th><th>Firmware</th><th>Key</th><th></th></tr></thead>
+<thead><tr><th>Name</th><th>Last seen</th><th>Location</th><th>Firmware</th><th>Key</th><th></th></tr></thead>
 <tbody>
 {% for device in devices %}
 <tr>
@@ -26,6 +26,12 @@
 </form>
 </td>
 <td>{{ device.last_seen_at.strftime('%Y-%m-%d %H:%M UTC') if device.last_seen_at else 'Never' }}</td>
+<td>
+{% set loc = device.location() %}
+{% if loc %}<code>{{ '%.4f'|format(loc[0]) }}, {{ '%.4f'|format(loc[1]) }}</code> · {{ loc[2]|int }} nm<br>
+<span class="sub">{{ 'reported by the receiver' if device.reported_lat is not none else 'set here' }}</span>
+{% else %}<span class="sub">Not set - using the server default</span>{% endif %}
+</td>
 <td>{{ device.firmware_version or '--' }}</td>
 <td>{% if device.active_key %}<code>{{ device.active_key.key_prefix }}...</code>{% else %}<span class="sub">No key issued</span>{% endif %}</td>
 <td>
@@ -33,8 +39,18 @@
 <form class="inline" method="post" action="/devices/{{ device.id }}/delete" onsubmit="return confirm('Delete this device and revoke its key?')"><button class="danger" type="submit">Delete</button></form>
 </td>
 </tr>
+<tr><td colspan="6" class="sub" style="padding-top:0">
+<form class="inline" method="post" action="/devices/{{ device.id }}/location">
+Location:
+<input class="input" name="latitude" placeholder="53.7326" value="{{ device.manual_lat if device.manual_lat is not none else '' }}" style="width:110px">
+<input class="input" name="longitude" placeholder="-1.4579" value="{{ device.manual_lon if device.manual_lon is not none else '' }}" style="width:110px">
+<input class="input" name="radius" placeholder="50" value="{{ device.manual_radius_nm|int if device.manual_radius_nm is not none else '' }}" style="width:70px"> nm
+<button type="submit">Save</button>
+</form>
+&nbsp;Only needed until the receiver reports its own position - it sends one with every request. Clear both coordinates to fall back to the server default.
+</td></tr>
 {% else %}
-<tr><td colspan="5" class="sub">No devices yet - add one below.</td></tr>
+<tr><td colspan="6" class="sub">No devices yet - add one below.</td></tr>
 {% endfor %}
 </tbody>
 </table>

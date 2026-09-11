@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 import httpx
 from sqlalchemy.orm import Session
 
+from . import models
 from .models import FeederKey, FeederProvider
 
 logger = logging.getLogger("aggregator")
@@ -33,6 +34,15 @@ logger = logging.getLogger("aggregator")
 USER_AGENT = "2E0LXY-ADSB-Aggregator/1.0 (+https://github.com/2E0LXY/ESP32-ADS-B)"
 POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "15"))
 STALE_AFTER_SECONDS = 5 * 60  # matches the ESP32 firmware's own MLAT/route cache staleness window
+# Per-device polling areas. A device asking for a 5 nm radius still needs the
+# cache filled a bit wider than that, or an aircraft is only cached once it
+# is already overhead; and nobody gets to make the aggregator poll the whole
+# hemisphere.
+MIN_POLL_RADIUS_NM = 25.0
+MAX_POLL_RADIUS_NM = 250.0
+# Each region is one request per upstream per cycle. Beyond this many the
+# regions are rotated across cycles instead.
+MAX_POLL_REGIONS = int(os.environ.get("MAX_POLL_REGIONS", "6"))
 
 
 @dataclass
@@ -129,7 +139,58 @@ class Aggregator:
             name: SourceHealth(name) for name in ("adsbfi", "airplaneslive", "adsblol")
         }
         self._feeder_cycle: dict[FeederProvider, itertools.cycle] = {}
+        self._region_cursor = 0
         self._task: asyncio.Task | None = None
+
+    def poll_regions(self) -> list[tuple[float, float, float]]:
+        """The areas to poll upstream this cycle.
+
+        One global HOME_LAT/HOME_LON meant the cache only ever contained
+        aircraft near the operator, so a customer anywhere else queried it
+        correctly and got nothing. Poll where the devices actually are
+        instead, and keep the configured home as the fallback for a
+        deployment with no located devices yet.
+
+        Nearby devices are merged rather than polled separately: a street of
+        receivers is one area to an upstream API, and asking three times for
+        the same sky is rude to a free service and no more useful.
+        """
+        db = self._session_factory()
+        try:
+            devices = db.query(models.Device).all()
+            located = [loc for loc in (d.location() for d in devices) if loc]
+        finally:
+            db.close()
+        if not located:
+            return [(self.home_lat, self.home_lon, self.home_radius_nm)]
+
+        merged: list[tuple[float, float, float]] = []
+        for lat, lon, radius in located:
+            radius = max(MIN_POLL_RADIUS_NM, min(radius, MAX_POLL_RADIUS_NM))
+            for index, (mlat, mlon, mradius) in enumerate(merged):
+                if _distance_nm(lat, lon, mlat, mlon) <= max(radius, mradius):
+                    # Cover both from one point, widened enough to still
+                    # reach the far edge of each.
+                    separation = _distance_nm(lat, lon, mlat, mlon)
+                    merged[index] = (
+                        (lat + mlat) / 2,
+                        (lon + mlon) / 2,
+                        min(MAX_POLL_RADIUS_NM, max(radius, mradius) + separation / 2),
+                    )
+                    break
+            else:
+                merged.append((lat, lon, radius))
+
+        if len(merged) > MAX_POLL_REGIONS:
+            # Every region costs a request to each upstream on every cycle.
+            # Past this many, rotate through them across cycles rather than
+            # multiplying the load on free APIs without limit; a device's
+            # area is then refreshed less often, not dropped.
+            start = self._region_cursor % len(merged)
+            self._region_cursor += MAX_POLL_REGIONS
+            rotated = merged[start:] + merged[:start]
+            return rotated[:MAX_POLL_REGIONS]
+        return merged
 
     def health(self) -> dict[str, SourceHealth]:
         return self._health
@@ -192,23 +253,26 @@ class Aggregator:
             logger.warning("poll failed for %s: %s", name, exc)
 
     async def _poll_adsbfi(self, client: httpx.AsyncClient):
-        url = (
-            f"https://opendata.adsb.fi/api/v3/lat/{self.home_lat}/lon/{self.home_lon}"
-            f"/dist/{self.home_radius_nm}"
-        )
-        await self._record("adsbfi", self._fetch(client, url, "ac"))
+        for lat, lon, radius in self.poll_regions():
+            url = (
+                f"https://opendata.adsb.fi/api/v3/lat/{lat}/lon/{lon}"
+                f"/dist/{radius:.0f}"
+            )
+            await self._record("adsbfi", self._fetch(client, url, "ac"))
 
     async def _poll_airplaneslive(self, client: httpx.AsyncClient):
         # No feeder-key pooling here yet: airplanes.live's own API doesn't
         # take a bearer/query-param key today (access is IP/account based on
         # their end) - the hook is here so it's a one-line change once/if
         # they document one.
-        url = f"https://api.airplanes.live/v2/point/{self.home_lat}/{self.home_lon}/{self.home_radius_nm}"
-        await self._record("airplaneslive", self._fetch(client, url, "ac"))
+        for lat, lon, radius in self.poll_regions():
+            url = f"https://api.airplanes.live/v2/point/{lat}/{lon}/{radius:.0f}"
+            await self._record("airplaneslive", self._fetch(client, url, "ac"))
 
     async def _poll_adsblol(self, client: httpx.AsyncClient):
-        url = f"https://api.adsb.lol/v2/point/{self.home_lat}/{self.home_lon}/{self.home_radius_nm}"
-        await self._record("adsblol", self._fetch(client, url, "ac"))
+        for lat, lon, radius in self.poll_regions():
+            url = f"https://api.adsb.lol/v2/point/{lat}/{lon}/{radius:.0f}"
+            await self._record("adsblol", self._fetch(client, url, "ac"))
 
     async def _fetch(self, client: httpx.AsyncClient, url: str, list_key: str) -> list[dict]:
         response = await client.get(url)

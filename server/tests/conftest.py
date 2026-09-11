@@ -36,6 +36,17 @@ def client():
     # plain http the client would silently never send it back and every
     # authenticated request would redirect to the login page.
     with TestClient(app, base_url="https://testserver") as test_client:
+        # Startup launches the real polling loop, which fetches live aircraft
+        # from adsb.fi and friends and merges them into the same cache these
+        # tests seed. Stop it: a test suite must not depend on the sky, on a
+        # third party being up, or on the network existing at all.
+        task = getattr(app.state.aggregator, "_task", None)
+        if task is not None:
+            task.cancel()
+            app.state.aggregator._task = None
+        # The cache lives on app.state and the app is imported once, so
+        # without this a test sees aircraft seeded by an earlier one.
+        app.state.aggregator.cache._by_hex.clear()
         yield test_client
 
 

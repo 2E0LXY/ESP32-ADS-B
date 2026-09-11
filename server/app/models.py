@@ -59,7 +59,35 @@ class Device(Base):
     feeder_enabled = Column(Boolean, default=False, nullable=False)
     feeder_port = Column(Integer, unique=True, nullable=True)
     feeder_last_message_at = Column(DateTime(timezone=True), nullable=True)
+    # Where this receiver actually is. The aggregator polls the upstream APIs
+    # for the areas its devices are in, so a customer in Cornwall is not
+    # served from a cache only ever filled around the operator's own house -
+    # which is what a single global HOME_LAT/HOME_LON meant.
+    #
+    # Two sources, deliberately separate rather than one field overwritten by
+    # whichever wrote last. reported_* is what the device sends with every
+    # /v1/aircraft request, so a receiver that moves (a hotel, a hotspot)
+    # follows itself with no configuration. manual_* is what the owner typed
+    # in the dashboard, used when a device has never reported - a new
+    # receiver, or one whose firmware predates this.
+    reported_lat = Column(Float, nullable=True)
+    reported_lon = Column(Float, nullable=True)
+    reported_radius_nm = Column(Float, nullable=True)
+    reported_at = Column(DateTime(timezone=True), nullable=True)
+    manual_lat = Column(Float, nullable=True)
+    manual_lon = Column(Float, nullable=True)
+    manual_radius_nm = Column(Float, nullable=True)
     created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+    def location(self) -> tuple[float, float, float] | None:
+        """Effective location: what the device reports, else what the owner
+        set, else nothing - and "nothing" means the caller falls back to the
+        deployment default rather than this guessing."""
+        if self.reported_lat is not None and self.reported_lon is not None:
+            return (self.reported_lat, self.reported_lon, self.reported_radius_nm or 50.0)
+        if self.manual_lat is not None and self.manual_lon is not None:
+            return (self.manual_lat, self.manual_lon, self.manual_radius_nm or 50.0)
+        return None
 
     account = relationship("Account", back_populates="devices")
     api_keys = relationship("ApiKey", back_populates="device", cascade="all, delete-orphan")

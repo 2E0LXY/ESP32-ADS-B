@@ -128,6 +128,20 @@ raw data being pushed straight into this backend.
 
 ## Known gaps / next steps
 
+Each device has its own location, so the aggregator polls the areas its
+devices are actually in rather than one global point. A device reports its
+position with every `/v1/aircraft` request, so a receiver that moves follows
+itself; the account dashboard can set one for a device that has never
+reported. `HOME_LAT`/`HOME_LON`/`HOME_RADIUS_NM` remain the fallback for a
+deployment with no located devices. Nearby devices are merged into one poll
+area, and the number of areas per cycle is capped by `MAX_POLL_REGIONS`
+(default 6), rotating across cycles beyond that so no free upstream API is
+asked for an unbounded number of regions.
+
+Schema changes add nullable columns on startup (`add_missing_columns`), so an
+existing deployment upgrades without a manual migration. Anything that is not
+a nullable column addition still needs a migration written by hand.
+
 Routes (callsign -> origin/destination) are resolved server-side and attached
 to each aircraft in `/v1/aircraft`, so devices never query adsbdb themselves.
 One resolution is shared by every customer who can see that flight. Lookups

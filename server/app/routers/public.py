@@ -54,6 +54,15 @@ async def get_aircraft(
     aircraft = enriched
     device.last_seen_at = datetime.datetime.now(datetime.timezone.utc)
     device.last_seen_ip = request.client.host if request.client else None
+    # The device already tells us where it is on every request, so record it:
+    # that is what lets the aggregator poll upstream for this customer's sky
+    # rather than only the operator's. A receiver that moves - a hotel, a
+    # phone hotspot - follows itself with no configuration at all.
+    if -85.0 <= lat <= 85.0 and -180.0 <= lon <= 180.0 and 0 < radius <= 250:
+        device.reported_lat = lat
+        device.reported_lon = lon
+        device.reported_radius_nm = radius
+        device.reported_at = device.last_seen_at
     db.add(
         models.UsageLog(
             device_id=device.id,
@@ -193,6 +202,45 @@ def rename_device(
         # up with a name that could not have been given to it at creation.
         device.name = name.strip()[:120] or "My receiver"
         db.commit()
+    return RedirectResponse("/account", status_code=status.HTTP_303_SEE_OTHER)
+
+
+@router.post("/devices/{device_id}/location")
+def set_device_location(
+    device_id: int,
+    latitude: str = Form(...),
+    longitude: str = Form(...),
+    radius: str = Form(...),
+    account: models.Account = Depends(get_current_account),
+    db: Session = Depends(get_db),
+):
+    """Owner-set location, used until the device reports its own.
+
+    Not an override of a reporting device: a receiver that says where it is
+    is more reliable than a remembered form field, and silently preferring
+    the form would make a moved receiver appear stuck at its old address.
+    """
+    device = _owned_device(db, account, device_id)
+    if not device:
+        return RedirectResponse("/account", status_code=status.HTTP_303_SEE_OTHER)
+    # Blank fields clear it, which is the only way back to the deployment
+    # default once something has been entered.
+    if not latitude.strip() and not longitude.strip():
+        device.manual_lat = device.manual_lon = device.manual_radius_nm = None
+        db.commit()
+        return RedirectResponse("/account", status_code=status.HTTP_303_SEE_OTHER)
+    try:
+        lat = float(latitude)
+        lon = float(longitude)
+        nm = float(radius) if radius.strip() else 50.0
+    except ValueError:
+        return RedirectResponse("/account?error=location", status_code=status.HTTP_303_SEE_OTHER)
+    if not (-85.0 <= lat <= 85.0 and -180.0 <= lon <= 180.0 and 5 <= nm <= 250):
+        return RedirectResponse("/account?error=location", status_code=status.HTTP_303_SEE_OTHER)
+    device.manual_lat = lat
+    device.manual_lon = lon
+    device.manual_radius_nm = nm
+    db.commit()
     return RedirectResponse("/account", status_code=status.HTTP_303_SEE_OTHER)
 
 

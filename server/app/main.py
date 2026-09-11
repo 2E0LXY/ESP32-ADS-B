@@ -7,7 +7,7 @@ from fastapi import FastAPI
 from . import models, security
 from .aggregator import Aggregator
 from .routes import RouteResolver
-from .database import Base, SessionLocal, engine
+from .database import Base, SessionLocal, add_missing_columns, engine
 from .feed_ingest import FeedIngestManager
 from .routers import admin, public
 
@@ -49,6 +49,9 @@ def _bootstrap_admin(db):
 @app.on_event("startup")
 async def startup():
     Base.metadata.create_all(bind=engine)
+    # Existing deployments predate the per-device location columns; without
+    # this they would raise on the first query after an upgrade.
+    add_missing_columns(Base)
     db = SessionLocal()
     try:
         _bootstrap_admin(db)
