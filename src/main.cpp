@@ -3209,10 +3209,54 @@ int overheadAircraftCount() {
   return collectOverheadAircraft(matches, 32);
 }
 
+// Set when the screensaver is entered, so the first frame after it appears
+// is always painted even if the content signature happens to match.
+bool screensaverNeedsRedraw = true;
+
 void renderScreensaverPage() {
-  filledRect(0, 0, W, H, rgb(0, 0, 0));
   int overheadMatches[32];
   const int overheadCount = collectOverheadAircraft(overheadMatches, 32);
+
+  // Repainting clears the whole screen: 768 KB of writes across the same
+  // PSRAM bus the panel refills its bounce buffers from, which is the burst
+  // that makes the picture slip. Every fetch used to trigger one through
+  // renderCurrentPage(), whether or not a single displayed value had
+  // changed - and on the no-aircraft page nothing ever changes. Skip the
+  // repaint when the frame would be identical.
+  //
+  // The signature covers everything this page actually draws for the
+  // selected aircraft; anything not in it cannot change the picture.
+  uint32_t signature = 2166136261u;
+  auto mix = [&signature](uint32_t value) {
+    signature = (signature ^ value) * 16777619u;
+  };
+  auto mixText = [&mix](const char *text) {
+    for (const char *c = text; *c; ++c) mix(static_cast<uint8_t>(*c));
+  };
+  mix(static_cast<uint32_t>(overheadCount));
+  if (overheadCount > 0) {
+    const AircraftDisplay &shown = latestAircraft[overheadMatches[screensaverAircraftIndex % overheadCount]];
+    mixText(shown.hex);
+    mixText(shown.flight);
+    mixText(shown.squawk);
+    mix(static_cast<uint32_t>(shown.altitudeFt));
+    mix(static_cast<uint32_t>(lroundf(shown.speedKnots)));
+    mix(static_cast<uint32_t>(lroundf(shown.track)));
+    mix(static_cast<uint32_t>(lroundf(shown.verticalRateFpm)));
+    mix(static_cast<uint32_t>(lroundf(shown.distanceMiles * 10.0f)));
+    mix(static_cast<uint32_t>(lroundf(shown.signalDb)));
+    mix(shown.messages);
+    mix(static_cast<uint32_t>(lroundf(shown.ageSeconds)));
+    const RouteCacheEntry *route = cachedRoute(shown.flight);
+    mixText(route && route->hasRoute ? route->origin : "");
+    mixText(route && route->hasRoute ? route->destination : "");
+  }
+  static uint32_t lastSignature = 0;
+  if (!screensaverNeedsRedraw && signature == lastSignature) return;
+  lastSignature = signature;
+  screensaverNeedsRedraw = false;
+
+  filledRect(0, 0, W, H, rgb(0, 0, 0));
   if (overheadCount == 0) {
     text5(20, H / 2 - 6, "NO OVERHEAD AIRCRAFT", rgb(120, 140, 160), 2);
     text5(20, H / 2 + 24, "TAP OR SWIPE TO RETURN", rgb(70, 90, 110));
@@ -5947,6 +5991,7 @@ void loop() {
   if (screensaverEnabled && !screensaverActive && detailAircraftIndex < 0 &&
       millis() - lastInteractionAt > screensaverIdleMinutes * 60000UL) {
     screensaverActive = true;
+    screensaverNeedsRedraw = true;
     screensaverAircraftIndex = 0;
     screensaverRotateAt = millis() + 6000UL;
     MutexGuard guard(dataMutex);
