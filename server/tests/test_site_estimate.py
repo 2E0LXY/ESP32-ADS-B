@@ -138,3 +138,47 @@ def test_spread_is_not_used_as_the_poll_radius():
     # The spread says how scattered the evidence was, not how far the
     # receiver reaches - polling 3 nm around it would cache nothing useful.
     assert device.location()[2] >= 50
+
+
+def test_samples_survive_a_reconnect():
+    """A feeder that drops and reconnects must not lose its evidence.
+
+    The sampler used to be created per connection, so on a flaky link - and
+    the deployment log shows reconnects - it never accumulated the twelve
+    airframes an estimate needs, and no estimate ever appeared.
+    """
+    from app.feed_ingest import FeedIngestManager
+
+    manager = FeedIngestManager(aggregator=None, session_factory=None)
+    now = time.time()
+
+    # First connection: six sightings, not yet enough to answer.
+    first = manager._samplers.setdefault(1, SiteSampler())
+    for i in range(6):
+        pos = _offset(LEEDS[0], LEEDS[1], i * 60, 8)
+        first.add(f"first{i:02d}", pos[0], pos[1], 3000, now)
+    assert first.estimate() is None
+
+    # Reconnect - same device, so the same sampler.
+    second = manager._samplers.setdefault(1, SiteSampler())
+    assert second is first
+    for i in range(8):
+        pos = _offset(LEEDS[0], LEEDS[1], i * 45 + 20, 10)
+        second.add(f"second{i:02d}", pos[0], pos[1], 3000, now)
+
+    estimate = second.estimate()
+    assert estimate is not None, "evidence from before the reconnect was lost"
+    assert _distance_nm(LEEDS[0], LEEDS[1], estimate[0], estimate[1]) < 6
+
+
+def test_each_device_samples_separately():
+    from app.feed_ingest import FeedIngestManager
+
+    manager = FeedIngestManager(aggregator=None, session_factory=None)
+    now = time.time()
+    for i in range(20):
+        pos = _offset(LEEDS[0], LEEDS[1], i * 18, 8)
+        manager._samplers.setdefault(1, SiteSampler()).add(f"a{i:02d}", pos[0], pos[1], 3000, now)
+    # A second feeder elsewhere must not pick up the first one's sightings.
+    assert manager._samplers.setdefault(2, SiteSampler()).estimate() is None
+    assert manager._samplers[1].estimate() is not None

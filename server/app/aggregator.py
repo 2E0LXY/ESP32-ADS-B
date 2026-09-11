@@ -36,6 +36,10 @@ POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "15"))
 # How long a source is still credited with an aircraft after last reporting
 # it. Long enough to ride out a gap between messages from a single receiver,
 # short enough that a feeder that goes offline stops claiming the sky.
+# A source that keeps failing is retried on a widening interval rather than
+# every cycle - an upstream that has started refusing us should not cost a
+# request and a log line every fifteen seconds indefinitely.
+SOURCE_BACKOFF_MAX_SECONDS = 15 * 60
 SOURCE_ATTRIBUTION_SECONDS = 60
 STALE_AFTER_SECONDS = 5 * 60  # matches the ESP32 firmware's own MLAT/route cache staleness window
 # Per-device polling areas. A device asking for a 5 nm radius still needs the
@@ -156,6 +160,7 @@ class SourceHealth:
     last_success: float | None = None
     last_error: str | None = None
     consecutive_errors: int = 0
+    last_attempt: float | None = None
 
 
 class Aggregator:
@@ -268,8 +273,31 @@ class Aggregator:
             return_exceptions=True,
         )
 
+    def _source_is_backed_off(self, name: str) -> bool:
+        """True while a repeatedly failing source is being left alone.
+
+        airplanes.live began answering 403 to every request, and without
+        this the poll loop asked it again every fifteen seconds forever and
+        wrote a warning each time - a dead source producing thousands of log
+        lines a day and a steady trickle of pointless requests at someone
+        else's server. Back off instead, and keep retrying occasionally so
+        the source recovers on its own when whatever changed changes back.
+        """
+        health = self._health[name]
+        if health.consecutive_errors == 0:
+            return False
+        delay = min(
+            SOURCE_BACKOFF_MAX_SECONDS,
+            POLL_INTERVAL_SECONDS * (2 ** min(health.consecutive_errors, 12)),
+        )
+        return time.time() - (health.last_attempt or 0) < delay
+
     async def _record(self, name: str, coro):
         health = self._health[name]
+        if self._source_is_backed_off(name):
+            coro.close()  # never awaited, so close it rather than leak a warning
+            return
+        health.last_attempt = time.time()
         try:
             aircraft = await coro
             await self.cache.merge(name, aircraft)
@@ -280,7 +308,16 @@ class Aggregator:
             health.ok = False
             health.last_error = str(exc)
             health.consecutive_errors += 1
-            logger.warning("poll failed for %s: %s", name, exc)
+            # Only the first few failures are worth a line each; after that
+            # the backoff above is doing the talking and repeating the same
+            # warning every cycle just buries everything else.
+            if health.consecutive_errors <= 3:
+                logger.warning("poll failed for %s: %s", name, exc)
+            elif health.consecutive_errors % 20 == 0:
+                logger.warning(
+                    "poll still failing for %s after %d attempts: %s",
+                    name, health.consecutive_errors, exc,
+                )
 
     async def _poll_adsbfi(self, client: httpx.AsyncClient):
         for lat, lon, radius in self.poll_regions():

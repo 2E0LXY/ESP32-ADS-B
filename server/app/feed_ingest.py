@@ -44,6 +44,8 @@ class FeedIngestManager:
         self.aggregator = aggregator
         self._session_factory = session_factory
         self._servers: dict[int, asyncio.base_events.Server] = {}
+        # Receiver-position samples, per device, surviving reconnects.
+        self._samplers: dict[int, SiteSampler] = {}
 
     async def sync_from_db(self):
         db = self._session_factory()
@@ -69,7 +71,13 @@ class FeedIngestManager:
             decoder = StreamDecoder()
             # An SBS stream never says where the receiver is, but the low
             # aircraft it hears do - see app/site_estimate.py.
-            sampler = SiteSampler()
+            #
+            # Kept per device, not per connection. A feeder reconnects
+            # whenever its link hiccups - the deployment log shows exactly
+            # that - and a sampler scoped to the connection threw away every
+            # sighting each time, so on a flaky link it would never reach the
+            # twelve airframes it needs and the estimate would never appear.
+            sampler = self._samplers.setdefault(device_id, SiteSampler())
             last_site_write = 0.0
 
             async def read_loop():
