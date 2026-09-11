@@ -1308,8 +1308,18 @@ enum class TouchGesture : uint8_t { None, Tap, SwipeLeft, SwipeRight, SwipeUp, S
 // cleanly is a tap - and anything that doesn't clear the 2:1 dominance ratio
 // on either axis falls through to a tap too, which used to silently double
 // as "advance page" for a vertical drag that missed being a clean swipe.
-constexpr int SWIPE_MIN_PIXELS = 70;
+// Horizontal and vertical thresholds differ because the panel does: 800 px
+// across but only 480 down, and a thumb scrolling a table travels a shorter
+// distance than one sweeping between pages.
+constexpr int SWIPE_MIN_X = 70;
+constexpr int SWIPE_MIN_Y = 45;
 constexpr uint32_t SWIPE_MAX_MS = 700;
+// How much the dominant axis must beat the other. This was 2:1, which a real
+// vertical drag routinely fails - a 100 px scroll with 60 px of thumb wobble
+// is unmistakably vertical to a person and was classified as a tap, which on
+// a page with no icons to hit meant "advance page". Scrolling the table was
+// effectively impossible.
+constexpr float SWIPE_AXIS_DOMINANCE = 1.4f;
 
 // Reads the current contact, if any. GT911 keeps point 0 at 0x8150 as
 // x-lo, x-hi, y-lo, y-hi. The status byte's high bit means the coordinate
@@ -1338,6 +1348,13 @@ TouchGesture touchGesture() {
   static int startX = 0, startY = 0, lastX = 0, lastY = 0;
   static uint32_t startedAt = 0;
 
+  // Peak excursion, not just the last sample before the lift. Touch is
+  // polled once per loop() and a render can leave a long gap between
+  // samples, so the finger is often already travelling back toward where it
+  // started by the time the last point is read. Judging the gesture on that
+  // point alone turned real swipes into taps.
+  static int peakX = 0, peakY = 0;
+
   int x = 0, y = 0;
   const bool contact = touchPoint(x, y);
 
@@ -1346,10 +1363,13 @@ TouchGesture touchGesture() {
       down = true;
       startX = lastX = x;
       startY = lastY = y;
+      peakX = peakY = 0;
       startedAt = millis();
     } else {
       lastX = x;
       lastY = y;
+      if (abs(x - startX) > abs(peakX)) peakX = x - startX;
+      if (abs(y - startY) > abs(peakY)) peakY = y - startY;
     }
     return TouchGesture::None;
   }
@@ -1357,12 +1377,12 @@ TouchGesture touchGesture() {
   if (!down) return TouchGesture::None;
   down = false;
   const uint32_t heldFor = millis() - startedAt;
-  const int deltaX = lastX - startX;
-  const int deltaY = lastY - startY;
+  const int deltaX = abs(peakX) > abs(lastX - startX) ? peakX : lastX - startX;
+  const int deltaY = abs(peakY) > abs(lastY - startY) ? peakY : lastY - startY;
   if (millis() - lastTouchAt < 350) return TouchGesture::None;
   lastTouchAt = millis();
-  if (heldFor <= SWIPE_MAX_MS && abs(deltaX) >= SWIPE_MIN_PIXELS &&
-      abs(deltaX) > abs(deltaY) * 2) {
+  if (heldFor <= SWIPE_MAX_MS && abs(deltaX) >= SWIPE_MIN_X &&
+      abs(deltaX) > abs(deltaY) * SWIPE_AXIS_DOMINANCE) {
     return deltaX < 0 ? TouchGesture::SwipeLeft : TouchGesture::SwipeRight;
   }
   // A vertical drag that missed a clean horizontal swipe used to fall all
@@ -1370,8 +1390,8 @@ TouchGesture touchGesture() {
   // didn't land on an aircraft icon - advanced the page exactly like a
   // horizontal swipe would. Table scrolling needs this recognised as its
   // own gesture instead.
-  if (heldFor <= SWIPE_MAX_MS && abs(deltaY) >= SWIPE_MIN_PIXELS &&
-      abs(deltaY) > abs(deltaX) * 2) {
+  if (heldFor <= SWIPE_MAX_MS && abs(deltaY) >= SWIPE_MIN_Y &&
+      abs(deltaY) > abs(deltaX) * SWIPE_AXIS_DOMINANCE) {
     return deltaY < 0 ? TouchGesture::SwipeUp : TouchGesture::SwipeDown;
   }
   lastTapX = lastX;
@@ -2894,8 +2914,10 @@ void renderTablePage() {
     text5(COL_ALT,y,altitude,rgb(255,255,255),2);
     text5(COL_ROUTE,y+4,routeLabel,rgb(255,255,255));
   }
-  char footer[36];
-  const char *scrollHint = (lastCount > TABLE_VISIBLE_ROWS) ? " - SWIPE UP/DOWN" : "";
+  char footer[72];
+  const char *scrollHint =
+      (lastCount > TABLE_VISIBLE_ROWS) ? " - SWIPE UP/DOWN, SIDEWAYS FOR PAGE"
+                                       : " - SWIPE SIDEWAYS FOR PAGE";
   const int rangeStart = rows > 0 ? tableScrollOffset + 1 : 0;
   if (creditsRemaining >= 0)
     snprintf(footer,sizeof(footer),"%d-%d OF %d  C%ld%s",rangeStart,tableScrollOffset+rows,lastCount,creditsRemaining,scrollHint);
@@ -5698,9 +5720,15 @@ void loop() {
       detailShownAt = millis();
       MutexGuard guard(dataMutex);
       renderAircraftDetailCard(hitIndex);
-    } else {
+    } else if (displayPage != DisplayPage::Table) {
       pageStep = 1;
     }
+    // The Table page plots no icons, so every tap on it missed one and
+    // advanced the page - including the near-taps left over from a scroll
+    // attempt that did not quite qualify as a swipe. On a page whose whole
+    // purpose is to be read and scrolled, that made it feel like the
+    // display changed page at random. Taps there now do nothing; the swipes
+    // still work and the footer says so.
   } else if (pressed) {
     pageStep = 1;
   }
