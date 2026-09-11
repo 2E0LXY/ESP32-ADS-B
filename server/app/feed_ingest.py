@@ -78,7 +78,6 @@ class FeedIngestManager:
             # sighting each time, so on a flaky link it would never reach the
             # twelve airframes it needs and the estimate would never appear.
             sampler = self._samplers.setdefault(device_id, SiteSampler())
-            last_site_write = 0.0
 
             async def read_loop():
                 while True:
@@ -97,6 +96,15 @@ class FeedIngestManager:
                 # real ADS-B traffic) must not leave the last-known state
                 # unmerged just because nothing arrived to trigger a check.
                 last_db_touch = 0.0
+                # Both of these belong to this function. last_site_write used
+                # to be bound in the enclosing scope while being assigned
+                # here, which makes Python treat every read of it as a read
+                # of an unassigned local - so the first pass raised
+                # UnboundLocalError, after merging exactly once, and the loop
+                # died. The connection stayed up and kept being drained, so
+                # nothing looked wrong; the feed simply went quiet and the
+                # customer's map emptied a minute later.
+                last_site_write = 0.0
                 loop = asyncio.get_event_loop()
                 while True:
                     await asyncio.sleep(MERGE_INTERVAL_SECONDS)
@@ -128,8 +136,23 @@ class FeedIngestManager:
                                 self._store_site_estimate, device_id, estimate, len(sampler)
                             )
 
+            async def guarded_merge_loop():
+                # ensure_future swallows an exception until the task is
+                # garbage collected, so the fault above produced no log line
+                # at all. Never again: if this loop ends for any reason other
+                # than being cancelled, it is a fault worth a traceback.
+                try:
+                    await merge_loop()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "feeder %s: merge loop stopped - this feed is now "
+                        "connected but contributing nothing", device_id,
+                    )
+
             reader_task = asyncio.ensure_future(read_loop())
-            merger_task = asyncio.ensure_future(merge_loop())
+            merger_task = asyncio.ensure_future(guarded_merge_loop())
             try:
                 await reader_task
             except (asyncio.IncompleteReadError, ConnectionResetError):
