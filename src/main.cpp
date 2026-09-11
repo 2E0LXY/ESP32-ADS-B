@@ -2659,6 +2659,22 @@ void status(const char *label, uint16_t colour) {
 }
 
 void present() {
+  // Start the copy at the top of the vertical blanking interval. There is
+  // exactly one framebuffer and the panel scans it out continuously, so
+  // writing a whole frame at an arbitrary moment races the beam: the
+  // display shows part of the old frame and part of the new one, which is
+  // the flickering lines and the torn rows. Beginning at vsync keeps the
+  // copy ahead of the scan for the rest of the frame - 768 KB of
+  // PSRAM-to-PSRAM takes roughly a third of a frame period, against a full
+  // frame of scan-out to stay in front of.
+  //
+  // This is not the same fault as the bandwidth starvation the bounce
+  // buffers exist for, which is why changing the pixel clock across its
+  // whole range made no difference to it: tearing happens at any clock.
+  //
+  // Waiting is capped and its result ignored on purpose - if vsync never
+  // arrives, drawing a torn frame beats blocking the UI task.
+  rgbpanel->waitForVsync(50);
   gfx->draw16bitRGBBitmap(0, 0, framebuffer, W, H);
   // esp_lcd_rgb_panel_restart() returns ESP_ERR_INVALID_STATE unless
   // CONFIG_LCD_RGB_RESTART_IN_VSYNC is set in the sdkconfig, which cannot be

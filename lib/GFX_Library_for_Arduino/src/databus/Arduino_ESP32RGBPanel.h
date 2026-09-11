@@ -18,6 +18,10 @@
 #include "Arduino_DataBus.h"
 
 #if defined(ESP32) && (CONFIG_IDF_TARGET_ESP32S3)
+// For the vsync semaphore below. Arduino pulls FreeRTOS in already, but this
+// header is also included on its own.
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
 #include "esp_lcd_panel_rgb.h"
 #include "esp_lcd_panel_ops.h"
@@ -91,6 +95,12 @@ public:
 
   uint16_t *getFrameBuffer(int16_t w, int16_t h);
   bool restartAtNextVsync();
+  // Blocks until the panel finishes scanning out a frame, so a caller can
+  // begin writing the framebuffer at the start of the blanking interval
+  // instead of into lines the display is reading right now. Returns false
+  // if no vsync arrived within the timeout, in which case the caller should
+  // draw anyway rather than stall. See the comment in the .cpp.
+  bool waitForVsync(uint32_t timeout_ms = 50);
 
 protected:
 private:
@@ -114,6 +124,7 @@ private:
   uint16_t _pclk_idle_high;
 
   esp_lcd_panel_handle_t _panel_handle = NULL;
+  SemaphoreHandle_t _vsync_sem = NULL;
 };
 
 #endif // #if defined(ESP32) && (CONFIG_IDF_TARGET_ESP32S3)
