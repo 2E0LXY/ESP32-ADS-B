@@ -240,8 +240,17 @@ class Aggregator:
     async def _loop(self):
         async with httpx.AsyncClient(timeout=10.0, headers={"User-Agent": USER_AGENT}) as client:
             while True:
-                await self._poll_all(client)
-                await self.cache.prune()
+                try:
+                    await self._poll_all(client)
+                    await self.cache.prune()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001
+                    # This loop is the only thing filling the cache. An
+                    # unhandled error here used to end it for the lifetime of
+                    # the process, and the only symptom was a service that
+                    # quietly returned fewer and fewer aircraft.
+                    logger.exception("poll cycle failed")
                 await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
     def _next_feeder_credential(self, provider: FeederProvider) -> str | None:
@@ -266,12 +275,27 @@ class Aggregator:
         return next(self._feeder_cycle[provider]).credential
 
     async def _poll_all(self, client: httpx.AsyncClient):
+        # Worked out once per cycle and handed to all three pollers, rather
+        # than each of them asking the database for itself. It is the same
+        # answer three times over, and it was three synchronous queries on
+        # the event loop every fifteen seconds - the loop the live feeder
+        # listeners also run on.
+        regions = await self._current_regions()
         await asyncio.gather(
-            self._poll_adsbfi(client),
-            self._poll_airplaneslive(client),
-            self._poll_adsblol(client),
+            self._poll_adsbfi(client, regions),
+            self._poll_airplaneslive(client, regions),
+            self._poll_adsblol(client, regions),
             return_exceptions=True,
         )
+
+    async def _current_regions(self) -> list[tuple[float, float, float]]:
+        try:
+            return await asyncio.to_thread(self.poll_regions)
+        except Exception as exc:  # noqa: BLE001
+            # Reading device locations is a convenience; not being able to
+            # is no reason to stop polling entirely.
+            logger.warning("could not read device locations (%s) - polling the home area only", exc)
+            return [(self.home_lat, self.home_lon, self.home_radius_nm)]
 
     def _source_is_backed_off(self, name: str) -> bool:
         """True while a repeatedly failing source is being left alone.
@@ -319,25 +343,25 @@ class Aggregator:
                     name, health.consecutive_errors, exc,
                 )
 
-    async def _poll_adsbfi(self, client: httpx.AsyncClient):
-        for lat, lon, radius in self.poll_regions():
+    async def _poll_adsbfi(self, client: httpx.AsyncClient, regions):
+        for lat, lon, radius in regions:
             url = (
                 f"https://opendata.adsb.fi/api/v3/lat/{lat}/lon/{lon}"
                 f"/dist/{radius:.0f}"
             )
             await self._record("adsbfi", self._fetch(client, url, "ac"))
 
-    async def _poll_airplaneslive(self, client: httpx.AsyncClient):
+    async def _poll_airplaneslive(self, client: httpx.AsyncClient, regions):
         # No feeder-key pooling here yet: airplanes.live's own API doesn't
         # take a bearer/query-param key today (access is IP/account based on
         # their end) - the hook is here so it's a one-line change once/if
         # they document one.
-        for lat, lon, radius in self.poll_regions():
+        for lat, lon, radius in regions:
             url = f"https://api.airplanes.live/v2/point/{lat}/{lon}/{radius:.0f}"
             await self._record("airplaneslive", self._fetch(client, url, "ac"))
 
-    async def _poll_adsblol(self, client: httpx.AsyncClient):
-        for lat, lon, radius in self.poll_regions():
+    async def _poll_adsblol(self, client: httpx.AsyncClient, regions):
+        for lat, lon, radius in regions:
             url = f"https://api.adsb.lol/v2/point/{lat}/{lon}/{radius:.0f}"
             await self._record("adsblol", self._fetch(client, url, "ac"))
 

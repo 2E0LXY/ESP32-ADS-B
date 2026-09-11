@@ -1,3 +1,4 @@
+import asyncio
 import datetime
 
 from fastapi import APIRouter, Cookie, Depends, Form, Header, Request, status
@@ -52,8 +53,26 @@ async def get_aircraft(
         route = resolver.lookup(entry.get("flight"))
         enriched.append({**entry, "route": route} if route else entry)
     aircraft = enriched
+    ip = request.client.host if request.client else None
+    # In a thread, not inline: this endpoint is "async def", so a synchronous
+    # commit here stops the whole event loop until SQLite lets go - and the
+    # feeder listeners live on that same loop, so a device poll that waited
+    # on a write lock stopped reading a customer's live SBS stream with it.
+    await asyncio.to_thread(_record_poll, db, device, ip, lat, lon, radius, len(aircraft))
+    return {"ac": aircraft, "total": len(aircraft)}
+
+
+def _record_poll(
+    db: Session,
+    device: models.Device,
+    ip: str | None,
+    lat: float,
+    lon: float,
+    radius: float,
+    returned: int,
+):
     device.last_seen_at = datetime.datetime.now(datetime.timezone.utc)
-    device.last_seen_ip = request.client.host if request.client else None
+    device.last_seen_ip = ip
     # The device already tells us where it is on every request, so record it:
     # that is what lets the aggregator poll upstream for this customer's sky
     # rather than only the operator's. A receiver that moves - a hotel, a
@@ -63,15 +82,8 @@ async def get_aircraft(
         device.reported_lon = lon
         device.reported_radius_nm = radius
         device.reported_at = device.last_seen_at
-    db.add(
-        models.UsageLog(
-            device_id=device.id,
-            ip=device.last_seen_ip,
-            aircraft_returned=len(aircraft),
-        )
-    )
+    db.add(models.UsageLog(device_id=device.id, ip=ip, aircraft_returned=returned))
     db.commit()
-    return {"ac": aircraft, "total": len(aircraft)}
 
 
 # --- Customer signup / login -------------------------------------------------
@@ -364,21 +376,27 @@ async def enable_feeder(
     account: models.Account = Depends(get_current_account),
     db: Session = Depends(get_db),
 ):
+    assigned = await asyncio.to_thread(_enable_feeder_row, db, account, device_id)
+    if assigned:
+        await request.app.state.feed_ingest.start_for_device(*assigned)
+    return RedirectResponse("/account", status_code=status.HTTP_303_SEE_OTHER)
+
+
+def _enable_feeder_row(db: Session, account: models.Account, device_id: int):
     device = _owned_device(db, account, device_id)
     if not device:
-        return RedirectResponse("/account", status_code=status.HTTP_303_SEE_OTHER)
+        return None
     if not device.feeder_port:
         port = allocate_port(db)
         if port is None:
             # Every port in the configured range is already assigned - a
             # capacity problem for the operator to fix (widen the range),
             # not something the customer can do anything about.
-            return RedirectResponse("/account", status_code=status.HTTP_303_SEE_OTHER)
+            return None
         device.feeder_port = port
     device.feeder_enabled = True
     db.commit()
-    await request.app.state.feed_ingest.start_for_device(device.id, device.feeder_port)
-    return RedirectResponse("/account", status_code=status.HTTP_303_SEE_OTHER)
+    return device.id, device.feeder_port
 
 
 @router.post("/devices/{device_id}/feeder/disable")
@@ -388,14 +406,19 @@ async def disable_feeder(
     account: models.Account = Depends(get_current_account),
     db: Session = Depends(get_db),
 ):
+    port = await asyncio.to_thread(_disable_feeder_row, db, account, device_id)
+    await request.app.state.feed_ingest.stop_for_device(port)
+    return RedirectResponse("/account", status_code=status.HTTP_303_SEE_OTHER)
+
+
+def _disable_feeder_row(db: Session, account: models.Account, device_id: int) -> int | None:
     device = _owned_device(db, account, device_id)
     if not device:
-        return RedirectResponse("/account", status_code=status.HTTP_303_SEE_OTHER)
+        return None
     device.feeder_enabled = False
     port = device.feeder_port
     db.commit()
-    await request.app.state.feed_ingest.stop_for_device(port)
-    return RedirectResponse("/account", status_code=status.HTTP_303_SEE_OTHER)
+    return port
 
 
 @router.get("/account/my-feed/{device_id}", response_class=HTMLResponse)
@@ -418,7 +441,10 @@ async def my_feed_aircraft(
     account: models.Account = Depends(get_current_account),
     db: Session = Depends(get_db),
 ):
-    device = _owned_device(db, account, device_id)
+    # Browsers on this page poll it every three seconds, so it is the most
+    # frequent database read in the service - and the one most able to stall
+    # the loop the feeder listeners run on.
+    device = await asyncio.to_thread(_owned_device, db, account, device_id)
     if not device:
         return {"ac": []}
     aircraft = await _aggregator(request).cache.query_by_source(f"feeder:{device.id}")

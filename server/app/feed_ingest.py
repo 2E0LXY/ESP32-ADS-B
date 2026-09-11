@@ -108,16 +108,25 @@ class FeedIngestManager:
                             sampler.add(state.hex, state.lat, state.lon, state.alt_baro, state.updated_at)
                     decoder.prune_older_than(300)
                     now = loop.time()
+                    # Both database writes go to a thread, and neither is
+                    # allowed to end the loop. Run inline they blocked the
+                    # event loop for as long as SQLite made them wait, which
+                    # stops every other feeder connection being read at the
+                    # same time; raised, they killed this connection's merge
+                    # loop for good, so the feed stayed connected and silently
+                    # stopped contributing aircraft.
                     if now - last_db_touch >= DB_TOUCH_INTERVAL_SECONDS:
                         last_db_touch = now
-                        self._touch_device(device_id)
+                        await self._in_thread(self._touch_device, device_id)
                     # Re-estimating on every merge would rewrite the row every
                     # two seconds for a value that barely moves.
                     if now - last_site_write >= SITE_ESTIMATE_INTERVAL_SECONDS:
                         last_site_write = now
                         estimate = sampler.estimate()
                         if estimate:
-                            self._store_site_estimate(device_id, estimate, len(sampler))
+                            await self._in_thread(
+                                self._store_site_estimate, device_id, estimate, len(sampler)
+                            )
 
             reader_task = asyncio.ensure_future(read_loop())
             merger_task = asyncio.ensure_future(merge_loop())
@@ -140,6 +149,12 @@ class FeedIngestManager:
         server = self._servers.pop(port)
         server.close()
         await server.wait_closed()
+
+    async def _in_thread(self, fn, *args):
+        try:
+            await asyncio.to_thread(fn, *args)
+        except Exception:  # noqa: BLE001 - a database hiccup must not end the feed
+            logger.exception("feeder database write failed")
 
     def _touch_device(self, device_id: int):
         db = self._session_factory()
