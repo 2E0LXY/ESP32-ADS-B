@@ -73,7 +73,12 @@ receiver's own raw data, not a key to someone else's network.</p>
 <tbody>
 {% for device in devices %}
 <tr>
-<td>{{ device.name }}</td>
+<td>
+<form class="inline" method="post" action="/devices/{{ device.id }}/rename">
+<input class="input" name="name" value="{{ device.name }}" maxlength="120" required style="width:150px">
+<button type="submit">Rename</button>
+</form>
+</td>
 <td>{% if device.feeder_enabled %}<span class="badge ok">Enabled</span>{% else %}<span class="badge bad">Off</span>{% endif %}</td>
 <td>{{ device.feeder_port or '--' }}</td>
 <td>{{ device.feeder_last_message_at.strftime('%Y-%m-%d %H:%M UTC') if device.feeder_last_message_at else 'Never' }}</td>
