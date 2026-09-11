@@ -5746,7 +5746,12 @@ void loop() {
                   : gesture == TouchGesture::Tap        ? "tap"
                                                         : "button");
   }
-  if (displayPage == DisplayPage::Radar && detailAircraftIndex < 0 &&
+  // Both periodic repaints below check screensaverActive. Without it the
+  // radar sweep - which repaints unconditionally every 750 ms - painted
+  // straight over the screensaver the moment it appeared, so on the Radar
+  // page the screensaver flashed up and vanished, over and over, instead of
+  // staying put. The marine page had the same hole on its own timer.
+  if (displayPage == DisplayPage::Radar && !screensaverActive && detailAircraftIndex < 0 &&
       static_cast<int32_t>(millis() - nextRadarFrameAt) >= 0) {
     // Full-screen PSRAM copies faster than this can starve the RGB DMA and
     // momentarily wrap the bottom scan lines to the top of the panel.
@@ -5755,7 +5760,8 @@ void loop() {
     { MutexGuard guard(dataMutex); renderRadarPage(); }
     nextRadarFrameAt = millis() + 750;
   }
-  if (displayPage == DisplayPage::Marine && marineDataDirty && detailAircraftIndex < 0 &&
+  if (displayPage == DisplayPage::Marine && marineDataDirty && !screensaverActive &&
+      detailAircraftIndex < 0 &&
       static_cast<int32_t>(millis() - nextMarineRenderAt) >= 0) {
     marineDataDirty = false;
     { MutexGuard guard(dataMutex); renderMarinePage(); }
