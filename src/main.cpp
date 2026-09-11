@@ -108,6 +108,24 @@ uint32_t panelPclkHz = PANEL_PCLK_HZ;
 // build flag: only ws_lcd_7_app passes -DRGB_BOUNCE_BUFFER_LINES, and the
 // library already resolves its own default when the flag is absent.
 uint16_t panelBounceLines = 0;
+
+// Draw straight into the panel's framebuffer instead of into a shadow copy
+// that present() then memcpys across.
+//
+// The copy is the largest single consumer of PSRAM bandwidth on the device:
+// 768 KB read plus 768 KB written on every render, on the same bus the LCD
+// DMA is refilling its bounce buffers from. The jumps line up with fetch
+// cycles, which is exactly when that bus is busiest, and no bounce buffer
+// size removes them - 40 lines only reduces them, and costs enough internal
+// RAM to leave largestInternal sitting at 31732, right on the threshold
+// mbedTLS needs.
+//
+// Drawing direct removes the copy entirely and frees the 768 KB shadow
+// buffer. The cost is that a frame appears progressively rather than all at
+// once, which on mostly-static pages is invisible and on a full repaint
+// looks like a fast wipe. Runtime-selectable because that trade has to be
+// judged on the hardware.
+bool panelDirectDraw = false;
 constexpr uint16_t PANEL_BOUNCE_CHOICES[] = {0, 10, 20, 30, 40};
 
 constexpr uint32_t PANEL_PCLK_CHOICES[] = {
@@ -2736,8 +2754,15 @@ void present() {
   //
   // Waiting is capped and its result ignored on purpose - if vsync never
   // arrives, drawing a torn frame beats blocking the UI task.
-  rgbpanel->waitForVsync(50);
-  gfx->draw16bitRGBBitmap(0, 0, framebuffer, W, H);
+  if (panelDirectDraw) {
+    // Already in the panel's buffer; it only needs pushing out of the CPU
+    // cache so the LCD DMA reads what was drawn. No vsync wait either -
+    // there is no bulk copy to keep ahead of the scan.
+    gfx->flush(true);
+  } else {
+    rgbpanel->waitForVsync(50);
+    gfx->draw16bitRGBBitmap(0, 0, framebuffer, W, H);
+  }
   // esp_lcd_rgb_panel_restart() returns ESP_ERR_INVALID_STATE unless
   // CONFIG_LCD_RGB_RESTART_IN_VSYNC is set in the sdkconfig, which cannot be
   // changed from platformio.ini with the prebuilt Arduino libraries. The
@@ -4394,6 +4419,7 @@ void handleStatusApi() {
   doc["pclkRefreshHz"] = roundf(panelRefreshHz(panelPclkHz) * 10.0f) / 10.0f;
   doc["bounceLines"] = panelBounceLines;
   doc["bounceKb"] = 2UL * panelBounceLines * W * 2UL / 1024UL;
+  doc["directDraw"] = panelDirectDraw;
   doc["screensaverActive"] = screensaverActive;
   doc["page"] = displayPageName();
   doc["latitude"] = homeLatitude;
@@ -4593,6 +4619,15 @@ void handleDisplaySettings() {
     screensaverIdleMinutes = static_cast<uint16_t>(minutes);
     settingsStore.putUShort("ssaver-min", screensaverIdleMinutes);
     lastInteractionAt = millis();
+  }
+  if (webServer.hasArg("directDraw")) {
+    settingsStore.putBool("direct-draw", webServer.arg("directDraw") == "1");
+    // The framebuffer pointer is chosen once at boot, so this needs a
+    // restart like the other two panel settings.
+    restartPending = true;
+    restartAt = millis() + 1500;
+    sendMessage(202, "Rendering mode saved - rebooting to apply");
+    return;
   }
   if (webServer.hasArg("bounceLines")) {
     long lines = 0;
@@ -5705,11 +5740,20 @@ void setup() {
   // the PNG decoder and 8.4 KB for the route cache - competing with the RGB
   // bounce buffers and every mbedTLS handshake for the scarcest memory on
   // the board. Neither needs the speed.
+  panelDirectDraw = settingsStore.getBool("direct-draw", false);
   initPngDecoder();
   initRouteCache();
   if (!pngDecoderPtr) Serial.println("PNG decoder allocation failed - map tiles unavailable");
   if (!routeCache.data) Serial.println("Route cache allocation failed - routes unavailable");
-  framebuffer=(uint16_t*)heap_caps_malloc(W*H*sizeof(uint16_t),MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
+  // In direct mode every pixel() lands in the panel's own buffer, so there
+  // is no shadow to allocate and present() has nothing to copy.
+  framebuffer = panelDirectDraw
+                    ? gfx->getFramebuffer()
+                    : (uint16_t *)heap_caps_malloc(W * H * sizeof(uint16_t),
+                                                   MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  Serial.printf("Rendering: %s\n", panelDirectDraw
+                                        ? "direct to panel framebuffer"
+                                        : "shadow buffer, copied on present()");
   baseMap=(uint16_t*)heap_caps_malloc(W*H*sizeof(uint16_t),MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
   latestAircraft = static_cast<AircraftDisplay *>(heap_caps_calloc(
       MAX_AIRCRAFT, sizeof(AircraftDisplay), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
