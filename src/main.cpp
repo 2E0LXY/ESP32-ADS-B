@@ -10,6 +10,7 @@
 #include "board_config.h"
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <new>
 #include <HTTPClient.h>
 #include <WiFiManager.h>
 #include <ArduinoJson.h>
@@ -766,7 +767,23 @@ struct VesselDisplay {
 
 uint16_t *framebuffer = nullptr;
 uint16_t *baseMap = nullptr;
-PNG pngDecoder;
+// PNGdec's decoder object carries its own line and Huffman buffers and is
+// 44.5 KB. As a plain global it sits in internal DRAM, which is the scarcest
+// memory on this board - the same pool the RGB bounce buffers and every
+// mbedTLS handshake compete for. It is only used to decode map tiles, where
+// PSRAM's extra latency costs nothing noticeable, so it lives there instead.
+// Placement-new into a PSRAM allocation, done once in setup().
+PNG *pngDecoderPtr = nullptr;
+
+void initPngDecoder() {
+  void *block = heap_caps_malloc(sizeof(PNG), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  // Falls back to the ordinary heap, not a static array: a static fallback
+  // would occupy the internal DRAM this is moving out of, whether or not it
+  // was ever needed, which defeats the whole change.
+  if (!block) block = malloc(sizeof(PNG));
+  pngDecoderPtr = block ? new (block) PNG() : nullptr;
+}
+#define pngDecoder (*pngDecoderPtr)
 int pngTileScreenX = 0;
 int pngTileScreenY = 0;
 uint32_t nextFetchAt = 0;
@@ -775,7 +792,30 @@ String bearerToken;
 int lastCount = 0;
 int lastMlat = 0;
 long creditsRemaining = -1;
-RouteCacheEntry routeCache[ROUTE_CACHE_SIZE];
+// 48 entries at 180 bytes is 8.4 KB, and as a plain array that is 8.4 KB of
+// internal DRAM for something read a handful of times a second. PSRAM, for
+// the same reason as the PNG decoder above.
+// A view rather than a bare pointer so every existing use site - the
+// range-for loops, the indexing, taking the address of an element - keeps
+// working unchanged, and the fixed size stays attached to the type.
+struct RouteCacheView {
+  RouteCacheEntry *data = nullptr;
+  RouteCacheEntry *begin() const { return data; }
+  // end() == begin() when the allocation failed, so every range-for over
+  // the cache iterates zero times instead of walking off a null pointer.
+  RouteCacheEntry *end() const { return data ? data + ROUTE_CACHE_SIZE : data; }
+  RouteCacheEntry &operator[](int index) const { return data[index]; }
+};
+RouteCacheView routeCache;
+
+void initRouteCache() {
+  routeCache.data = static_cast<RouteCacheEntry *>(heap_caps_calloc(
+      ROUTE_CACHE_SIZE, sizeof(RouteCacheEntry), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  // Ordinary heap as the fallback, for the same reason as the PNG decoder:
+  // a static array would still cost the internal DRAM being reclaimed.
+  if (!routeCache.data)
+    routeCache.data = static_cast<RouteCacheEntry *>(calloc(ROUTE_CACHE_SIZE, sizeof(RouteCacheEntry)));
+}
 AircraftDisplay *latestAircraft = nullptr;
 VesselDisplay *latestVessels = nullptr;
 int vesselCount = 0;
@@ -1762,6 +1802,9 @@ bool drawCachedOsmTile(const String &path, int screenX, int screenY) {
   }
   pngTileScreenX = screenX;
   pngTileScreenY = screenY;
+  // The decoder lives in PSRAM and is allocated at boot; nothing else in
+  // this path checks, so guard here rather than dereference a null.
+  if (!pngDecoderPtr) return false;
   const int opened = pngDecoder.openRAM(data, size, drawPngLine);
   const bool success = opened == PNG_SUCCESS && pngDecoder.decode(nullptr, 0) == PNG_SUCCESS;
   if (opened == PNG_SUCCESS) pngDecoder.close();
@@ -2055,6 +2098,7 @@ void abbreviateAirport(const char *cityName, const char *fullAirportName, char *
 // stops sending routes (an older deployment), the device falls back to
 // looking it up itself once this expires.
 bool adoptServerRoute(const char *rawCallsign, JsonObjectConst route) {
+  if (!routeCache.data) return false;
   if (route.isNull()) return false;
   const char *origin = route["origin"] | "";
   const char *destination = route["destination"] | "";
@@ -2102,6 +2146,7 @@ bool adoptServerRoute(const char *rawCallsign, JsonObjectConst route) {
 
 RouteCacheEntry *routeForCallsign(const char *rawCallsign, int &lookupsUsed,
                                   WiFiClientSecure &client, HTTPClient &http) {
+  if (!routeCache.data) return nullptr;
   char callsign[9];
   normalizeCallsign(rawCallsign, callsign);
   if (strlen(callsign) < 3) return nullptr;
@@ -5656,6 +5701,14 @@ void setup() {
 #endif
   renderBootScreen();
   delay(2800);
+  // Both of these used to be plain globals in internal DRAM - 44.5 KB for
+  // the PNG decoder and 8.4 KB for the route cache - competing with the RGB
+  // bounce buffers and every mbedTLS handshake for the scarcest memory on
+  // the board. Neither needs the speed.
+  initPngDecoder();
+  initRouteCache();
+  if (!pngDecoderPtr) Serial.println("PNG decoder allocation failed - map tiles unavailable");
+  if (!routeCache.data) Serial.println("Route cache allocation failed - routes unavailable");
   framebuffer=(uint16_t*)heap_caps_malloc(W*H*sizeof(uint16_t),MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
   baseMap=(uint16_t*)heap_caps_malloc(W*H*sizeof(uint16_t),MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
   latestAircraft = static_cast<AircraftDisplay *>(heap_caps_calloc(
