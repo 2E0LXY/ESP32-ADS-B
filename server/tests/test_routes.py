@@ -20,6 +20,7 @@ def _payload(origin="CFU", destination="EDI"):
         "response": {
             "flightroute": {
                 "callsign": "EZY51NR",
+                "airline": {"name": "easyJet", "icao": "EZY"},
                 "origin": {
                     "iata_code": origin,
                     "icao_code": "LGKR",
@@ -61,6 +62,9 @@ async def test_first_lookup_returns_nothing_then_resolves():
         assert route["origin"] == "CFU"
         assert route["destination"] == "EDI"
         assert route["origin_city"] == "Corfu"
+        # Comes from the same adsbdb response as the route, so the device
+        # never needs its own airline table.
+        assert route["airline"] == "easyJet"
         assert route["destination_name"] == "Edinburgh Airport"
     finally:
         await resolver.stop()

@@ -50,6 +50,7 @@ MAX_CACHE = 5000
 
 @dataclass
 class Route:
+    airline: str = ""
     origin: str = ""
     destination: str = ""
     origin_name: str = ""
@@ -65,6 +66,11 @@ class Route:
 
     def as_dict(self) -> dict:
         return {
+            # adsbdb returns the operating airline alongside the route, so
+            # this costs nothing extra and saves the device carrying a
+            # compiled-in prefix table that can only cover the operators
+            # someone remembered to add.
+            "airline": self.airline,
             "origin": self.origin,
             "destination": self.destination,
             "origin_name": self.origin_name,
@@ -183,6 +189,8 @@ class RouteResolver:
         except ValueError:
             return
         flight = (payload.get("response") or {}).get("flightroute") or {}
+        airline = flight.get("airline") or {}
+        route.airline = (airline.get("name") or "")[:31]
         origin = flight.get("origin") or {}
         destination = flight.get("destination") or {}
         route.origin = _code(origin)

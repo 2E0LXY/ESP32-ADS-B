@@ -26,6 +26,7 @@ def resolver_with_stub(client):
             json={
                 "response": {
                     "flightroute": {
+                        "airline": {"name": "easyJet", "icao": "EZY"},
                         "origin": {"iata_code": "CFU", "name": "Corfu", "municipality": "Corfu"},
                         "destination": {
                             "iata_code": "EDI",

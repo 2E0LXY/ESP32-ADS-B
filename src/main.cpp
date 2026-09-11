@@ -463,6 +463,12 @@ struct RouteCacheEntry {
   // name. Computed once here rather than per frame.
   char originAbbrev[10] = {};
   char destinationAbbrev[10] = {};
+  // Airline name, when the aggregator supplied one. adsbdb returns it
+  // alongside the route, so the server gets it for free from a request it
+  // is already making - a far better source than a prefix table compiled
+  // into the firmware, which can only ever cover the operators someone
+  // thought to add.
+  char airline[32] = {};
   uint32_t resolvedAt = 0;
   uint32_t lastUsed = 0;
   bool occupied = false;
@@ -2165,6 +2171,7 @@ bool adoptServerRoute(const char *rawCallsign, JsonObjectConst route) {
   strncpy(slot->destination, destination, sizeof(slot->destination) - 1);
   strncpy(slot->originName, route["origin_name"] | "", sizeof(slot->originName) - 1);
   strncpy(slot->destinationName, route["destination_name"] | "", sizeof(slot->destinationName) - 1);
+  strncpy(slot->airline, route["airline"] | "", sizeof(slot->airline) - 1);
   strncpy(slot->originCity, route["origin_city"] | "", sizeof(slot->originCity) - 1);
   strncpy(slot->destinationCity, route["destination_city"] | "", sizeof(slot->destinationCity) - 1);
   if (slot->originCity[0] && slot->originName[0])
@@ -2319,6 +2326,110 @@ void loadRouteCacheFromStorage() {
   }
   file.close();
   if (loaded) Serial.printf("Loaded %d cached routes from %s\n", loaded, routeCacheFilePath());
+}
+
+// Airline name from the callsign's ICAO prefix. The feeds' own "ownOp"
+// field is empty for most aircraft, so a screensaver that only showed what
+// the feed sent displayed a bare callsign like EAG78H and told the viewer
+// nothing. The prefix is the one piece of an airline callsign that is
+// globally assigned and stable, so it can be resolved on-device.
+//
+// Deliberately partial: it covers the operators actually seen over the UK
+// and Europe plus the major long-haul carriers, and anything unlisted falls
+// back to showing the callsign, which is what it did before. Nothing here
+// costs RAM - it is const and lives in flash.
+struct OperatorName {
+  char code[4];
+  const char *name;
+};
+
+constexpr OperatorName OPERATOR_NAMES[] = {
+    // UK and Ireland
+    {"BAW", "BRITISH AIRWAYS"},   {"SHT", "BRITISH AIRWAYS SHUTTLE"},
+    {"EZY", "EASYJET"},           {"EJU", "EASYJET EUROPE"},
+    {"RYR", "RYANAIR"},           {"RUK", "RYANAIR UK"},
+    {"EXS", "JET2"},              {"TOM", "TUI AIRWAYS"},
+    {"VIR", "VIRGIN ATLANTIC"},   {"LOG", "LOGANAIR"},
+    {"EAG", "EMERALD AIRLINES"},  {"EIN", "AER LINGUS"},
+    {"BEE", "BLUE ISLANDS"},      {"NPT", "WEST ATLANTIC UK"},
+    {"DHK", "DHL AIR UK"},        {"BCS", "DHL EUROPEAN AIR TRANSPORT"},
+    // Continental Europe
+    {"DLH", "LUFTHANSA"},         {"GEC", "LUFTHANSA CARGO"},
+    {"EWG", "EUROWINGS"},         {"CFG", "CONDOR"},
+    {"AFR", "AIR FRANCE"},        {"KLM", "KLM"},
+    {"SWR", "SWISS"},             {"AUA", "AUSTRIAN AIRLINES"},
+    {"BEL", "BRUSSELS AIRLINES"}, {"IBE", "IBERIA"},
+    {"VLG", "VUELING"},           {"AEA", "AIR EUROPA"},
+    {"TAP", "TAP AIR PORTUGAL"},  {"SAS", "SAS"},
+    {"FIN", "FINNAIR"},           {"NAX", "NORWEGIAN"},
+    {"WZZ", "WIZZ AIR"},          {"WUK", "WIZZ AIR UK"},
+    {"LOT", "LOT POLISH AIRLINES"}, {"CTN", "CROATIA AIRLINES"},
+    {"AEE", "AEGEAN AIRLINES"},   {"ICE", "ICELANDAIR"},
+    {"BTI", "AIR BALTIC"},        {"CLX", "CARGOLUX"},
+    {"SXS", "SUNEXPRESS"},        {"PGT", "PEGASUS"},
+    {"THY", "TURKISH AIRLINES"},
+    // Middle East, Africa and Asia
+    {"UAE", "EMIRATES"},          {"QTR", "QATAR AIRWAYS"},
+    {"ETD", "ETIHAD"},            {"SVA", "SAUDIA"},
+    {"FDB", "FLYDUBAI"},          {"ABY", "AIR ARABIA"},
+    {"GFA", "GULF AIR"},          {"OMA", "OMAN AIR"},
+    {"KAC", "KUWAIT AIRWAYS"},    {"MEA", "MIDDLE EAST AIRLINES"},
+    {"RJA", "ROYAL JORDANIAN"},   {"ELY", "EL AL"},
+    {"MSR", "EGYPTAIR"},          {"RAM", "ROYAL AIR MAROC"},
+    {"ETH", "ETHIOPIAN AIRLINES"},{"KQA", "KENYA AIRWAYS"},
+    {"AIC", "AIR INDIA"},         {"PIA", "PAKISTAN INTERNATIONAL"},
+    {"SIA", "SINGAPORE AIRLINES"},{"CPA", "CATHAY PACIFIC"},
+    {"THA", "THAI AIRWAYS"},      {"MAS", "MALAYSIA AIRLINES"},
+    {"JAL", "JAPAN AIRLINES"},    {"ANA", "ALL NIPPON AIRWAYS"},
+    {"KAL", "KOREAN AIR"},        {"AAR", "ASIANA AIRLINES"},
+    {"CCA", "AIR CHINA"},         {"CES", "CHINA EASTERN"},
+    {"CSN", "CHINA SOUTHERN"},
+    // Americas and Oceania
+    {"AAL", "AMERICAN AIRLINES"}, {"UAL", "UNITED AIRLINES"},
+    {"DAL", "DELTA AIR LINES"},   {"SWA", "SOUTHWEST AIRLINES"},
+    {"JBU", "JETBLUE"},           {"ACA", "AIR CANADA"},
+    {"WJA", "WESTJET"},           {"AMX", "AEROMEXICO"},
+    {"LAN", "LATAM"},             {"AVA", "AVIANCA"},
+    {"QFA", "QANTAS"},            {"ANZ", "AIR NEW ZEALAND"},
+    {"FDX", "FEDEX"},             {"UPS", "UPS AIRLINES"},
+    {"GTI", "ATLAS AIR"},
+    // Business aviation, common overhead and rarely in ownOp
+    {"NJE", "NETJETS EUROPE"},    {"EJA", "NETJETS"},
+    {"VJT", "VISTAJET"},          {"LXJ", "FLEXJET"},
+};
+
+// Only treat a callsign as an airline callsign when it looks like one:
+// three letters then a digit. Registrations reach here too - "GBEOY" would
+// otherwise match a "GBE" prefix that means nothing.
+const char *operatorNameForCallsign(const char *callsign) {
+  if (!callsign || strlen(callsign) < 4) return nullptr;
+  for (int i = 0; i < 3; ++i)
+    if (!isalpha(static_cast<unsigned char>(callsign[i]))) return nullptr;
+  if (!isdigit(static_cast<unsigned char>(callsign[3]))) return nullptr;
+  char prefix[4] = {};
+  for (int i = 0; i < 3; ++i) prefix[i] = toupper(static_cast<unsigned char>(callsign[i]));
+  for (const OperatorName &entry : OPERATOR_NAMES)
+    if (!strcmp(entry.code, prefix)) return entry.name;
+  return nullptr;
+}
+
+// What a squawk actually means, where it means anything. The three
+// emergency codes are worth interrupting someone for; the conspicuity codes
+// explain why half the small aircraft overhead share one number. Everything
+// else is a discrete code - a temporary tag a controller issued from their
+// local block, carrying no meaning beyond "this sector, today" - so it gets
+// no label rather than an invented one.
+const char *squawkMeaning(const char *squawk) {
+  if (!squawk || !squawk[0]) return nullptr;
+  if (!strcmp(squawk, "7700")) return "GENERAL EMERGENCY";
+  if (!strcmp(squawk, "7600")) return "RADIO FAILURE";
+  if (!strcmp(squawk, "7500")) return "HIJACK";
+  if (!strcmp(squawk, "7000")) return "VFR CONSPICUITY";
+  if (!strcmp(squawk, "1200")) return "VFR (NORTH AMERICA)";
+  if (!strcmp(squawk, "2000")) return "IFR, NO CODE ASSIGNED";
+  if (!strcmp(squawk, "7777")) return "MILITARY INTERCEPT";
+  if (!strcmp(squawk, "0000")) return "MILITARY / UNASSIGNED";
+  return nullptr;
 }
 
 uint16_t operatorColour(const char *code) {
@@ -3265,6 +3376,8 @@ void renderScreensaverPage() {
     const RouteCacheEntry *route = cachedRoute(shown.flight);
     mixText(route && route->hasRoute ? route->origin : "");
     mixText(route && route->hasRoute ? route->destination : "");
+    mixText(route ? route->airline : "");
+    mixText(shown.operatorName);
   }
   static uint32_t lastSignature = 0;
   if (!screensaverNeedsRedraw && signature == lastSignature) return;
@@ -3299,7 +3412,16 @@ void renderScreensaverPage() {
   // Line 1 - who. The operator name when the feed carries one, otherwise the
   // callsign, which is the most identifying thing left.
   char line[64];
-  snprintf(line, sizeof(line), "%s", a.operatorName[0] ? a.operatorName : (a.flight[0] ? a.flight : a.hex));
+  // Who is flying it, best source first: the operator the feed sent, then
+  // the airline the aggregator resolved from the callsign, then the
+  // firmware's own prefix table for when neither is available, and only
+  // then the bare callsign. Showing "EAG78H" told the viewer nothing when
+  // "EMERALD AIRLINES" was derivable from it.
+  const char *operatorLabel = a.operatorName[0] ? a.operatorName : nullptr;
+  if (!operatorLabel && route && route->airline[0]) operatorLabel = route->airline;
+  if (!operatorLabel) operatorLabel = operatorNameForCallsign(a.flight);
+  if (!operatorLabel) operatorLabel = a.flight[0] ? a.flight : a.hex;
+  snprintf(line, sizeof(line), "%s", operatorLabel);
   const int nameScale = W >= 800 ? 3 : 2;
   fitText(line, textX, nameScale);
   text5(textX, tileY, line, white, nameScale);
@@ -3353,6 +3475,20 @@ void renderScreensaverPage() {
            static_cast<unsigned long>(a.messages));
   fitText(line, margin, 2);
   text5(margin, y, line, emergencySquawk ? rgb(255, 60, 60) : dim, 2);
+  y += 24;
+
+  // What the squawk means, where it means anything. A discrete code - a
+  // temporary tag issued from a controller's local block - gets no label,
+  // because inventing one would be worse than leaving it bare.
+  if (const char *meaning = squawkMeaning(a.squawk)) {
+    snprintf(line, sizeof(line), "SQUAWK %s: %s", a.squawk, meaning);
+    fitText(line, margin, 2);
+    text5(margin, y, line, emergencySquawk ? rgb(255, 60, 60) : dim, 2);
+  } else if (a.squawk[0]) {
+    snprintf(line, sizeof(line), "SQUAWK %s: DISCRETE CODE, ATC ASSIGNED", a.squawk);
+    fitText(line, margin, 2);
+    text5(margin, y, line, rgb(110, 130, 150), 2);
+  }
   y += 24;
 
   // Full airport names, which is what makes the route mean something to
@@ -3540,7 +3676,8 @@ void fetchAdsbV2Aircraft() {
   // than a scalar, so it needs its own entry.
   JsonObject routeFilter = aircraftFilter["route"].to<JsonObject>();
   for (const char *field : {"origin", "destination", "origin_name",
-                            "destination_name", "origin_city", "destination_city"})
+                            "destination_name", "origin_city", "destination_city",
+                            "airline"})
     routeFilter[field] = true;
   JsonDocument doc(&psramJsonAllocator);
   DeserializationError error = DeserializationError::IncompleteInput;
