@@ -182,10 +182,12 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt httpx pytest
 - The aggregator cache is in-process memory - fine for one container
   instance. If this is ever scaled to multiple instances, the cache needs to
   move to something shared (Redis) - flagged in `aggregator.py`.
-- `HOME_LAT`/`HOME_LON`/`HOME_RADIUS_NM` are global to the whole deployment,
-  not per-device - fine while every device is near the same receiver
-  location; would need to become a per-device parameter for a
-  multi-location deployment.
+- Feeder ingest has no authentication beyond the per-device port, which is
+  how every feeder network works (readsb and friends cannot send a
+  credential first) but does mean anyone who learns or scans a port can
+  inject aircraft into the shared cache. Before open signup: sanity-check
+  incoming positions against the feeder's own location, and consider
+  pinning a feeder to its last-seen source IP.
 - Admin panel has no "change your own password" page yet - see the note in
   `.env.example` for how to rotate the bootstrap admin's password manually
   in the meantime.
