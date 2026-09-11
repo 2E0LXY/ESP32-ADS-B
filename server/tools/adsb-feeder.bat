@@ -22,6 +22,8 @@ if "%ADSB_PORT%"=="0" (
   exit /b 1
 )
 
+REM "python" not "python3": on Windows python3 hits the Microsoft Store
+REM alias stub rather than a real interpreter.
 python "%~dp0adsb_feeder.py" --server %ADSB_SERVER% --port %ADSB_PORT% ^
   --receiver %ADSB_RECEIVER% --receiver-port %ADSB_RECEIVER_PORT%
 pause

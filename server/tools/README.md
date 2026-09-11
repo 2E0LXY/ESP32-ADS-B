@@ -56,6 +56,10 @@ later does not wipe your settings.
 ## Windows
 
 1. Install Python 3 from python.org, ticking **Add python.exe to PATH**.
+   Check it worked with `python --version` in a new terminal. If that prints
+   the Microsoft Store message instead of a version, PATH did not get set -
+   reinstall with the box ticked, or turn off the Store alias under Settings
+   → Apps → Advanced app settings → App execution aliases.
 2. Put `adsb_feeder.py` and `adsb-feeder.bat` in the same folder.
 3. Edit `adsb-feeder.bat`, setting `ADSB_SERVER` and `ADSB_PORT`.
 4. Double-click it to test.
@@ -66,9 +70,24 @@ startup** → action **Start a program** → the `.bat`.
 
 ## When nothing arrives
 
+Debian:
+
 ```bash
 python3 adsb_feeder.py --check --server feed.example.com --port 30117
 ```
+
+Windows — `python3` is not a command there, and typing it gets you the
+Microsoft Store stub ("Python was not found; run without arguments to
+install..."). Use `python`, or `py` if that fails:
+
+```
+cd C:\ESP32-ADS-B\server\tools
+python adsb_feeder.py --check --server feed.example.com --port 30117
+```
+
+Substitute your own hostname and the port your dashboard shows for the
+device - the values above are placeholders and will simply report the
+aggregator unreachable.
 
 That tests both ends separately and says which one is wrong. The usual causes:
 
