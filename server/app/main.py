@@ -12,6 +12,7 @@ from .feed_ingest import FeedIngestManager
 from .logos import LogoStore
 from .photos import PhotoStore
 from .reference import ReferenceData
+from .retention import RETENTION_DAYS, UsageLogPruner
 from .routers import admin, public
 
 logging.basicConfig(level=logging.INFO)
@@ -102,12 +103,20 @@ async def startup():
     app.state.photos = PhotoStore()
     app.state.photos.start()
 
+    # One usage_log row is written per device poll and nothing ever deleted
+    # one, so the table grew forever - the first thing that would have
+    # filled the disk. See app/retention.py.
+    app.state.usage_pruner = UsageLogPruner(SessionLocal)
+    app.state.usage_pruner.start()
+    logger.info("usage_log retention: %d days", RETENTION_DAYS)
+
     app.state.feed_ingest = FeedIngestManager(app.state.aggregator, SessionLocal)
     await app.state.feed_ingest.sync_from_db()
 
 
 @app.on_event("shutdown")
 async def shutdown():
+    await app.state.usage_pruner.stop()
     await app.state.photos.stop()
     await app.state.logos.stop()
     await app.state.routes.stop()

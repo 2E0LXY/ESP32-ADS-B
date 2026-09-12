@@ -200,8 +200,12 @@ class AuditLog(Base):
 
 class UsageLog(Base):
     """One row per /v1/aircraft request, for quotas, abuse detection, and
-    per-device activity in the admin panel. Pruned periodically - see
-    prune_usage_log() - so this table doesn't grow without bound."""
+    per-device activity in the admin panel.
+
+    Pruned periodically by app/retention.py, which keeps
+    USAGE_LOG_RETENTION_DAYS of history plus each device's most recent row.
+    Without that this table grows by 2,880 rows per device per day and
+    never shrinks."""
 
     __tablename__ = "usage_log"
 

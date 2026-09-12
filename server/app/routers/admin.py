@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from .. import models, security
 from ..aggregator import POLL_INTERVAL_SECONDS, Aggregator
+from ..retention import RETENTION_DAYS
 from ..database import get_db
 from ..deps import get_current_admin
 
@@ -112,6 +113,11 @@ def admin_dashboard(
             "active_key_count": db.query(models.ApiKey).filter(models.ApiKey.revoked_at.is_(None)).count(),
             "feeder_key_count": db.query(models.FeederKey).filter(models.FeederKey.enabled.is_(True)).count(),
             "recent_devices": recent_devices,
+            # So an operator can see the retention job is actually running,
+            # rather than finding out from a full disk that it isn't.
+            "retention_days": RETENTION_DAYS,
+            "usage_pruned": getattr(getattr(request.app.state, "usage_pruner", None),
+                                    "total_removed", None),
         },
     )
 

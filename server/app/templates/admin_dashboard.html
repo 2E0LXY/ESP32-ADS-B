@@ -19,7 +19,8 @@
 {% endfor %}
 </tbody>
 </table>
-<p class="sub" style="margin-top:10px">Cache holds {{ cache_size }} aircraft. Poll interval: {{ poll_interval }}s.</p>
+<p class="sub" style="margin-top:10px">Cache holds {{ cache_size }} aircraft. Poll interval: {{ poll_interval }}s.
+  Usage history kept {{ retention_days }} days{% if usage_pruned is not none %}; {{ usage_pruned }} rows pruned since restart{% endif %}.</p>
 </div>
 
 <div class="panel">
