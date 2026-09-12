@@ -402,7 +402,7 @@ Map data is © OpenStreetMap contributors. The browser and LCD show attribution.
 | Receiver position inference | For a feeder that never states where it is, estimates the position from the radio horizon of the low aircraft it hears |
 | My-feed map | A live map of only what one customer's own receiver is reporting, with track-aligned icons, an altitude colour ramp, and every field the feed carries on click |
 | Public share links | An unlisted read-only URL for that map, for anyone the owner sends it to, with no account needed; revocable and replaceable |
-| Operator and type enrichment | Fills in operator name, telephony, IATA code, aircraft model, country from the ICAO hex range, and special livery from offline lists covering 6,008 operators and 2,755 type designators |
+| Operator and type enrichment | Fills in operator name, telephony, IATA code, aircraft model, country from the ICAO hex range, and special livery from offline lists covering 6,008 operators and 2,735 type designators |
 | Aircraft silhouettes | Resolves each aircraft's shape from its real ICAO class and engine configuration and sends it with the aircraft, so the device is not limited to the 91 callsign prefixes it can carry itself |
 | Airline logos | Fetches each operator's logo from logo.dev once for the whole deployment, keeps it on disk beside the database, and serves it from `/logo/callsign/<callsign>.png`, so a viewer never contacts logo.dev and the token never leaves the server |
 | Feeder client | `server/tools/` has a standard-library Python forwarder with a systemd unit, a Windows launcher, and a `--check` mode, for receiver software that cannot push SBS out on its own |
@@ -411,7 +411,7 @@ Map data is © OpenStreetMap contributors. The browser and LCD show attribution.
 
 **Operator, type and country lookups.** `server/reference/` holds offline lists that fill in what the feeds leave out: operator name, radio telephony and IATA code from the callsign prefix, aircraft manufacturer and model from the type designator, country from the ICAO hex address range, and special liveries by registration. The device gets all of it attached to the aircraft it was already fetching.
 
-The most useful part is the silhouette. The firmware can only carry 91 hand-written designator prefixes, so anything outside them drew a generic shape. The server derives the shape from real class and engine data for 2,755 designators and sends it, and the device prefers it over its own guess while keeping that guess as the fallback for anyone using a different provider.
+The most useful part is the silhouette. The firmware can only carry 91 hand-written designator prefixes, so anything outside them drew a generic shape. The server derives the shape from real class and engine data for 2,735 designators and sends it, and the device prefers it over its own guess while keeping that guess as the fallback for anyone using a different provider.
 
 That split is also a licensing decision: the provenance of those lists is not established, so they stay server-side and out of every released binary and the USB installer. `server/reference/README.md` records what each file is, why the work-in-progress type list is deliberately unused, and what needs resolving before commercial launch.
 

@@ -36,7 +36,7 @@ terms permit redistribution, or drop it.
 | --- | --- | --- |
 | `Airlines.csv` | 6,008 | ICAO code, name, country, radio telephony |
 | `ICAO.txt` | 96 | Richer: adds IATA code and active/defunct status. Applied second, so it wins where the two disagree |
-| `ICAOList.csv` | 2,755 | Type designator, class, engine configuration, manufacturer and model. Drives the silhouette |
+| `ICAOList.csv` | 2,735 | Type designator, class, engine configuration, manufacturer and model. Drives the silhouette. 2,767 rows, less `ZZZZ` and the 31 `ZZZZ-` prefixed rows |
 | `ICAOTypeConversion.csv` | 65 | Retired designators to current ones, e.g. CL61 to CL60 |
 | `ICAOHexRange.csv` | 189 | Hex address range to country. Preferred over registration prefixes because every aircraft has a hex |
 | `RegPrefixList.csv` | 244 | Country to registration prefix. **Not currently used** - the hex ranges cover the same ground more reliably |

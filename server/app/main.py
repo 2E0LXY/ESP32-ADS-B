@@ -72,7 +72,7 @@ async def startup():
     app.state.routes.start()
 
     # Operator names, aircraft models, countries and - most usefully - the
-    # silhouette for each of 2,755 type designators. Loaded once, here, so no
+    # silhouette for each of 2,735 type designators. Loaded once, here, so no
     # request pays for reading a CSV. See app/reference.py.
     app.state.reference = ReferenceData()
     app.state.reference.load()
