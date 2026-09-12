@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+{% block header_title %}Devices{% endblock %}
+{% block nav %}<a href="/admin">Dashboard</a><a href="/admin/logs">Logs</a><a href="/admin/settings">Settings</a><a href="/admin/system">System</a><a href="/admin/accounts">Accounts</a><a href="/admin/logout">Log out</a>{% endblock %}
+{% block content %}
+
+<div class="panel">
+<form method="get" action="/admin/devices">
+  <input class="input" type="search" name="q" value="{{ q }}" style="width:22em"
+         placeholder="name, account email, IP or firmware">
+  <button type="submit">Search</button>
+  {% if q %}<a href="/admin/devices" style="margin-left:10px;color:var(--cyan)">clear</a>{% endif %}
+</form>
+<p class="sub" style="margin-bottom:0">{{ devices | length }} shown of {{ total }} registered
+  (most recently seen first, 200 at most).</p>
+</div>
+
+<div class="panel">
+<table>
+<thead><tr>
+  <th>Device</th><th>Account</th><th>Last seen</th><th>Firmware</th><th>Address</th>
+  <th>Location</th><th>Keys</th><th>Feeder</th><th>Actions</th>
+</tr></thead>
+<tbody>
+{% for device in devices %}
+<tr>
+  <td>{{ device.name }}</td>
+  <td class="sub">{{ device.account.email }}{% if not device.account.is_active %}
+    <span class="badge bad">suspended</span>{% endif %}</td>
+  <td class="sub">{{ device.last_seen_at.strftime('%Y-%m-%d %H:%M') if device.last_seen_at else 'Never' }}</td>
+  <td class="sub">{{ device.firmware_version or '--' }}</td>
+  <td class="sub">{{ device.last_seen_ip or '--' }}</td>
+  <td class="sub">{{ device.location_str }}<br>{{ device.location_from }}</td>
+  <td>{% if device.active_key_count %}{{ device.active_key_count }}{% else %}
+    <span class="badge bad">none</span>{% endif %}</td>
+  <td class="sub">{% if device.feeder_enabled %}
+      <span class="badge ok">port {{ device.feeder_port }}</span>
+      {% if device.feeder_last_message_at %}<br>{{ device.feeder_last_message_at.strftime('%H:%M') }}{% endif %}
+    {% else %}off{% endif %}</td>
+  <td style="white-space:nowrap">
+    {% if device.active_key_count %}
+    <form method="post" action="/admin/devices/{{ device.id }}/revoke-keys" class="inline"
+          onsubmit="return confirm('Revoke {{ device.active_key_count }} key(s) for {{ device.name }}? Its receiver stops fetching aircraft until the owner issues a new key.')">
+      <button class="danger" type="submit">Revoke keys</button>
+    </form>
+    {% endif %}
+    {% if device.feeder_enabled %}
+    <form method="post" action="/admin/devices/{{ device.id }}/disable-feeder" class="inline"
+          onsubmit="return confirm('Stop accepting the feed from {{ device.name }}?')">
+      <button class="danger" type="submit">Stop feed</button>
+    </form>
+    {% endif %}
+  </td>
+</tr>
+{% else %}
+<tr><td colspan="9" class="sub">No devices match{% if q %} "{{ q }}"{% endif %}.</td></tr>
+{% endfor %}
+</tbody>
+</table>
+<p class="sub" style="margin-bottom:0">Revoking a device's keys cuts off that one receiver
+  without suspending its owner's whole account, which was the only lever before. Stopping a
+  feed closes its listener straight away rather than at the next restart - feeder ingestion
+  has no authentication beyond knowing the port, so a feed injecting nonsense needs to be
+  stoppable from here. Both are recorded in the <a href="/admin/audit-log">audit log</a>.</p>
+</div>
+
+{% endblock %}

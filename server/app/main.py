@@ -14,6 +14,7 @@ from .logos import LogoStore
 from .photos import PhotoStore
 from .reference import ReferenceData
 from .leader import Leadership
+from .log_buffer import install as install_log_buffer
 from .retention import UsageLogPruner
 from .runtime_settings import SettingsStore
 from .routers import admin, public
@@ -27,6 +28,9 @@ logging.basicConfig(level=logging.INFO)
 # were being buried by a library narrating its own success.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
+# Also keep the most recent lines in memory, so /admin/logs can show what
+# just happened without an SSH session. See app/log_buffer.py.
+log_ring = install_log_buffer()
 logger = logging.getLogger("main")
 
 DEBUG = os.environ.get("DEBUG") == "1"

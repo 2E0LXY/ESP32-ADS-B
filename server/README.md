@@ -122,6 +122,7 @@ raw data being pushed straight into this backend.
 - `app/leader.py` - which worker does the work that must only happen once
 - `app/retention.py` - prunes `usage_log` so it stops growing without bound
 - `app/runtime_settings.py` - the settings an operator can change from the admin panel
+- `app/log_buffer.py` - recent log lines in memory, for `/admin/logs`
 - `app/sbs.py` - SBS/BaseStation protocol decoder for incoming feeder connections
 - `app/feed_ingest.py` - per-device TCP listeners that accept customers' own feeds
 - `app/security.py` - password hashing, session tokens, API key generation/hashing
@@ -156,6 +157,21 @@ raw data being pushed straight into this backend.
 - **Password** - `/admin/password`. Until this existed the only admin
   password was `ADMIN_BOOTSTRAP_PASSWORD`, so it is still sitting in `.env`
   on the server; change it here and then clear that line.
+- **Devices** - `/admin/devices`. Every registered device, searchable by
+  name, account email, IP or firmware, with the two actions an operator
+  actually needs: revoke one device's API keys (cutting off a single
+  receiver without suspending its owner's whole account, which was the only
+  lever before) and stop accepting one receiver's raw feed. Stopping a feed
+  closes its listener immediately rather than at the next restart - feeder
+  ingestion has no authentication beyond knowing the port, so a feed
+  injecting nonsense has to be stoppable now. Both are audit-logged.
+- **Logs** - `/admin/logs`. The last few hundred log lines from the worker
+  that served the request, filterable by level and text, with optional
+  auto-refresh and a `logs.txt` view for pasting or grepping. Tracebacks are
+  kept whole, since `logger.exception()` is used throughout and the
+  traceback is the useful half. In memory and lost on restart: it answers
+  "what just happened" without an SSH session, and `docker compose logs`
+  remains the full history.
 - **Accounts** and **Audit log** as before.
 
 The environment variables in `.env.example` set where a *fresh* deployment

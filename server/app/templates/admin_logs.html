@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block header_title %}Logs{% endblock %}
+{% block nav %}<a href="/admin">Dashboard</a><a href="/admin/devices">Devices</a><a href="/admin/settings">Settings</a><a href="/admin/system">System</a><a href="/admin/audit-log">Audit log</a><a href="/admin/logout">Log out</a>{% endblock %}
+{% block content %}
+
+<div class="panel">
+<form method="get" action="/admin/logs">
+  <label for="level" style="display:inline;margin-right:6px">Level</label>
+  <select id="level" name="level">
+    {% for name in levels %}<option value="{{ name }}" {% if name == level %}selected{% endif %}>{{ name }}</option>{% endfor %}
+  </select>
+  <input class="input" type="search" name="q" value="{{ q }}" placeholder="contains..." style="width:16em">
+  <input class="input" type="number" name="limit" value="{{ limit }}" min="1" max="2000" style="width:6em">
+  <label for="refresh" style="display:inline;margin:0 6px">Auto-refresh</label>
+  <select id="refresh" name="refresh">
+    <option value="0" {% if not refresh %}selected{% endif %}>off</option>
+    <option value="5" {% if refresh == 5 %}selected{% endif %}>5s</option>
+    <option value="15" {% if refresh == 15 %}selected{% endif %}>15s</option>
+    <option value="60" {% if refresh == 60 %}selected{% endif %}>60s</option>
+  </select>
+  <button type="submit">Apply</button>
+  <a href="/admin/logs.txt?level={{ level }}&q={{ q }}" style="margin-left:10px;color:var(--cyan)">plain text</a>
+</form>
+<p class="sub" style="margin-bottom:0">
+  {{ counts.total }} line{{ '' if counts.total == 1 else 's' }} held
+  (last {{ capacity }}{% if dropped %}, {{ dropped }} older dropped{% endif %}),
+  {{ counts.warnings }} warning{{ '' if counts.warnings == 1 else 's' }},
+  {{ counts.errors }} error{{ '' if counts.errors == 1 else 's' }}.
+  In memory and lost on restart - <code>docker compose logs</code> is still the full history.
+  {% if shared_cache %}This is the buffer of the worker that answered ({{ worker }}); each
+  worker keeps its own.{% endif %}
+</p>
+</div>
+
+<div class="panel">
+<h2>Newest first</h2>
+{% if entries %}
+<table>
+<thead><tr><th style="width:11em">Time (UTC)</th><th style="width:6em">Level</th><th style="width:9em">Logger</th><th>Message</th></tr></thead>
+<tbody>
+{% for entry in entries %}
+<tr>
+  <td class="sub" style="white-space:nowrap">{{ entry.at_str }}</td>
+  <td>{% if entry.css_class %}<span class="badge {{ entry.css_class }}">{{ entry.level }}</span>{% else %}<span class="sub">{{ entry.level }}</span>{% endif %}</td>
+  <td class="sub">{{ entry.logger }}</td>
+  <td><pre style="margin:0;white-space:pre-wrap;word-break:break-word;font:inherit">{{ entry.message }}</pre></td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+{% else %}
+<p class="sub" style="margin-bottom:0">Nothing matches{% if q %} "{{ q }}"{% endif %}.</p>
+{% endif %}
+</div>
+
+{% if refresh %}
+<script>
+  // Re-requests the same filtered view. A meta refresh would lose the
+  // scroll position on every tick, which makes reading a traceback
+  // impossible.
+  setTimeout(function () { window.location.reload(); }, {{ refresh }} * 1000);
+</script>
+{% endif %}
+
+{% endblock %}

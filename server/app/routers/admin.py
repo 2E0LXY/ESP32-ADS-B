@@ -1,15 +1,16 @@
 import datetime
+import logging
 import os
 import shutil
 
 from fastapi import APIRouter, Depends, Form, Request, status
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
 
 from .. import models, security
 from ..aggregator import POLL_INTERVAL_SECONDS, Aggregator
-from .. import runtime_settings
+from .. import log_buffer, runtime_settings
 from ..cache import RedisAircraftCache
 from ..database import get_db
 from ..deps import get_current_admin
@@ -424,3 +425,184 @@ def admin_change_password(
     db.commit()
     _log(db, admin.email, "change_admin_password", admin.email)
     return back("Password changed", error=False)
+
+
+# --- logs --------------------------------------------------------------
+
+LOG_LEVELS = {"all": 0, "info": logging.INFO, "warning": logging.WARNING, "error": logging.ERROR}
+
+
+@router.get("/logs", response_class=HTMLResponse)
+def admin_logs(
+    request: Request,
+    admin: models.AdminUser = Depends(get_current_admin),
+    level: str = "all",
+    q: str = "",
+    limit: int = 300,
+    refresh: int = 0,
+):
+    """Recent log lines, so watching this service does not require SSH.
+
+    The container's own logs remain the full history; this is the last few
+    hundred lines of what just happened, reachable from the thing that
+    already knows who you are.
+    """
+    handler = log_buffer.handler()
+    entries = []
+    counts = {"total": 0, "warnings": 0, "errors": 0}
+    if handler is not None:
+        entries = handler.entries(
+            minimum_level=LOG_LEVELS.get(level, 0),
+            contains=q,
+            limit=max(1, min(limit, 2000)),
+        )
+        counts = handler.counts()
+    return templates.TemplateResponse(
+        request,
+        "admin_logs.html",
+        {
+            "entries": entries,
+            "counts": counts,
+            "level": level if level in LOG_LEVELS else "all",
+            "levels": list(LOG_LEVELS),
+            "q": q,
+            "limit": limit,
+            "refresh": refresh,
+            "capacity": getattr(handler, "capacity", 0),
+            "dropped": getattr(handler, "dropped", 0),
+            # Each worker keeps its own buffer, so with more than one this
+            # is whichever worker answered - worth saying rather than
+            # implying it is everything the service logged.
+            "shared_cache": getattr(getattr(request.app.state, "leadership", None), "shared", False),
+            "worker": getattr(getattr(request.app.state, "leadership", None), "identity", ""),
+        },
+    )
+
+
+@router.get("/logs.txt", response_class=PlainTextResponse)
+def admin_logs_text(
+    admin: models.AdminUser = Depends(get_current_admin),
+    level: str = "all",
+    q: str = "",
+    limit: int = 1000,
+):
+    """The same lines as plain text, for pasting into an issue or piping
+    through grep without opening a browser."""
+    handler = log_buffer.handler()
+    if handler is None:
+        return "no log buffer installed"
+    entries = handler.entries(minimum_level=LOG_LEVELS.get(level, 0), contains=q,
+                              limit=max(1, min(limit, 2000)))
+    return "\n".join(
+        f"{entry.at_str} {entry.level:<8} {entry.logger}: {entry.message}"
+        for entry in reversed(entries)  # oldest first, as a log file reads
+    )
+
+
+# --- devices -----------------------------------------------------------
+
+@router.get("/devices", response_class=HTMLResponse)
+def admin_devices(
+    request: Request,
+    admin: models.AdminUser = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+    q: str = "",
+    flash: str | None = None,
+    flash_error: int = 0,
+):
+    """Every device, searchable, with the actions an operator actually
+    needs.
+
+    The dashboard shows the twenty most recently active, which answers
+    "what is happening now" and nothing else - there was no way to find a
+    specific customer's receiver, or to do anything about it once found.
+    """
+    query = db.query(models.Device).join(models.Account)
+    needle = q.strip()
+    if needle:
+        like = f"%{needle}%"
+        query = query.filter(
+            models.Device.name.ilike(like)
+            | models.Account.email.ilike(like)
+            | models.Device.last_seen_ip.ilike(like)
+            | models.Device.firmware_version.ilike(like)
+        )
+    devices = query.order_by(models.Device.last_seen_at.desc().nullslast()).limit(200).all()
+    for device in devices:
+        location = device.location()
+        device.location_str = (
+            f"{location[0]:.3f}, {location[1]:.3f} @ {location[2]:.0f} nm" if location else "Unknown"
+        )
+        device.location_from = device.location_source()
+        device.active_key_count = (
+            db.query(models.ApiKey)
+            .filter(models.ApiKey.device_id == device.id, models.ApiKey.revoked_at.is_(None))
+            .count()
+        )
+    return templates.TemplateResponse(
+        request,
+        "admin_devices.html",
+        {"devices": devices, "q": q, "flash": flash, "flash_error": bool(flash_error),
+         "total": db.query(models.Device).count()},
+    )
+
+
+def _device_or_none(db: Session, device_id: int):
+    return db.query(models.Device).filter(models.Device.id == device_id).first()
+
+
+@router.post("/devices/{device_id}/revoke-keys")
+def admin_revoke_device_keys(
+    device_id: int,
+    admin: models.AdminUser = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    """Cuts a single receiver off without suspending its owner's whole
+    account - the only lever that existed before."""
+    device = _device_or_none(db, device_id)
+    if device is None:
+        return RedirectResponse("/admin/devices?flash=No such device&flash_error=1",
+                                status_code=status.HTTP_303_SEE_OTHER)
+    revoked = (
+        db.query(models.ApiKey)
+        .filter(models.ApiKey.device_id == device.id, models.ApiKey.revoked_at.is_(None))
+        .all()
+    )
+    now = datetime.datetime.now(datetime.timezone.utc)
+    for key in revoked:
+        key.revoked_at = now
+    db.commit()
+    _log(db, admin.email, "revoke_device_keys", f"device:{device.id}",
+         f"{len(revoked)} key(s) for {device.name}")
+    return RedirectResponse(
+        f"/admin/devices?flash=Revoked {len(revoked)} key(s) for {device.name}",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@router.post("/devices/{device_id}/disable-feeder")
+async def admin_disable_device_feeder(
+    request: Request,
+    device_id: int,
+    admin: models.AdminUser = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    """Stops accepting one receiver's raw feed.
+
+    Feeder ingestion has no authentication beyond knowing the port, so a
+    feed injecting nonsense is something an operator has to be able to stop
+    from here rather than by editing the database.
+    """
+    device = _device_or_none(db, device_id)
+    if device is None or not device.feeder_enabled:
+        return RedirectResponse("/admin/devices?flash=Feeder was not enabled&flash_error=1",
+                                status_code=status.HTTP_303_SEE_OTHER)
+    port = device.feeder_port
+    device.feeder_enabled = False
+    db.commit()
+    # Close the listener now: leaving it bound would keep accepting the
+    # feed this call was meant to stop.
+    await request.app.state.feed_ingest.stop_for_device(port)
+    _log(db, admin.email, "disable_device_feeder", f"device:{device.id}", f"port {port}")
+    return RedirectResponse(f"/admin/devices?flash=Feeder disabled for {device.name}",
+                            status_code=status.HTTP_303_SEE_OTHER)
