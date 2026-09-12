@@ -3477,11 +3477,16 @@ void renderScreensaverPage() {
   // The signature covers everything this page actually draws for the
   // selected aircraft; anything not in it cannot change the picture.
 
-  // The no-aircraft frame is otherwise empty, and an empty panel is exactly
-  // when someone wants to know where the admin interface lives - there is
-  // nothing else on screen to read it off. Worked out before the signature
-  // below so a reconnect or a new DHCP lease repaints rather than leaving a
-  // stale address on a page that never otherwise changes.
+  // The screensaver is the one page with no header, so it is also the one
+  // place the admin address cannot be read off the screen. It goes in the
+  // top corner of both frames: the empty one, where there is nothing else to
+  // read, and the departure board, where the top band above the operator
+  // tile is unused anyway.
+  //
+  // Worked out before the signature below and mixed into it, so a reconnect
+  // or a new DHCP lease repaints. Without that this page skips its repaint
+  // whenever the frame would be identical and a stale address would sit
+  // there indefinitely.
   char address[40];
   if (WiFi.status() == WL_CONNECTED)
     snprintf(address, sizeof(address), "%s", WiFi.localIP().toString().c_str());
@@ -3496,7 +3501,7 @@ void renderScreensaverPage() {
     for (const char *c = text; *c; ++c) mix(static_cast<uint8_t>(*c));
   };
   mix(static_cast<uint32_t>(overheadCount));
-  if (overheadCount == 0) mixText(address);
+  mixText(address);
   if (overheadCount > 0) {
     const AircraftDisplay &shown = latestAircraft[overheadMatches[screensaverAircraftIndex % overheadCount]];
     mixText(shown.hex);
@@ -3522,14 +3527,21 @@ void renderScreensaverPage() {
   screensaverNeedsRedraw = false;
 
   filledRect(0, 0, W, H, rgb(0, 0, 0));
-  if (overheadCount == 0) {
-    // Right-aligned in the top corner. Each glyph advances 6*scale with the
-    // last column of that advance being the gap to the next character, so
-    // the drawn width is one scale unit narrower than the advance total.
+
+  // Right-aligned in the top corner. Each glyph advances 6*scale with the
+  // last column of that advance being the gap to the next character, so the
+  // drawn width is one scale unit narrower than the advance total.
+  //
+  // Sits above the operator tile, which starts at margin + H/24, so it
+  // clears the board's own first line on either panel size.
+  {
     const int addressScale = W >= 800 ? 2 : 1;
     const int addressWidth = static_cast<int>(strlen(address)) * 6 * addressScale - addressScale;
     const int edge = W / 40;
     text5(W - edge - addressWidth, edge, address, rgb(120, 140, 160), addressScale);
+  }
+
+  if (overheadCount == 0) {
     text5(20, H / 2 - 6, "NO OVERHEAD AIRCRAFT", rgb(120, 140, 160), 2);
     text5(20, H / 2 + 24, "TAP OR SWIPE TO RETURN", rgb(70, 90, 110));
     present();
