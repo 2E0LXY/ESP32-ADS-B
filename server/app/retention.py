@@ -41,9 +41,10 @@ from . import models
 
 logger = logging.getLogger("retention")
 
-# How much history to keep. Usage rows exist for quotas, abuse
-# investigation and "is this receiver actually working" - all questions
-# about recent behaviour. A month is generous for all three.
+# How much history to keep, for a fresh deployment. After that the admin
+# panel owns it - see app/runtime_settings.py. Usage rows exist for quotas,
+# abuse investigation and "is this receiver actually working", all questions
+# about recent behaviour, so a month is generous for all three.
 RETENTION_DAYS = int(os.environ.get("USAGE_LOG_RETENTION_DAYS", "30"))
 # Rows per DELETE. Small enough that the writer lock is held for
 # milliseconds, large enough to clear a day's backlog from a big fleet in a
@@ -127,8 +128,11 @@ def prune_usage_log(db, retention_days: int = RETENTION_DAYS, batch_rows: int = 
 class UsageLogPruner:
     """Background task that runs prune_usage_log on a schedule."""
 
-    def __init__(self, session_factory):
+    def __init__(self, session_factory, settings=None):
         self._session_factory = session_factory
+        # The retention window is editable from the admin panel; with no
+        # store this is the environment default, as before.
+        self._settings = settings
         self._task: asyncio.Task | None = None
         self.last_removed = 0
         self.total_removed = 0
@@ -143,6 +147,8 @@ class UsageLogPruner:
             self._task = None
 
     async def run_once(self) -> int:
+        days = self._settings.get("usage_log_retention_days") if self._settings else RETENTION_DAYS
+
         def work() -> int:
             db = self._session_factory()
             try:
@@ -150,7 +156,8 @@ class UsageLogPruner:
                 # importantly, releases SQLite's writer lock between
                 # batches, so device polls interleave with a backlog clear
                 # instead of queueing behind it.
-                return prune_usage_log(db, on_batch=lambda _n: time.sleep(BATCH_PAUSE_SECONDS))
+                return prune_usage_log(db, retention_days=days,
+                                       on_batch=lambda _n: time.sleep(BATCH_PAUSE_SECONDS))
             finally:
                 db.close()
 
@@ -162,7 +169,7 @@ class UsageLogPruner:
         self.total_removed += removed
         self.last_run_at = datetime.datetime.now(datetime.timezone.utc)
         if removed:
-            logger.info("pruned %d usage_log rows older than %d days", removed, RETENTION_DAYS)
+            logger.info("pruned %d usage_log rows older than %d days", removed, days)
         return removed
 
     async def _loop(self):

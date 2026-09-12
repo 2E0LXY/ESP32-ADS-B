@@ -121,6 +121,7 @@ raw data being pushed straight into this backend.
 - `app/cache.py` - the aircraft cache: in-process by default, Redis when shared
 - `app/leader.py` - which worker does the work that must only happen once
 - `app/retention.py` - prunes `usage_log` so it stops growing without bound
+- `app/runtime_settings.py` - the settings an operator can change from the admin panel
 - `app/sbs.py` - SBS/BaseStation protocol decoder for incoming feeder connections
 - `app/feed_ingest.py` - per-device TCP listeners that accept customers' own feeds
 - `app/security.py` - password hashing, session tokens, API key generation/hashing
@@ -128,6 +129,38 @@ raw data being pushed straight into this backend.
 - `app/routers/admin.py` - admin login, dashboard, account management, audit log
 - SQLite by default (`DATABASE_URL` in `.env`) - fine at this scale; point at
   Postgres later if it's ever needed, nothing else here is SQLite-specific.
+
+## Admin panel
+
+`/admin` (separate login from customer accounts):
+
+- **Dashboard** - upstream source health, including sources that are
+  switched off rather than failing; cache size; recently active devices
+  with firmware, address, location, last result, polls in 24h and feeder
+  state.
+- **Settings** - `/admin/settings`. Poll interval, maximum polling areas
+  and area radius, which upstream sources are polled, usage-history
+  retention and whether aircraft photos are fetched. These take effect
+  immediately: no restart, so no feeder connection is dropped. Values are
+  validated (a poll interval of zero would hammer three free public APIs in
+  a tight loop), a bad value rejects the whole submission rather than
+  half-applying it, and every change is written to the audit log. There is
+  also a "prune usage history now" button for when the retention window has
+  just been shortened.
+- **System** - `/admin/system`. What this process is actually doing: cache
+  mode, whether Redis is reachable, which worker holds the polling role,
+  database and image-cache sizes, disk free, reference-data counts, feeder
+  listeners. It also lists, explicitly, what **cannot** be changed without a
+  restart and why - `REDIS_URL` and the worker count are read once at
+  startup, so a switch there would be lying.
+- **Password** - `/admin/password`. Until this existed the only admin
+  password was `ADMIN_BOOTSTRAP_PASSWORD`, so it is still sitting in `.env`
+  on the server; change it here and then clear that line.
+- **Accounts** and **Audit log** as before.
+
+The environment variables in `.env.example` set where a *fresh* deployment
+starts. Once a setting has been saved in the panel, the stored value wins -
+editing `.env` and restarting will not undo it.
 
 ## Capacity, measured
 

@@ -35,6 +35,7 @@ from .cache import (  # re-exported: all of these lived here before the cache mo
 )
 from .cache import distance_nm as _distance_nm
 from .models import FeederKey, FeederProvider
+from .runtime_settings import SettingsStore
 
 logger = logging.getLogger("aggregator")
 
@@ -52,6 +53,9 @@ SOURCE_BACKOFF_MAX_SECONDS = 15 * 60
 # is already overhead; and nobody gets to make the aggregator poll the whole
 # hemisphere.
 MIN_POLL_RADIUS_NM = 25.0
+# The starting values for the editable settings of the same name. Once a
+# deployment is running, the admin panel decides these - see
+# app/runtime_settings.py.
 MAX_POLL_RADIUS_NM = 250.0
 # Each region is one request per upstream per cycle. Beyond this many the
 # regions are rotated across cycles instead.
@@ -65,6 +69,9 @@ MAX_POLL_REGIONS = int(os.environ.get("MAX_POLL_REGIONS", "6"))
 # somebody could fix, nor keep spending requests at someone else's server
 # to re-learn the same answer. Clear this variable to try it again if their
 # access rules change.
+# Only the default for whether each source is polled; after first boot the
+# admin panel's per-source switches decide, and this is what a fresh
+# database starts from.
 DISABLED_SOURCES = {
     name.strip()
     for name in os.environ.get("DISABLED_SOURCES", "airplaneslive").split(",")
@@ -84,21 +91,28 @@ class SourceHealth:
 
 class Aggregator:
     def __init__(self, home_lat: float, home_lon: float, home_radius_nm: float, session_factory,
-                 cache=None, leadership=None):
+                 cache=None, leadership=None, settings=None):
         self.cache = cache if cache is not None else build_cache()
         # Only the leader polls upstream. Without this, running N workers
         # would ask each community API for the same sky N times every
         # cycle. None means "always the leader", which is what a
         # single-process deployment is - see app/leader.py.
         self._leadership = leadership
+        # Editable from the admin panel rather than only from .env plus a
+        # restart - see app/runtime_settings.py. A store with no session
+        # factory serves the environment defaults and never reads a
+        # database, which is what a caller passing nothing gets.
+        self.settings = settings if settings is not None else SettingsStore()
         self.home_lat = home_lat
         self.home_lon = home_lon
         self.home_radius_nm = home_radius_nm
         self._session_factory = session_factory
+        # Every source, whether or not it is currently polled: a source
+        # turned back on in the admin panel needs somewhere to record its
+        # first attempt, and the dashboard should show a disabled source as
+        # disabled rather than omitting it and implying it does not exist.
         self._health: dict[str, SourceHealth] = {
-            name: SourceHealth(name)
-            for name in ("adsbfi", "airplaneslive", "adsblol")
-            if name not in DISABLED_SOURCES
+            name: SourceHealth(name) for name in ("adsbfi", "airplaneslive", "adsblol")
         }
         self._feeder_cycle: dict[FeederProvider, itertools.cycle] = {}
         self._region_cursor = 0
@@ -117,6 +131,8 @@ class Aggregator:
         receivers is one area to an upstream API, and asking three times for
         the same sky is rude to a free service and no more useful.
         """
+        max_radius = self.settings.get("max_poll_radius_nm")
+        max_regions = self.settings.get("max_poll_regions")
         db = self._session_factory()
         try:
             devices = db.query(models.Device).all()
@@ -128,7 +144,7 @@ class Aggregator:
 
         merged: list[tuple[float, float, float]] = []
         for lat, lon, radius in located:
-            radius = max(MIN_POLL_RADIUS_NM, min(radius, MAX_POLL_RADIUS_NM))
+            radius = max(MIN_POLL_RADIUS_NM, min(radius, max_radius))
             for index, (mlat, mlon, mradius) in enumerate(merged):
                 if _distance_nm(lat, lon, mlat, mlon) <= max(radius, mradius):
                     # Cover both from one point, widened enough to still
@@ -137,21 +153,21 @@ class Aggregator:
                     merged[index] = (
                         (lat + mlat) / 2,
                         (lon + mlon) / 2,
-                        min(MAX_POLL_RADIUS_NM, max(radius, mradius) + separation / 2),
+                        min(max_radius, max(radius, mradius) + separation / 2),
                     )
                     break
             else:
                 merged.append((lat, lon, radius))
 
-        if len(merged) > MAX_POLL_REGIONS:
+        if len(merged) > max_regions:
             # Every region costs a request to each upstream on every cycle.
             # Past this many, rotate through them across cycles rather than
             # multiplying the load on free APIs without limit; a device's
             # area is then refreshed less often, not dropped.
             start = self._region_cursor % len(merged)
-            self._region_cursor += MAX_POLL_REGIONS
+            self._region_cursor += max_regions
             rotated = merged[start:] + merged[:start]
-            return rotated[:MAX_POLL_REGIONS]
+            return rotated[:max_regions]
         return merged
 
     def health(self) -> dict[str, SourceHealth]:
@@ -181,6 +197,11 @@ class Aggregator:
                     # dashboard reads, leader or not; it is one cheap read
                     # and a follower's dashboard should not show zero.
                     await self.cache.refresh_size()
+                    # Pick up admin-panel changes. The worker that made the
+                    # change applied it immediately; this is how the others
+                    # find out, within one cycle. In a thread because every
+                    # statement in reload() is blocking SQLAlchemy.
+                    await asyncio.to_thread(self.settings.reload)
                 except asyncio.CancelledError:
                     raise
                 except Exception:  # noqa: BLE001
@@ -189,7 +210,7 @@ class Aggregator:
                     # the process, and the only symptom was a service that
                     # quietly returned fewer and fewer aircraft.
                     logger.exception("poll cycle failed")
-                await asyncio.sleep(POLL_INTERVAL_SECONDS)
+                await asyncio.sleep(self.settings.get("poll_interval_seconds"))
 
     def _next_feeder_credential(self, provider: FeederProvider) -> str | None:
         """Round-robins across enabled donated keys for this provider.
@@ -236,7 +257,7 @@ class Aggregator:
             return [(self.home_lat, self.home_lon, self.home_radius_nm)]
 
     def source_enabled(self, name: str) -> bool:
-        return name in self._health
+        return self.settings.source_enabled(name)
 
     def _source_is_backed_off(self, name: str) -> bool:
         """True while a repeatedly failing source is being left alone.
@@ -253,15 +274,15 @@ class Aggregator:
             return False
         delay = min(
             SOURCE_BACKOFF_MAX_SECONDS,
-            POLL_INTERVAL_SECONDS * (2 ** min(health.consecutive_errors, 12)),
+            self.settings.get("poll_interval_seconds") * (2 ** min(health.consecutive_errors, 12)),
         )
         return time.time() - (health.last_attempt or 0) < delay
 
     async def _record(self, name: str, coro):
-        health = self._health.get(name)
-        if health is None:  # disabled - see DISABLED_SOURCES
-            coro.close()
+        if not self.source_enabled(name):
+            coro.close()  # never awaited, so close it rather than leak a warning
             return
+        health = self._health[name]
         if self._source_is_backed_off(name):
             coro.close()  # never awaited, so close it rather than leak a warning
             return
@@ -288,7 +309,7 @@ class Aggregator:
                 )
 
     async def _poll_adsbfi(self, client: httpx.AsyncClient, regions):
-        if "adsbfi" in DISABLED_SOURCES:
+        if not self.source_enabled("adsbfi"):
             return
         for lat, lon, radius in regions:
             url = (
@@ -298,7 +319,7 @@ class Aggregator:
             await self._record("adsbfi", self._fetch(client, url, "ac"))
 
     async def _poll_airplaneslive(self, client: httpx.AsyncClient, regions):
-        if "airplaneslive" in DISABLED_SOURCES:
+        if not self.source_enabled("airplaneslive"):
             return
         # No feeder-key pooling here yet: airplanes.live's own API doesn't
         # take a bearer/query-param key today (access is IP/account based on
@@ -309,7 +330,7 @@ class Aggregator:
             await self._record("airplaneslive", self._fetch(client, url, "ac"))
 
     async def _poll_adsblol(self, client: httpx.AsyncClient, regions):
-        if "adsblol" in DISABLED_SOURCES:
+        if not self.source_enabled("adsblol"):
             return
         for lat, lon, radius in regions:
             url = f"https://api.adsb.lol/v2/point/{lat}/{lon}/{radius:.0f}"

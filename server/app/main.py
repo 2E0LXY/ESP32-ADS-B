@@ -14,7 +14,8 @@ from .logos import LogoStore
 from .photos import PhotoStore
 from .reference import ReferenceData
 from .leader import Leadership
-from .retention import RETENTION_DAYS, UsageLogPruner
+from .retention import UsageLogPruner
+from .runtime_settings import SettingsStore
 from .routers import admin, public
 
 logging.basicConfig(level=logging.INFO)
@@ -72,6 +73,13 @@ async def startup():
     finally:
         db.close()
 
+    # Settings an operator can change from the admin panel rather than by
+    # editing .env over SSH and restarting - which drops every feeder
+    # connection. The environment still sets where a fresh deployment
+    # starts. See app/runtime_settings.py.
+    app.state.settings = SettingsStore(SessionLocal)
+    app.state.settings.reload()
+
     # The aircraft cache. In-process unless REDIS_URL is set, in which case
     # every worker shares one view of the sky - see app/cache.py for why the
     # in-process dict was the ceiling on this deployment.
@@ -90,7 +98,8 @@ async def startup():
     home_radius_nm = float(os.environ.get("HOME_RADIUS_NM", "50"))
     app.state.aggregator = Aggregator(home_lat, home_lon, home_radius_nm, SessionLocal,
                                       cache=app.state.cache,
-                                      leadership=app.state.leadership)
+                                      leadership=app.state.leadership,
+                                      settings=app.state.settings)
     app.state.aggregator.start()
 
     # Resolves callsign -> route on behalf of every device, so the ESP32
@@ -117,7 +126,7 @@ async def startup():
     # Aircraft type photographs, CC0 and public-domain-mark only, cropped to
     # the panel's band and cached on disk. See app/photos.py for why the
     # licence restriction rules out Wikimedia Commons for civil types.
-    app.state.photos = PhotoStore()
+    app.state.photos = PhotoStore(settings=app.state.settings)
     app.state.photos.start()
 
     # One usage_log row is written per device poll and nothing ever deleted
@@ -125,8 +134,9 @@ async def startup():
     # filled the disk. See app/retention.py.
     # Leader-only: several workers all deleting the same expired rows is
     # wasted writes against SQLite's single writer lock, not extra safety.
-    app.state.usage_pruner = UsageLogPruner(SessionLocal)
-    logger.info("usage_log retention: %d days", RETENTION_DAYS)
+    app.state.usage_pruner = UsageLogPruner(SessionLocal, settings=app.state.settings)
+    logger.info("usage_log retention: %d days",
+                app.state.settings.get("usage_log_retention_days"))
 
     app.state.feed_ingest = FeedIngestManager(app.state.aggregator, SessionLocal)
 

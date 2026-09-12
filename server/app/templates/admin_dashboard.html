@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% block header_title %}Admin{% endblock %}
-{% block nav %}<a href="/admin/accounts">Accounts</a><a href="/admin/audit-log">Audit log</a><a href="/admin/logout">Log out</a>{% endblock %}
+{% block nav %}<a href="/admin/settings">Settings</a><a href="/admin/system">System</a><a href="/admin/accounts">Accounts</a><a href="/admin/audit-log">Audit log</a><a href="/admin/password">Password</a><a href="/admin/logout">Log out</a>{% endblock %}
 {% block content %}
 
 <div class="panel">
@@ -11,10 +11,10 @@
 {% for name, h in health.items() %}
 <tr>
 <td>{{ name }}</td>
-<td>{% if h.ok %}<span class="badge ok">Up</span>{% else %}<span class="badge bad">Down</span>{% endif %}</td>
+<td>{% if not h.enabled %}<span class="badge">Off</span>{% elif h.ok %}<span class="badge ok">Up</span>{% else %}<span class="badge bad">Down</span>{% endif %}</td>
 <td>{{ h.last_success_str }}</td>
 <td>{{ h.consecutive_errors }}</td>
-<td class="sub">{{ h.last_error or '--' }}</td>
+<td class="sub">{% if not h.enabled %}not polled - turn on in <a href="/admin/settings">Settings</a>{% else %}{{ h.last_error or '--' }}{% endif %}</td>
 </tr>
 {% endfor %}
 </tbody>

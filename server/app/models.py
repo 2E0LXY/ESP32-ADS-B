@@ -198,6 +198,21 @@ class AuditLog(Base):
     detail = Column(Text, nullable=True)
 
 
+class Setting(Base):
+    """An operator-editable setting, overriding the environment default.
+
+    Only settings that can take effect while the service runs live here -
+    see app/runtime_settings.py for why the worker count and REDIS_URL
+    deliberately do not."""
+
+    __tablename__ = "settings"
+
+    key = Column(String(64), primary_key=True)
+    value = Column(String(255), nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+    updated_by = Column(String(255), nullable=True)
+
+
 class UsageLog(Base):
     """One row per /v1/aircraft request, for quotas, abuse detection, and
     per-device activity in the admin panel.

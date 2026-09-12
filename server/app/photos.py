@@ -49,6 +49,9 @@ FREE_LICENCES = "cc0,pdm"
 USER_AGENT = "2E0LXY-ADSB-Aggregator/1.0 (+https://github.com/2E0LXY/ESP32-ADS-B)"
 
 CACHE_DIR = os.environ.get("PHOTO_CACHE_DIR", "/data/photos")
+# The default for a fresh deployment; the admin panel owns it after that
+# (see app/runtime_settings.py), which is why PhotoStore.enabled() exists
+# rather than every caller reading this constant.
 PHOTOS_ENABLED = os.environ.get("AIRCRAFT_PHOTOS", "1") != "0"
 # The panel draws these in a landscape band, so one shape at a few widths.
 ALLOWED_WIDTHS = (160, 240, 320)
@@ -114,9 +117,13 @@ def _is_plausible_photo(result: dict, model: str) -> tuple[bool, str]:
 
 
 class PhotoStore:
-    def __init__(self, cache_dir: str = CACHE_DIR, enabled: bool = PHOTOS_ENABLED):
+    def __init__(self, cache_dir: str = CACHE_DIR, enabled: bool = PHOTOS_ENABLED,
+                 settings=None):
         self._dir = cache_dir
         self._enabled = enabled
+        # Switchable from the admin panel without a restart. The
+        # constructor argument stays the default and what the tests use.
+        self._settings = settings
         self._client: httpx.AsyncClient | None = None
         # A search that fails is not cached as a miss, so a systemic failure
         # - the host unreachable from this deployment, say - retries for ever
@@ -180,6 +187,8 @@ class PhotoStore:
         self.queued_now = len(self._queued)
 
     def configured(self) -> bool:
+        if self._settings is not None:
+            return bool(self._settings.get("aircraft_photos"))
         return self._enabled
 
     def _paths(self, designator: str, width: int) -> tuple[str, str, str]:
@@ -194,7 +203,7 @@ class PhotoStore:
         it did before.
         """
         code = (designator or "").strip().upper()
-        if not self._enabled or not DESIGNATOR_PATTERN.match(code) or not model:
+        if not self.configured() or not DESIGNATOR_PATTERN.match(code) or not model:
             return None
         if width not in ALLOWED_WIDTHS:
             width = DEFAULT_WIDTH
@@ -307,7 +316,7 @@ class PhotoStore:
 
     def stats(self) -> dict:
         return {
-            "enabled": self._enabled,
+            "enabled": self.configured(),
             "hits": self.hits,
             "fetches": self.fetches,
             "misses": self.misses,
