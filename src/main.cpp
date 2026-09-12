@@ -1052,6 +1052,121 @@ String previousWifiSsid;
 String previousWifiPassword;
 uint32_t wifiRollbackAt = 0;
 
+// Saved Wi-Fi networks, most recently connected first.
+//
+// The ESP32 remembers exactly one network, so moving the receiver between
+// two places - a house and a club site, a bench and a shed - meant retyping
+// a password every time even though it had been entered before. These are
+// kept alongside that, as a fallback: the stock autoConnect() path is tried
+// first and unchanged, and this list is only walked when it fails or when a
+// working connection is lost for long enough to look permanent.
+//
+// Stored as one JSON string rather than numbered key pairs so adding,
+// removing and reordering is a single NVS write and cannot leave a
+// half-updated set of slots behind.
+constexpr int MAX_SAVED_NETWORKS = 6;
+constexpr uint32_t WIFI_RETRY_AFTER_MS = 60000UL;   // how long disconnected before walking the list
+constexpr uint32_t WIFI_JOIN_TIMEOUT_MS = 12000UL;  // per network, while walking it
+uint32_t wifiDisconnectedSince = 0;
+
+String savedNetworksJson() {
+  return settingsStore.getString("wifi-nets", "[]");
+}
+
+// SSIDs only. A password that has been stored is never sent back out, the
+// same rule the provider credentials follow.
+void savedNetworkNames(JsonArray out) {
+  JsonDocument doc;
+  if (deserializeJson(doc, savedNetworksJson()) != DeserializationError::Ok) return;
+  for (JsonObjectConst entry : doc.as<JsonArrayConst>()) {
+    const char *ssid = entry["s"];
+    // String, not the const char*: that pointer is into this function's own
+    // document, which dies on return, and ArduinoJson would have kept the
+    // pointer rather than the text.
+    if (ssid && *ssid) out.add(String(ssid));
+  }
+}
+
+void rememberWifiNetwork(const String &ssid, const String &password) {
+  if (!ssid.length()) return;
+  JsonDocument stored;
+  if (deserializeJson(stored, savedNetworksJson()) != DeserializationError::Ok)
+    stored.to<JsonArray>();
+
+  JsonDocument updated;
+  JsonArray list = updated.to<JsonArray>();
+  // This network goes to the front: the most recently working credentials
+  // are the ones worth trying first next time.
+  JsonObject first = list.add<JsonObject>();
+  first["s"] = ssid;
+  first["p"] = password;
+  for (JsonObjectConst entry : stored.as<JsonArrayConst>()) {
+    if (list.size() >= MAX_SAVED_NETWORKS) break;
+    const char *existing = entry["s"];
+    if (!existing || !*existing || ssid == existing) continue;  // no duplicates
+    JsonObject copy = list.add<JsonObject>();
+    copy["s"] = existing;
+    copy["p"] = entry["p"] | "";
+  }
+  String payload;
+  serializeJson(list, payload);
+  settingsStore.putString("wifi-nets", payload);
+}
+
+bool forgetWifiNetwork(const String &ssid) {
+  JsonDocument stored;
+  if (deserializeJson(stored, savedNetworksJson()) != DeserializationError::Ok) return false;
+  JsonDocument updated;
+  JsonArray list = updated.to<JsonArray>();
+  bool removed = false;
+  for (JsonObjectConst entry : stored.as<JsonArrayConst>()) {
+    const char *existing = entry["s"];
+    if (!existing || !*existing) continue;
+    if (ssid == existing) { removed = true; continue; }
+    JsonObject copy = list.add<JsonObject>();
+    copy["s"] = existing;
+    copy["p"] = entry["p"] | "";
+  }
+  if (!removed) return false;
+  String payload;
+  serializeJson(list, payload);
+  settingsStore.putString("wifi-nets", payload);
+  return true;
+}
+
+// Tries each saved network in turn. Blocking, by design: it only ever runs
+// when there is no connection, so there is nothing else for this core to
+// usefully do, and a non-blocking state machine here would be a lot of
+// machinery for a path taken once per outage.
+bool connectSavedWifiNetwork() {
+  JsonDocument doc;
+  if (deserializeJson(doc, savedNetworksJson()) != DeserializationError::Ok) return false;
+  for (JsonObjectConst entry : doc.as<JsonArrayConst>()) {
+    // The station can come back on its own part way through - the router
+    // rebooted, the link recovered. Stop rather than spend the rest of the
+    // list tearing down a connection that just succeeded. This also bounds
+    // the common case well below the whole list's worth of timeouts, which
+    // matters because this task also services the web server.
+    if (WiFi.status() == WL_CONNECTED) return true;
+    const char *ssid = entry["s"];
+    if (!ssid || !*ssid) continue;
+    const char *password = entry["p"] | "";
+    Serial.printf("Wi-Fi: trying saved network %s\n", ssid);
+    WiFi.begin(ssid, password);
+    const uint32_t deadline = millis() + WIFI_JOIN_TIMEOUT_MS;
+    while (static_cast<int32_t>(millis() - deadline) < 0) {
+      if (WiFi.status() == WL_CONNECTED) {
+        Serial.printf("Wi-Fi: connected to saved network %s\n", ssid);
+        // Re-save so a network that actually works moves to the front.
+        rememberWifiNetwork(ssid, password);
+        return true;
+      }
+      delay(250);
+    }
+  }
+  return false;
+}
+
 // Certificate validation for every outbound HTTPS request. The OTA image is
 // separately RSA-signed, but the RapidAPI key and the OpenSky client secret
 // were previously sent over an unauthenticated channel. Build with
@@ -4803,6 +4918,35 @@ void handleWifiConnect() {
   WiFi.begin(ssid.c_str(), password.c_str());
 }
 
+void handleWifiSavedNetworks() {
+  if (!requireWebAuthentication()) return;
+  JsonDocument doc;
+  savedNetworkNames(doc["saved"].to<JsonArray>());
+  doc["max"] = MAX_SAVED_NETWORKS;
+  doc["current"] = WiFi.status() == WL_CONNECTED ? WiFi.SSID() : "";
+  String payload;
+  serializeJson(doc, payload);
+  sendJson(200, payload);
+}
+
+void handleWifiForgetNetwork() {
+  if (!requireWebAuthentication()) return;
+  if (!requireCsrfToken()) return;
+  const String ssid = webServer.arg("ssid");
+  if (!ssid.length()) {
+    sendMessage(400, "Name the network to forget");
+    return;
+  }
+  if (!forgetWifiNetwork(ssid)) {
+    sendMessage(404, "That network is not saved");
+    return;
+  }
+  // Deliberately does not disconnect. Forgetting the network the receiver
+  // is currently on should stop it being rejoined automatically later, not
+  // drop the connection the person is using to say so.
+  sendMessage(200, "Network forgotten");
+}
+
 void handlePageControl() {
   if (!requireWebAuthentication()) return;
   if (!requireCsrfToken()) return;
@@ -5265,6 +5409,8 @@ void beginWebControl() {
     webServer.on("/api/wifi/scan", HTTP_POST, handleWifiScanStart);
     webServer.on("/api/wifi/results", HTTP_GET, handleWifiScanResults);
     webServer.on("/api/wifi/connect", HTTP_POST, handleWifiConnect);
+    webServer.on("/api/wifi/saved", HTTP_GET, handleWifiSavedNetworks);
+    webServer.on("/api/wifi/forget", HTTP_POST, handleWifiForgetNetwork);
     webServer.on("/api/password", HTTP_POST, handlePasswordChange);
     webServer.on("/api/provider", HTTP_POST, handleProviderSettings);
     webServer.on("/api/marine/credentials", HTTP_POST, handleMarineCredentials);
@@ -5741,6 +5887,30 @@ void networkTask(void *) {
       previousWifiSsid = "";
       previousWifiPassword = "";
     }
+    // One place to record a network that works, whichever route got us
+    // there: the boot autoConnect, the setup portal, or the Wi-Fi page. The
+    // alternative was remembering at each of those call sites and missing
+    // one.
+    if (WiFi.status() == WL_CONNECTED) {
+      wifiDisconnectedSince = 0;
+      static String lastRemembered;
+      const String current = WiFi.SSID();
+      if (current.length() && current != lastRemembered) {
+        lastRemembered = current;
+        rememberWifiNetwork(current, WiFi.psk());
+      }
+    } else if (!wifiRollbackAt) {
+      // Not while a rollback is pending - that already has a network in
+      // mind and walking the list would fight it.
+      const uint32_t now = millis();
+      // Zero means "not currently disconnected", so the one tick per ~49
+      // days where millis() is genuinely 0 borrows the next millisecond.
+      if (!wifiDisconnectedSince) wifiDisconnectedSince = now ? now : 1;
+      else if (now - wifiDisconnectedSince >= WIFI_RETRY_AFTER_MS) {
+        wifiDisconnectedSince = 0;
+        connectSavedWifiNetwork();
+      }
+    }
     if (restartPending && static_cast<int32_t>(millis() - restartAt) >= 0) {
       delay(100);
       ESP.restart();
@@ -6011,9 +6181,15 @@ void setup() {
   });
   renderBootScreen("Wi-Fi connecting - please wait", rgb(53,169,244));
   if (!wm.autoConnect("ADSB_WIFI")) {
-    renderBootScreen("Wi-Fi failed - setup required", rgb(255,65,65));
-    delay(5000);
-    restoreMap(); status("WIFI",rgb(245,30,35)); present();
+    // autoConnect only knows the one network the ESP32 itself remembers.
+    // Before declaring setup required, try the others this receiver has
+    // successfully used - which is the whole point of keeping them.
+    renderBootScreen("Trying saved networks", rgb(53,169,244));
+    if (!connectSavedWifiNetwork()) {
+      renderBootScreen("Wi-Fi failed - setup required", rgb(255,65,65));
+      delay(5000);
+      restoreMap(); status("WIFI",rgb(245,30,35)); present();
+    }
   }
   if (WiFi.status() == WL_CONNECTED) {
     renderBootScreen("Wi-Fi connected: " + WiFi.localIP().toString(), rgb(55,215,110));
