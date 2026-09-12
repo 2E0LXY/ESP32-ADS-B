@@ -6,12 +6,14 @@ from fastapi import FastAPI
 
 from . import models, security
 from .aggregator import Aggregator
+from .cache import build_cache
 from .routes import RouteResolver
 from .database import Base, SessionLocal, add_missing_columns, engine
 from .feed_ingest import FeedIngestManager
 from .logos import LogoStore
 from .photos import PhotoStore
 from .reference import ReferenceData
+from .leader import Leadership
 from .retention import RETENTION_DAYS, UsageLogPruner
 from .routers import admin, public
 
@@ -70,10 +72,25 @@ async def startup():
     finally:
         db.close()
 
+    # The aircraft cache. In-process unless REDIS_URL is set, in which case
+    # every worker shares one view of the sky - see app/cache.py for why the
+    # in-process dict was the ceiling on this deployment.
+    app.state.cache = build_cache()
+    shared = getattr(app.state.cache, "_redis", None)
+
+    # With a shared cache there can be several workers, and some work must
+    # still happen exactly once: upstream polling (or we ask each community
+    # API for the same sky N times a cycle) and feeder listeners (only one
+    # process can bind a device's port). See app/leader.py.
+    app.state.leadership = Leadership(shared)
+    app.state.leadership.start()
+
     home_lat = float(os.environ.get("HOME_LAT", "53.73"))
     home_lon = float(os.environ.get("HOME_LON", "-1.57"))
     home_radius_nm = float(os.environ.get("HOME_RADIUS_NM", "50"))
-    app.state.aggregator = Aggregator(home_lat, home_lon, home_radius_nm, SessionLocal)
+    app.state.aggregator = Aggregator(home_lat, home_lon, home_radius_nm, SessionLocal,
+                                      cache=app.state.cache,
+                                      leadership=app.state.leadership)
     app.state.aggregator.start()
 
     # Resolves callsign -> route on behalf of every device, so the ESP32
@@ -106,22 +123,47 @@ async def startup():
     # One usage_log row is written per device poll and nothing ever deleted
     # one, so the table grew forever - the first thing that would have
     # filled the disk. See app/retention.py.
+    # Leader-only: several workers all deleting the same expired rows is
+    # wasted writes against SQLite's single writer lock, not extra safety.
     app.state.usage_pruner = UsageLogPruner(SessionLocal)
-    app.state.usage_pruner.start()
     logger.info("usage_log retention: %d days", RETENTION_DAYS)
 
     app.state.feed_ingest = FeedIngestManager(app.state.aggregator, SessionLocal)
-    await app.state.feed_ingest.sync_from_db()
+
+    async def _single_instance_work(leader: bool):
+        """Starts or stops everything that must run in exactly one worker.
+
+        Driven by the lease rather than by startup, so a worker that takes
+        over from a dead leader opens the feeder listeners itself - without
+        this, losing the leader would mean customers' receivers stayed
+        unaccepted until somebody restarted the service.
+        """
+        if leader:
+            await app.state.feed_ingest.sync_from_db()
+            app.state.usage_pruner.start()
+        else:
+            # Release the feeder ports promptly: whoever takes the lease
+            # next has to be able to bind them.
+            await app.state.feed_ingest.stop_all()
+            await app.state.usage_pruner.stop()
+
+    app.state.leadership.on_change(_single_instance_work)
+    if app.state.leadership.is_leader:
+        # Either a single-process deployment, or this worker won the lease
+        # on the first tick - no transition to wait for.
+        await _single_instance_work(True)
 
 
 @app.on_event("shutdown")
 async def shutdown():
+    await app.state.leadership.stop()
     await app.state.usage_pruner.stop()
     await app.state.photos.stop()
     await app.state.logos.stop()
     await app.state.routes.stop()
     await app.state.aggregator.stop()
     await app.state.feed_ingest.stop_all()
+    await app.state.cache.close()
 
 
 app.include_router(public.router)

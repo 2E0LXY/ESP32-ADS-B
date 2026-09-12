@@ -20,7 +20,8 @@
 </tbody>
 </table>
 <p class="sub" style="margin-top:10px">Cache holds {{ cache_size }} aircraft. Poll interval: {{ poll_interval }}s.
-  Usage history kept {{ retention_days }} days{% if usage_pruned is not none %}; {{ usage_pruned }} rows pruned since restart{% endif %}.</p>
+  Usage history kept {{ retention_days }} days{% if usage_pruned is not none %}; {{ usage_pruned }} rows pruned since restart{% endif %}.
+  {% if shared_cache %}Shared cache: this worker {% if polls_upstream %}holds{% else %}does not hold{% endif %} the polling role.{% endif %}</p>
 </div>
 
 <div class="panel">

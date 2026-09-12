@@ -27,5 +27,42 @@ services:
     env_file:
       - .env
 
+  # Only needed to run more than one uvicorn worker: it holds the shared
+  # aircraft cache (app/cache.py) and the single-instance lease
+  # (app/leader.py). With REDIS_URL unset the app ignores it entirely and
+  # behaves exactly as it did before, so this service is harmless to leave
+  # running and harmless to remove.
+  #
+  # Host networking to match the app container, and bound to localhost only:
+  # this holds live aircraft positions and must not be reachable from the
+  # internet. Redis has no authentication enabled here - the bind address is
+  # what protects it, so do not change that without adding a password.
+  redis:
+    image: redis:7-alpine
+    container_name: adsb-redis
+    restart: unless-stopped
+    network_mode: host
+    command: >
+      redis-server
+      --bind 127.0.0.1
+      --port 6379
+      --save ""
+      --appendonly no
+      --maxmemory 128mb
+      --maxmemory-policy noeviction
+    # noeviction, not an LRU policy: the single-instance lease lives in here
+    # alongside the aircraft, and no eviction policy can be told to spare
+    # it. Evicting the lease would let a second worker take the role while
+    # the current holder still believes it has it - two leaders, which is
+    # the one thing app/leader.py exists to prevent. 128 MB is orders of
+    # magnitude more than a few thousand aircraft need, so if this limit is
+    # ever reached something is wrong and a failed write that shows up in
+    # the logs is the useful outcome.
+    #
+    # No persistence at all: every key in here is either a live aircraft
+    # (gone in five minutes anyway) or a lease that is meant to expire.
+    # Restarting Redis costs one poll cycle, not data - so writing it to
+    # disk would be pure I/O for nothing.
+
 volumes:
   adsb-data:

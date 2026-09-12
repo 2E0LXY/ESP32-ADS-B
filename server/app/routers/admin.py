@@ -116,6 +116,13 @@ def admin_dashboard(
             # So an operator can see the retention job is actually running,
             # rather than finding out from a full disk that it isn't.
             "retention_days": RETENTION_DAYS,
+            # Which process is actually polling. With one worker this is
+            # always "this one"; with several, a dashboard showing source
+            # health from a follower is showing that worker's last attempt
+            # before it lost the role, which is misleading without saying so.
+            "polls_upstream": aggregator.polls_upstream(),
+            "shared_cache": getattr(getattr(request.app.state, "leadership", None),
+                                    "shared", False),
             "usage_pruned": getattr(getattr(request.app.state, "usage_pruner", None),
                                     "total_removed", None),
         },

@@ -9,3 +9,7 @@ jinja2==3.1.5
 itsdangerous==2.2.0
 # Crops and scales aircraft photos to the panel's band shape - see app/photos.py
 Pillow==11.0.0
+# Shared aircraft cache and the single-instance lease, so the service can run
+# more than one worker - see app/cache.py and app/leader.py. Only used when
+# REDIS_URL is set; the default in-process cache needs none of this.
+redis==5.2.1

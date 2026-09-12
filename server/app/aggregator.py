@@ -18,15 +18,22 @@ scales with how many feeders opt in.
 import asyncio
 import itertools
 import logging
-import math
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import httpx
 from sqlalchemy.orm import Session
 
 from . import models
+from .cache import (  # re-exported: all of these lived here before the cache moved out
+    SOURCE_ATTRIBUTION_SECONDS,
+    STALE_AFTER_SECONDS,
+    AircraftCache,
+    CachedAircraft,
+    build_cache,
+)
+from .cache import distance_nm as _distance_nm
 from .models import FeederKey, FeederProvider
 
 logger = logging.getLogger("aggregator")
@@ -40,8 +47,6 @@ POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "15"))
 # every cycle - an upstream that has started refusing us should not cost a
 # request and a log line every fifteen seconds indefinitely.
 SOURCE_BACKOFF_MAX_SECONDS = 15 * 60
-SOURCE_ATTRIBUTION_SECONDS = 60
-STALE_AFTER_SECONDS = 5 * 60  # matches the ESP32 firmware's own MLAT/route cache staleness window
 # Per-device polling areas. A device asking for a 5 nm radius still needs the
 # cache filled a bit wider than that, or an aircraft is only cached once it
 # is already overhead; and nobody gets to make the aggregator poll the whole
@@ -68,106 +73,6 @@ DISABLED_SOURCES = {
 
 
 @dataclass
-class CachedAircraft:
-    hex: str
-    data: dict
-    seen_at: float
-    # Every source that has recently reported this aircraft, and when, kept
-    # independently of whose record currently wins the freshness comparison
-    # in merge(). Attribution used to be a single field on the winning
-    # record, which meant an aircraft a customer's own receiver was tracking
-    # vanished from their "my feed" map the moment an upstream API reported
-    # it a fraction of a second fresher - so the aircraft nearest the
-    # receiver, the ones the aggregator also polls for, were exactly the
-    # ones that disappeared.
-    sources: dict = field(default_factory=dict)
-
-
-class AircraftCache:
-    """In-memory, single-process cache - fine for one aggregator instance.
-    If this is ever scaled to multiple processes/instances, this needs to
-    move to something shared (Redis) instead; flagged here rather than
-    silently becoming a bug on the day someone adds a second worker."""
-
-    def __init__(self):
-        self._by_hex: dict[str, CachedAircraft] = {}
-        self._lock = asyncio.Lock()
-
-    async def merge(self, source: str, aircraft: list[dict]):
-        now = time.time()
-        async with self._lock:
-            for ac in aircraft:
-                hex_id = (ac.get("hex") or "").lower()
-                if not hex_id:
-                    continue
-                existing = self._by_hex.get(hex_id)
-                # Prefer the record with the most recent "seen" (seconds-ago
-                # from the upstream API, smaller is fresher) rather than
-                # simply "last source polled wins" - two sources can both
-                # report the same aircraft at different staleness.
-                # Record that this source saw it whatever happens next: who
-                # reported it and whose values are freshest are two different
-                # questions, and conflating them lost aircraft.
-                sources = existing.sources if existing else {}
-                sources[source] = now
-                if existing is None or ac.get("seen", 1e9) <= existing.data.get("seen", 1e9):
-                    ac = dict(ac)
-                    ac["_source"] = source
-                    self._by_hex[hex_id] = CachedAircraft(hex_id, ac, now, sources)
-                else:
-                    existing.sources = sources
-
-    async def prune(self):
-        cutoff = time.time() - STALE_AFTER_SECONDS
-        async with self._lock:
-            stale = [h for h, entry in self._by_hex.items() if entry.seen_at < cutoff]
-            for h in stale:
-                del self._by_hex[h]
-
-    async def query(self, lat: float, lon: float, radius_nm: float) -> list[dict]:
-        async with self._lock:
-            snapshot = list(self._by_hex.values())
-        result = []
-        for entry in snapshot:
-            ac_lat, ac_lon = entry.data.get("lat"), entry.data.get("lon")
-            if ac_lat is None or ac_lon is None:
-                continue
-            if _distance_nm(lat, lon, ac_lat, ac_lon) <= radius_nm:
-                result.append(entry.data)
-        return result
-
-    async def query_by_source(self, source: str) -> list[dict]:
-        """Used by the "my feed" account page - aircraft this source has
-        reported recently, so a feeder sees what its own receiver actually
-        contributed rather than the whole shared cache.
-
-        Asks "has this source reported it lately", not "did this source win
-        the last merge". The latter hid an aircraft from its own feeder
-        whenever an upstream API happened to report it fractionally fresher,
-        which is most likely for the traffic closest to the receiver.
-        """
-        cutoff = time.time() - SOURCE_ATTRIBUTION_SECONDS
-        async with self._lock:
-            return [
-                entry.data
-                for entry in self._by_hex.values()
-                if entry.sources.get(source, 0) >= cutoff
-            ]
-
-    def size(self) -> int:
-        return len(self._by_hex)
-
-
-def _distance_nm(lat1, lon1, lat2, lon2) -> float:
-    r_nm = 3440.065
-    p1, p2 = math.radians(lat1), math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlambda = math.radians(lon2 - lon1)
-    a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlambda / 2) ** 2
-    return 2 * r_nm * math.asin(math.sqrt(a))
-
-
-@dataclass
 class SourceHealth:
     name: str
     ok: bool = True
@@ -178,8 +83,14 @@ class SourceHealth:
 
 
 class Aggregator:
-    def __init__(self, home_lat: float, home_lon: float, home_radius_nm: float, session_factory):
-        self.cache = AircraftCache()
+    def __init__(self, home_lat: float, home_lon: float, home_radius_nm: float, session_factory,
+                 cache=None, leadership=None):
+        self.cache = cache if cache is not None else build_cache()
+        # Only the leader polls upstream. Without this, running N workers
+        # would ask each community API for the same sky N times every
+        # cycle. None means "always the leader", which is what a
+        # single-process deployment is - see app/leader.py.
+        self._leadership = leadership
         self.home_lat = home_lat
         self.home_lon = home_lon
         self.home_radius_nm = home_radius_nm
@@ -246,6 +157,12 @@ class Aggregator:
     def health(self) -> dict[str, SourceHealth]:
         return self._health
 
+    def polls_upstream(self) -> bool:
+        """Whether this process is the one polling. A follower's source
+        health is its own last attempt, which may be from before it lost
+        the role, so the admin panel needs to say which it is looking at."""
+        return self._leadership is None or self._leadership.is_leader
+
     def start(self):
         self._task = asyncio.create_task(self._loop())
 
@@ -257,8 +174,13 @@ class Aggregator:
         async with httpx.AsyncClient(timeout=10.0, headers={"User-Agent": USER_AGENT}) as client:
             while True:
                 try:
-                    await self._poll_all(client)
-                    await self.cache.prune()
+                    if self._leadership is None or self._leadership.is_leader:
+                        await self._poll_all(client)
+                        await self.cache.prune()
+                    # Every worker keeps its own copy of the count the admin
+                    # dashboard reads, leader or not; it is one cheap read
+                    # and a follower's dashboard should not show zero.
+                    await self.cache.refresh_size()
                 except asyncio.CancelledError:
                     raise
                 except Exception:  # noqa: BLE001
