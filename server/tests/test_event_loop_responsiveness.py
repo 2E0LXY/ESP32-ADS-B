@@ -71,6 +71,14 @@ class _StubResolver:
         return None
 
 
+class _StubReference:
+    """The endpoint enriches every aircraft; this test is about the event
+    loop, not about the lookups."""
+
+    def enrich(self, aircraft):
+        return aircraft
+
+
 async def test_device_poll_does_not_stall_the_loop(monkeypatch):
     """A /v1/aircraft request writes to the database on every call.
 
@@ -80,7 +88,8 @@ async def test_device_poll_does_not_stall_the_loop(monkeypatch):
     aggregator = Aggregator(0.0, 0.0, 50, SessionLocal)
     request = types.SimpleNamespace(
         app=types.SimpleNamespace(
-            state=types.SimpleNamespace(aggregator=aggregator, routes=_StubResolver())
+            state=types.SimpleNamespace(aggregator=aggregator, routes=_StubResolver(),
+                                        reference=_StubReference())
         ),
         client=types.SimpleNamespace(host="127.0.0.1"),
     )

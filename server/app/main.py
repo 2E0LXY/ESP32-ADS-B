@@ -10,6 +10,7 @@ from .routes import RouteResolver
 from .database import Base, SessionLocal, add_missing_columns, engine
 from .feed_ingest import FeedIngestManager
 from .logos import LogoStore
+from .reference import ReferenceData
 from .routers import admin, public
 
 logging.basicConfig(level=logging.INFO)
@@ -69,6 +70,12 @@ async def startup():
     # never opens its own TLS connection to adsbdb. See app/routes.py.
     app.state.routes = RouteResolver()
     app.state.routes.start()
+
+    # Operator names, aircraft models, countries and - most usefully - the
+    # silhouette for each of 2,755 type designators. Loaded once, here, so no
+    # request pays for reading a CSV. See app/reference.py.
+    app.state.reference = ReferenceData()
+    app.state.reference.load()
 
     # Airline logos, fetched once each and then served off this deployment's
     # own disk. See app/logos.py for why lookup is by domain, not by name.

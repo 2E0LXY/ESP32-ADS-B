@@ -25,6 +25,10 @@ def _routes(request: Request):
     return request.app.state.routes
 
 
+def _reference(request: Request):
+    return request.app.state.reference
+
+
 @router.get("/", response_class=HTMLResponse)
 def root():
     # The device's own admin page links customers to their product's site,
@@ -49,8 +53,14 @@ async def get_aircraft(
     # lookup() never blocks: an unknown callsign is queued and comes back
     # with a route on a later poll.
     resolver = _routes(request)
+    reference = _reference(request)
     enriched = []
     for entry in aircraft:
+        # Operator, model, country and the silhouette, from the offline
+        # lists. The device cannot carry 450 KB of lookup tables, and the
+        # shape in particular is far better than the 91 callsign prefixes it
+        # falls back to when a provider other than this one is selected.
+        entry = reference.enrich(entry)
         route = resolver.lookup(entry.get("flight"))
         enriched.append({**entry, "route": route} if route else entry)
     aircraft = enriched
@@ -457,6 +467,7 @@ async def my_feed_aircraft(
     if not device:
         return {"ac": []}
     aircraft = await _aggregator(request).cache.query_by_source(f"feeder:{device.id}")
+    aircraft = [_reference(request).enrich(entry) for entry in aircraft]
     return {"ac": aircraft, "total": len(aircraft)}
 
 
@@ -545,7 +556,8 @@ async def shared_feed_aircraft(token: str, request: Request, db: Session = Depen
     if not device:
         return JSONResponse({"ac": [], "total": 0}, status_code=status.HTTP_404_NOT_FOUND,
                             headers=NO_INDEX)
-    aircraft = await _aggregator(request).cache.query_by_source(f"feeder:{device.id}")
+    aircraft = [_reference(request).enrich(entry)
+                for entry in await _aggregator(request).cache.query_by_source(f"feeder:{device.id}")]
     return JSONResponse({"ac": aircraft, "total": len(aircraft)}, headers=NO_INDEX)
 
 

@@ -726,6 +726,25 @@ const char *planeShapeName(PlaneShape shape) {
   return "generic";
 }
 
+// The aggregator resolves the silhouette from real ICAO class and engine
+// data for thousands of designators - far more than the prefix table below
+// can cover - and sends it with the aircraft. Accepted when present, which
+// is why the names here must match planeShapeName() exactly.
+PlaneShape shapeFromName(const char *name) {
+  if (!name || !name[0]) return PlaneShape::Generic;
+  if (!strcmp(name, "light")) return PlaneShape::LightProp;
+  if (!strcmp(name, "twin")) return PlaneShape::Twin;
+  if (!strcmp(name, "airliner")) return PlaneShape::Airliner;
+  if (!strcmp(name, "heavy")) return PlaneShape::HeavyJet;
+  if (!strcmp(name, "fighter")) return PlaneShape::Fighter;
+  if (!strcmp(name, "helicopter")) return PlaneShape::Helicopter;
+  if (!strcmp(name, "glider")) return PlaneShape::Glider;
+  if (!strcmp(name, "balloon")) return PlaneShape::Balloon;
+  if (!strcmp(name, "drone")) return PlaneShape::Drone;
+  if (!strcmp(name, "ground")) return PlaneShape::Ground;
+  return PlaneShape::Generic;
+}
+
 PlaneShape shapeForAircraft(const char *typeDesignator, const char *category, bool onGround) {
   PlaneShape shape = PlaneShape::Generic;
   size_t bestPrefix = 0;
@@ -4256,7 +4275,15 @@ void fetchAdsbV2Aircraft() {
     // Resolve the silhouette once, here, rather than on every redraw: the
     // type table is a linear scan and these icons are drawn several times a
     // second.
-    display.iconShape = shapeForAircraft(display.aircraftType, display.category, display.onGround);
+    // The server's silhouette when it sent one, our own guess otherwise.
+    // A surface vehicle is still a surface vehicle whatever the type list
+    // says, so the on-ground rule is applied over the top of either.
+    const PlaneShape served = shapeFromName(aircraft["shape"] | "");
+    display.iconShape = served != PlaneShape::Generic
+                            ? served
+                            : shapeForAircraft(display.aircraftType, display.category, display.onGround);
+    if (display.onGround && display.iconShape == PlaneShape::Generic)
+      display.iconShape = PlaneShape::Ground;
     adoptServerRoute(display.flight, aircraft["route"].as<JsonObject>());
     JsonArray mlatFields = aircraft["mlat"].as<JsonArray>();
     display.positionSource = !mlatFields.isNull() && mlatFields.size() ? 2 : 0;
