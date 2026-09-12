@@ -2002,6 +2002,35 @@ void blitStage(const ImageStage &stage, int left, int top) {
   }
 }
 
+// The ICAO operator prefix of a callsign: RYR2BH is Ryanair. Empty when the
+// callsign cannot carry one, which is most GA traffic - those keep the
+// initials tile.
+bool operatorLogoCode(const char *flight, char *out) {
+  out[0] = 0;
+  if (!flight) return false;
+  // Four characters minimum: three letters and at least one of the flight
+  // number. A bare three-letter callsign is not an airline flight.
+  if (strlen(flight) < 4) return false;
+  for (int i = 0; i < 3; ++i) {
+    const char c = static_cast<char>(toupper(static_cast<unsigned char>(flight[i])));
+    if (c < 'A' || c > 'Z') return false;
+    out[i] = c;
+  }
+  out[3] = 0;
+  return true;
+}
+
+String operatorLogoPath(const char *code) {
+  return (sdMounted ? "/adsb/logo_" : "/logo_") + String(code) + ".png";
+}
+
+// A logo the aggregator has none of. Recorded so the device stops asking;
+// without it every screensaver rotation past a cargo or charter operator
+// would spend another request for the same 404.
+String operatorLogoMissPath(const char *code) {
+  return (sdMounted ? "/adsb/logo_" : "/logo_") + String(code) + ".none";
+}
+
 bool drawCachedOperatorLogo(int x, int y, int size, const char *code) {
   if (!framebuffer || !ensureStage(logoStage, LOGO_PIXELS, LOGO_PIXELS)) return false;
   if (strcmp(logoStage.key, code) &&
