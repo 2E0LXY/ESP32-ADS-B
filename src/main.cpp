@@ -726,7 +726,7 @@ const char *planeShapeName(PlaneShape shape) {
   return "generic";
 }
 
-PlaneShape shapeForAircraft(const char *typeDesignator, const char *category) {
+PlaneShape shapeForAircraft(const char *typeDesignator, const char *category, bool onGround) {
   PlaneShape shape = PlaneShape::Generic;
   size_t bestPrefix = 0;
   if (typeDesignator && typeDesignator[0]) {
@@ -740,7 +740,16 @@ PlaneShape shapeForAircraft(const char *typeDesignator, const char *category) {
     }
   }
   if (bestPrefix) return shape;
-  return shapeForCategory(category);
+  shape = shapeForCategory(category);
+  // Nothing in the type table, nothing in the category, but it says it is on
+  // the ground: that is surface traffic, not an aircraft whose class we
+  // happen not to know. Airport ground stations and service vehicles report
+  // exactly this - no type, no category, zero speed, no altitude - and drawing
+  // them as something airborne put aircraft on the taxiways and the tower.
+  // Narrow on purpose: an airliner at the gate is also on the ground, but it
+  // has a type designator and never reaches here.
+  if (shape == PlaneShape::Generic && onGround) return PlaneShape::Ground;
+  return shape;
 }
 
 struct AircraftDisplay {
@@ -3979,7 +3988,7 @@ void fetchAdsbV2Aircraft() {
     // Resolve the silhouette once, here, rather than on every redraw: the
     // type table is a linear scan and these icons are drawn several times a
     // second.
-    display.iconShape = shapeForAircraft(display.aircraftType, display.category);
+    display.iconShape = shapeForAircraft(display.aircraftType, display.category, display.onGround);
     adoptServerRoute(display.flight, aircraft["route"].as<JsonObject>());
     JsonArray mlatFields = aircraft["mlat"].as<JsonArray>();
     display.positionSource = !mlatFields.isNull() && mlatFields.size() ? 2 : 0;
@@ -4183,7 +4192,7 @@ void fetchAircraft() {
     if (!state[17].isNull()) openSkyCategoryToAdsb(state[17].as<int>(), display.category,
                                                    sizeof(display.category));
     strcpy(display.emergency, "none");
-    display.iconShape = shapeForAircraft(display.aircraftType, display.category);
+    display.iconShape = shapeForAircraft(display.aircraftType, display.category, display.onGround);
     ++lastCount;
   }
   sortAircraftByDistance();
