@@ -9,6 +9,7 @@ from .aggregator import Aggregator
 from .routes import RouteResolver
 from .database import Base, SessionLocal, add_missing_columns, engine
 from .feed_ingest import FeedIngestManager
+from .logos import LogoStore
 from .routers import admin, public
 
 logging.basicConfig(level=logging.INFO)
@@ -69,12 +70,23 @@ async def startup():
     app.state.routes = RouteResolver()
     app.state.routes.start()
 
+    # Airline logos, fetched once each and then served off this deployment's
+    # own disk. See app/logos.py for why lookup is by domain, not by name.
+    app.state.logos = LogoStore()
+    app.state.logos.start()
+    if not app.state.logos.configured():
+        logger.info(
+            "LOGO_DEV_TOKEN is not set - operator badges will fall back to "
+            "initials instead of real logos (see .env.example)"
+        )
+
     app.state.feed_ingest = FeedIngestManager(app.state.aggregator, SessionLocal)
     await app.state.feed_ingest.sync_from_db()
 
 
 @app.on_event("shutdown")
 async def shutdown():
+    await app.state.logos.stop()
     await app.state.routes.stop()
     await app.state.aggregator.stop()
     await app.state.feed_ingest.stop_all()

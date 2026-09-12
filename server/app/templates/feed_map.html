@@ -14,6 +14,7 @@ Only aircraft your own receiver is currently reporting - not the shared aggregat
 {% endif %}
 <span id="count">0</span> aircraft right now. Icons point along the track and are coloured by altitude; click one for everything the feed carries about it.</p>
 <div id="map" style="height:520px;border-radius:4px"></div>
+<div class="sub" style="margin-top:8px">Airline logos provided by <a href="https://logo.dev" target="_blank" rel="noopener">Logo.dev</a></div>
 </div>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin="anonymous"></script>
 <script>
@@ -49,6 +50,20 @@ function planeIcon(track, colour, onGround) {
   });
 }
 
+// The operator's logo, served from this deployment's own cache rather than
+// from logo.dev directly - one fetch for the whole deployment instead of one
+// per viewer, and the account token never leaves the server. A 404 is the
+// normal answer for an airline we have no logo for, so the onerror hides the
+// image and leaves the callsign to speak for itself.
+function logoTag(flight) {
+  const callsign = (flight || '').trim();
+  if (callsign.length < 4) return '';
+  return '<img src="/logo/callsign/' + encodeURIComponent(callsign) + '.png?size=64"'
+       + ' alt="" width="32" height="32" loading="lazy"'
+       + ' style="border-radius:4px;background:#fff;object-fit:contain;flex:none"'
+       + ' onerror="this.remove()">';
+}
+
 function row(label, value) {
   if (value === undefined || value === null || value === '' ) return '';
   return '<tr><td style="padding:1px 10px 1px 0;color:#91a8ba">' + label + '</td><td><b>' + value + '</b></td></tr>';
@@ -68,8 +83,11 @@ function details(a) {
   const altitude = typeof a.alt_baro === 'number' ? a.alt_baro
                  : (typeof a.alt_geom === 'number' ? a.alt_geom : null);
   return '<div style="min-width:230px">'
-    + '<div style="font-weight:800;font-size:15px">' + (a.flight || a.hex || 'Unknown') + '</div>'
-    + (route.airline ? '<div class="sub">' + route.airline + '</div>' : '')
+    + '<div style="display:flex;align-items:center;gap:8px">'
+    +   logoTag(a.flight)
+    +   '<div><div style="font-weight:800;font-size:15px">' + (a.flight || a.hex || 'Unknown') + '</div>'
+    +   (route.airline ? '<div class="sub">' + route.airline + '</div>' : '') + '</div>'
+    + '</div>'
     + (from && to ? '<div style="margin:4px 0;color:#35a9f4"><b>' + from + ' &rarr; ' + to + '</b></div>' : '')
     + '<table style="font-size:12px;border-collapse:collapse">'
     + row('ICAO hex', a.hex)

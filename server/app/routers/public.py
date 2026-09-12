@@ -2,7 +2,7 @@ import asyncio
 import datetime
 
 from fastapi import APIRouter, Cookie, Depends, Form, Header, Request, status
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
 
@@ -11,6 +11,7 @@ from ..aggregator import Aggregator
 from ..database import get_db
 from ..deps import get_current_account, require_device_api_key
 from ..feed_ingest import allocate_port
+from ..logos import DEFAULT_SIZE, code_for_callsign
 
 router = APIRouter()
 templates = Jinja2Templates(directory="app/templates")
@@ -546,3 +547,44 @@ async def shared_feed_aircraft(token: str, request: Request, db: Session = Depen
                             headers=NO_INDEX)
     aircraft = await _aggregator(request).cache.query_by_source(f"feeder:{device.id}")
     return JSONResponse({"ac": aircraft, "total": len(aircraft)}, headers=NO_INDEX)
+
+
+# --- Airline logos --------------------------------------------------------
+#
+# Open, unauthenticated and heavily cacheable on purpose: these are public
+# brand images, they are needed by the shared feed links which have no
+# session, and the point of the endpoint is that a logo is fetched from
+# logo.dev once for the whole deployment rather than once per viewer.
+#
+# 404 is a normal answer, not an error. It means "we have no logo for this
+# airline", and every caller answers it the same way: draw its own initials
+# badge. That is why the img tags using this carry an onerror.
+
+LOGO_CACHE_HEADERS = {
+    # A week in the browser, and a stale copy is fine while a fresh one is
+    # fetched: an airline logo changes on the order of never.
+    "Cache-Control": "public, max-age=604800, stale-while-revalidate=86400",
+}
+
+
+@router.get("/logo/callsign/{callsign}.png")
+async def logo_for_callsign(callsign: str, request: Request, size: int = DEFAULT_SIZE):
+    """The operator's logo for a flight callsign, e.g. RYR2BH -> Ryanair."""
+    code = code_for_callsign(callsign)
+    if not code:
+        return Response(status_code=status.HTTP_404_NOT_FOUND, headers=LOGO_CACHE_HEADERS)
+    return await _logo_response(request, code, size)
+
+
+@router.get("/logo/airline/{code}.png")
+async def logo_for_airline(code: str, request: Request, size: int = DEFAULT_SIZE):
+    """The logo for an ICAO airline code directly, e.g. RYR."""
+    return await _logo_response(request, code.strip().upper(), size)
+
+
+async def _logo_response(request: Request, code: str, size: int) -> Response:
+    store = request.app.state.logos
+    data = await store.logo(code, size)
+    if data is None:
+        return Response(status_code=status.HTTP_404_NOT_FOUND, headers=LOGO_CACHE_HEADERS)
+    return Response(content=data, media_type="image/png", headers=LOGO_CACHE_HEADERS)
