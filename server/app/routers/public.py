@@ -12,6 +12,7 @@ from ..database import get_db
 from ..deps import get_current_account, require_device_api_key
 from ..feed_ingest import allocate_port
 from ..logos import DEFAULT_SIZE, code_for_callsign
+from ..photos import DEFAULT_WIDTH as PHOTO_DEFAULT_WIDTH
 
 router = APIRouter()
 templates = Jinja2Templates(directory="app/templates")
@@ -609,3 +610,49 @@ async def _logo_response(request: Request, code: str, size: int) -> Response:
     if data is None:
         return Response(status_code=status.HTTP_404_NOT_FOUND, headers=LOGO_CACHE_HEADERS)
     return Response(content=data, media_type="image/png", headers=LOGO_CACHE_HEADERS)
+
+
+# --- Aircraft type photographs -------------------------------------------
+#
+# Same shape as the logo endpoints and open for the same reasons: public
+# images, needed by share links that have no session, and fetched once for
+# the whole deployment rather than once per viewer.
+#
+# The caller passes only the designator. The model name the search needs
+# comes from the reference lists here, so the device does not have to know
+# that "B738" means "Boeing 737-800" - which is the whole point of it not
+# carrying 450 KB of tables.
+
+
+@router.get("/aircraft-photo/{designator}.png")
+async def aircraft_photo(designator: str, request: Request, size: int = PHOTO_DEFAULT_WIDTH):
+    code = designator.strip().upper()
+    store = request.app.state.photos
+    if not store.configured():
+        # Switched off deployment-wide, which the device must treat as
+        # retry-later rather than "this type has no photograph" - see the
+        # same reasoning on the logo endpoint.
+        return Response(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        headers={"Retry-After": "3600"})
+    type_info = _reference(request).aircraft_type(code)
+    if not type_info or not type_info.get("name"):
+        return Response(status_code=status.HTTP_404_NOT_FOUND, headers=LOGO_CACHE_HEADERS)
+    data = await store.photo(code, type_info["name"], size)
+    if data is None:
+        return Response(status_code=status.HTTP_404_NOT_FOUND, headers=LOGO_CACHE_HEADERS)
+    return Response(content=data, media_type="image/png", headers=LOGO_CACHE_HEADERS)
+
+
+@router.get("/aircraft-photo/credits")
+async def aircraft_photo_credits(request: Request):
+    """Where every cached photograph came from.
+
+    CC0 and the Public Domain Mark require no attribution, so this is not a
+    licence obligation. It exists because being unable to say where a picture
+    came from is its own problem, and because a claim of "licence-free" should
+    be checkable rather than asserted.
+    """
+    store = request.app.state.photos
+    entries = await asyncio.to_thread(store.credits)
+    return JSONResponse({"note": "CC0 and Public Domain Mark only; attribution is not required",
+                         "count": len(entries), "photos": entries})

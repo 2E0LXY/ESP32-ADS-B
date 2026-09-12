@@ -1851,6 +1851,28 @@ constexpr int LOGO_PIXELS = 128;  // must be one of the server's allowed sizes
 volatile bool logoFetchPending = false;
 char logoFetchCode[4] = {0};
 
+// The same one-at-a-time arrangement for the type photograph. Separate from
+// the logo so a type with no photo does not block that airline's logo, and
+// vice versa.
+volatile bool photoFetchPending = false;
+char photoFetchCode[8] = {0};
+constexpr int MAX_PHOTOS_UNAVAILABLE = 24;
+char photoUnavailable[MAX_PHOTOS_UNAVAILABLE][8] = {};
+int photoUnavailableCount = 0;
+
+bool photoKnownUnavailable(const char *code) {
+  for (int i = 0; i < photoUnavailableCount; ++i)
+    if (!strcmp(photoUnavailable[i], code)) return true;
+  return false;
+}
+
+void rememberPhotoUnavailable(const char *code) {
+  if (photoKnownUnavailable(code)) return;
+  if (photoUnavailableCount >= MAX_PHOTOS_UNAVAILABLE) return;  // the card still remembers
+  strncpy(photoUnavailable[photoUnavailableCount], code, 7);
+  photoUnavailable[photoUnavailableCount++][7] = 0;
+}
+
 // What a fetch attempt actually achieved. The distinction matters: only a
 // newly written image justifies a repaint. Treating "already know there is
 // no logo" as success repainted the whole screen, which set the tile asking
@@ -1876,97 +1898,61 @@ void rememberLogoUnavailable(const char *code) {
   if (logoUnavailableCount >= MAX_LOGOS_UNAVAILABLE) return;  // the card still remembers
   memcpy(logoUnavailable[logoUnavailableCount++], code, 4);
 }
-// The decoded logo, held in PSRAM, and which airline it belongs to.
+// A decoded image held in PSRAM, and which key it belongs to.
 //
-// Decoded once per airline rather than once per repaint. The screensaver's
-// repaint signature includes the aircraft's age, so it repaints about every
-// second, and reading the card and running PNGdec at 1 Hz - on the bus the
-// panel refills its bounce buffer from - is exactly the kind of load this
-// display cannot absorb. One 32 KB staging buffer turns that into a memcpy.
-uint16_t *logoPixels = nullptr;
-char logoPixelsCode[4] = {0};
+// Decoded once per subject rather than once per repaint. Reading the card and
+// running PNGdec on every screensaver repaint - on the bus the panel refills
+// its bounce buffer from - is exactly the kind of load this display cannot
+// absorb. A staging buffer turns each repaint into a memcpy.
+//
+// Two of these: the airline logo and the aircraft type photograph. They share
+// one decode callback rather than having a near-identical one each, because
+// two copies of this drift apart.
+struct ImageStage {
+  uint16_t *pixels = nullptr;
+  int width = 0;
+  int height = 0;
+  char key[8] = {0};
+};
 
-int decodeLogoPngLine(PNGDRAW *draw) {
-  // Too wide would run past the end of the row it is writing into. The
-  // request asks for 128, but a cache file written by an older build - or a
-  // server that starts answering differently - must not be able to corrupt
-  // memory here.
-  if (!logoPixels || draw->iWidth > LOGO_PIXELS) return 0;
-  if (draw->y < 0 || draw->y >= LOGO_PIXELS) return 1;  // taller than asked for: ignore the rest
-  pngDecoder.getLineAsRGB565(draw, logoPixels + draw->y * LOGO_PIXELS,
+ImageStage logoStage;
+ImageStage photoStage;
+ImageStage *decodeStageTarget = nullptr;
+
+int decodeStagePngLine(PNGDRAW *draw) {
+  ImageStage *stage = decodeStageTarget;
+  // A wider row than the stage would run past the end of the line it is
+  // writing into. A cache file written by an older build, or a server that
+  // starts answering differently, must not be able to corrupt memory here.
+  if (!stage || !stage->pixels || draw->iWidth > stage->width) return 0;
+  if (draw->y < 0 || draw->y >= stage->height) return 1;  // taller than asked: ignore the rest
+  pngDecoder.getLineAsRGB565(draw, stage->pixels + draw->y * stage->width,
                              PNG_RGB565_LITTLE_ENDIAN, 0xffffffff);
   return 1;
 }
 
-// Centred in the tile rather than scaled to it: 128 into 160 leaves an even
-// margin, and a scaler here would be a lot of code for sixteen pixels.
-void blitOperatorLogo(int x, int y, int size) {
-  const int left = x + (size - LOGO_PIXELS) / 2;
-  const int top = y + (size - LOGO_PIXELS) / 2;
-  for (int row = 0; row < LOGO_PIXELS; ++row) {
-    const int destinationY = top + row;
-    if (destinationY < 0 || destinationY >= H) continue;
-    const int destinationX = max(0, left);
-    const int sourceX = max(0, -left);
-    const int count = min(LOGO_PIXELS - sourceX, W - destinationX);
-    if (count > 0) memcpy(framebuffer + destinationY * W + destinationX,
-                          logoPixels + row * LOGO_PIXELS + sourceX,
-                          count * sizeof(uint16_t));
-  }
-}
-
-// The ICAO operator prefix of a callsign: RYR2BH is Ryanair. Empty when the
-// callsign cannot carry one, which is most GA traffic - those keep the
-// initials tile.
-bool operatorLogoCode(const char *flight, char *out) {
-  out[0] = 0;
-  if (!flight) return false;
-  // Four characters minimum: three letters and at least one of the flight
-  // number. A bare three-letter callsign is not an airline flight.
-  if (strlen(flight) < 4) return false;
-  for (int i = 0; i < 3; ++i) {
-    const char c = static_cast<char>(toupper(static_cast<unsigned char>(flight[i])));
-    if (c < 'A' || c > 'Z') return false;
-    out[i] = c;
-  }
-  out[3] = 0;
+// Allocates the staging buffer on first use. PSRAM only: internal RAM is the
+// scarce resource the TLS handshake needs, and taking it from there to draw a
+// picture would trade a working feed for a prettier panel.
+bool ensureStage(ImageStage &stage, int width, int height) {
+  if (stage.pixels) return true;
+  stage.pixels = static_cast<uint16_t *>(heap_caps_malloc(
+      static_cast<size_t>(width) * height * sizeof(uint16_t),
+      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (!stage.pixels) return false;
+  stage.width = width;
+  stage.height = height;
   return true;
 }
 
-String operatorLogoPath(const char *code) {
-  return (sdMounted ? "/adsb/logo_" : "/logo_") + String(code) + ".png";
-}
-
-// A logo the aggregator has none of. Recorded so the device stops asking;
-// without it every screensaver rotation past a cargo or charter operator
-// would spend another request for the same 404.
-String operatorLogoMissPath(const char *code) {
-  return (sdMounted ? "/adsb/logo_" : "/logo_") + String(code) + ".none";
-}
-
-bool drawCachedOperatorLogo(int x, int y, int size, const char *code) {
-  if (!framebuffer || !pngDecoderPtr) return false;
-  // Already decoded and still the same airline: nothing to do but copy it.
-  if (logoPixels && !strcmp(logoPixelsCode, code)) {
-    blitOperatorLogo(x, y, size);
-    return true;
-  }
-
+// Reads a cached PNG from the card into the stage. Shared by both images.
+bool decodeCachedImage(ImageStage &stage, const String &path, const char *key) {
+  if (!pngDecoderPtr || !stage.pixels) return false;
   fs::FS &cache = sdMounted ? static_cast<fs::FS &>(SDCARD) : static_cast<fs::FS &>(LittleFS);
-  const String path = operatorLogoPath(code);
   File file = cache.open(path, FILE_READ);
   if (!file) return false;
   const size_t bytes = file.size();
-  if (!bytes || bytes > 128UL * 1024UL) { file.close(); cache.remove(path); return false; }
-
-  if (!logoPixels) {
-    logoPixels = static_cast<uint16_t *>(heap_caps_malloc(
-        LOGO_PIXELS * LOGO_PIXELS * sizeof(uint16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    // PSRAM only. This is 32 KB and internal RAM is the scarce resource the
-    // TLS handshake needs; taking it from there to draw a logo would trade a
-    // working feed for a prettier tile.
-    if (!logoPixels) { file.close(); return false; }
-  }
+  if (!bytes || bytes > 160UL * 1024UL) { file.close(); cache.remove(path); return false; }
   uint8_t *data = static_cast<uint8_t *>(heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
   if (!data) data = static_cast<uint8_t *>(malloc(bytes));
   if (!data) { file.close(); return false; }
@@ -1978,23 +1964,99 @@ bool drawCachedOperatorLogo(int x, int y, int size, const char *code) {
     return false;
   }
 
-  // Cleared first: a logo narrower or shorter than 128 would otherwise leave
-  // the previous airline's pixels showing around the edges of this one.
-  memset(logoPixels, 0, LOGO_PIXELS * LOGO_PIXELS * sizeof(uint16_t));
-  logoPixelsCode[0] = 0;
-  const int opened = pngDecoder.openRAM(data, bytes, decodeLogoPngLine);
+  // Cleared first: an image smaller than the stage would otherwise leave the
+  // previous subject's pixels showing around the edges of this one.
+  memset(stage.pixels, 0, static_cast<size_t>(stage.width) * stage.height * sizeof(uint16_t));
+  stage.key[0] = 0;
+  decodeStageTarget = &stage;
+  const int opened = pngDecoder.openRAM(data, bytes, decodeStagePngLine);
   const bool success = opened == PNG_SUCCESS && pngDecoder.decode(nullptr, 0) == PNG_SUCCESS;
   if (opened == PNG_SUCCESS) pngDecoder.close();
+  decodeStageTarget = nullptr;
   heap_caps_free(data);
   if (!success) {
     // Same reasoning as the map tiles: a corrupt file would otherwise sit
     // there failing to draw for ever.
     cache.remove(path);
-    Serial.printf("Removed undecodable operator logo %s\n", code);
+    Serial.printf("Removed undecodable cached image %s\n", path.c_str());
     return false;
   }
-  memcpy(logoPixelsCode, code, 4);
-  blitOperatorLogo(x, y, size);
+  strncpy(stage.key, key, sizeof(stage.key) - 1);
+  stage.key[sizeof(stage.key) - 1] = 0;
+  return true;
+}
+
+// Copies a stage to the panel, clipped to the screen. The stage may be
+// smaller than the box it is centred in.
+void blitStage(const ImageStage &stage, int left, int top) {
+  if (!framebuffer || !stage.pixels) return;
+  for (int row = 0; row < stage.height; ++row) {
+    const int destinationY = top + row;
+    if (destinationY < 0 || destinationY >= H) continue;
+    const int destinationX = max(0, left);
+    const int sourceX = max(0, -left);
+    const int count = min(stage.width - sourceX, W - destinationX);
+    if (count > 0) memcpy(framebuffer + destinationY * W + destinationX,
+                          stage.pixels + row * stage.width + sourceX,
+                          count * sizeof(uint16_t));
+  }
+}
+
+bool drawCachedOperatorLogo(int x, int y, int size, const char *code) {
+  if (!framebuffer || !ensureStage(logoStage, LOGO_PIXELS, LOGO_PIXELS)) return false;
+  if (strcmp(logoStage.key, code) &&
+      !decodeCachedImage(logoStage, operatorLogoPath(code), code)) return false;
+  // Centred in the tile rather than scaled to it: 128 into 160 leaves an even
+  // margin, and a scaler here would be a lot of code for sixteen pixels.
+  blitStage(logoStage, x + (size - logoStage.width) / 2, y + (size - logoStage.height) / 2);
+  return true;
+}
+
+// The aircraft type photograph: a landscape band, drawn in the space the
+// departure board leaves below its last row. Same lifecycle as the logo -
+// fetched once per type from the aggregator, kept on the card, decoded once
+// per type into PSRAM.
+constexpr int PHOTO_WIDTH = 160;  // must be one of the server's allowed widths
+constexpr int PHOTO_HEIGHT = 96;  // the server crops to 5:3
+
+String typePhotoPath(const char *designator) {
+  return (sdMounted ? "/adsb/photo_" : "/photo_") + String(designator) + ".png";
+}
+
+String typePhotoMissPath(const char *designator) {
+  return (sdMounted ? "/adsb/photo_" : "/photo_") + String(designator) + ".none";
+}
+
+// Designators are up to four characters and are used in a filename, so
+// anything else is refused rather than sanitised.
+bool typePhotoCode(const char *designator, char *out) {
+  out[0] = 0;
+  if (!designator) return false;
+  const size_t length = strlen(designator);
+  if (length < 2 || length > 4) return false;
+  for (size_t i = 0; i < length; ++i) {
+    const char c = static_cast<char>(toupper(static_cast<unsigned char>(designator[i])));
+    if (!isalnum(static_cast<unsigned char>(c))) return false;
+    out[i] = c;
+  }
+  out[length] = 0;
+  return true;
+}
+
+// Whether a photograph could be drawn right now, without decoding one.
+// The board reserves horizontal space for it before laying out its text, so
+// this has to be answerable before the draw.
+bool typePhotoAvailable(const char *designator) {
+  if (!strcmp(photoStage.key, designator)) return true;  // already decoded
+  fs::FS &cache = sdMounted ? static_cast<fs::FS &>(SDCARD) : static_cast<fs::FS &>(LittleFS);
+  return cache.exists(typePhotoPath(designator));
+}
+
+bool drawCachedTypePhoto(int left, int top, const char *designator) {
+  if (!framebuffer || !ensureStage(photoStage, PHOTO_WIDTH, PHOTO_HEIGHT)) return false;
+  if (strcmp(photoStage.key, designator) &&
+      !decodeCachedImage(photoStage, typePhotoPath(designator), designator)) return false;
+  blitStage(photoStage, left, top);
   return true;
 }
 
@@ -2178,6 +2240,67 @@ LogoFetch cacheOperatorLogo(const char *code) {
     return LogoFetch::Retry;
   }
   Serial.printf("Logo %s cached (%d bytes)\n", code, written);
+  return LogoFetch::Cached;
+}
+
+constexpr char PHOTO_ENDPOINT[] = "https://adsb.2e0lxy.uk/aircraft-photo/";
+
+// Same guards as the logo, for the same reason: the handshake competes for
+// contiguous internal RAM, which is the scarce resource on this board.
+LogoFetch cacheTypePhoto(const char *designator) {
+  fs::FS &cache = sdMounted ? static_cast<fs::FS &>(SDCARD) : static_cast<fs::FS &>(LittleFS);
+  const String path = typePhotoPath(designator);
+  const String missPath = typePhotoMissPath(designator);
+  if (cache.exists(missPath)) return LogoFetch::Unavailable;
+  if (cache.exists(path)) return LogoFetch::Cached;
+  if (WiFi.status() != WL_CONNECTED) return LogoFetch::Retry;
+  if (tileCacheFreeBytes() < MIN_TILE_CACHE_FREE_BYTES) return LogoFetch::Retry;
+  const size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (largest < LOGO_MIN_INTERNAL_BLOCK) {
+    Serial.printf("Photo %s deferred: largestInternal=%u\n", designator,
+                  static_cast<unsigned>(largest));
+    return LogoFetch::Retry;
+  }
+
+  WiFiClientSecure client;
+  applyTlsPolicy(client);
+  HTTPClient http;
+  http.setTimeout(15000); http.setConnectTimeout(15000);
+  const String url = String(PHOTO_ENDPOINT) + designator + ".png?size=" + String(PHOTO_WIDTH);
+  if (!http.begin(client, url)) return LogoFetch::Retry;
+  http.addHeader("User-Agent", userAgent());
+  const int status = http.GET();
+  if (status == HTTP_CODE_NOT_FOUND) {
+    // A real answer: no attribution-free photograph exists for this type.
+    // Recorded so we stop asking, which matters more here than for logos -
+    // most of the 2,700 designators are types nobody photographs.
+    http.end();
+    File marker = cache.open(missPath, FILE_WRITE);
+    if (marker) marker.close();
+    Serial.printf("Photo %s: none available\n", designator);
+    return LogoFetch::Unavailable;
+  }
+  if (status == 503) {
+    Serial.printf("Photo %s: aggregator has photographs disabled\n", designator);
+    http.end();
+    return LogoFetch::Retry;
+  }
+  if (status != HTTP_CODE_OK) {
+    Serial.printf("Photo %s HTTP %d\n", designator, status);
+    http.end();
+    return LogoFetch::Retry;
+  }
+  const int expected = http.getSize();
+  File file = cache.open(path, FILE_WRITE);
+  const int written = file ? http.writeToStream(&file) : -1;
+  if (file) file.close();
+  http.end();
+  if (written <= 0 || (expected > 0 && written != expected)) {
+    Serial.printf("Photo %s write failed: %d of %d bytes\n", designator, written, expected);
+    cache.remove(path);
+    return LogoFetch::Retry;
+  }
+  Serial.printf("Photo %s cached (%d bytes)\n", designator, written);
   return LogoFetch::Cached;
 }
 
@@ -3723,9 +3846,14 @@ void renderAircraftDetailCard(int aircraftIndex) {
 // Truncates in place to what will actually fit, so a long operator name or
 // airport pair clips cleanly instead of running off the panel. text5()
 // advances 6*scale pixels per character.
-void fitText(char *text, int xLeft, int scale) {
-  const int maxChars = (W - xLeft - 6) / (6 * scale);
+void fitTextTo(char *text, int xLeft, int scale, int xRight) {
+  const int maxChars = (xRight - xLeft) / (6 * scale);
   if (maxChars > 0 && static_cast<int>(strlen(text)) > maxChars) text[maxChars] = 0;
+  else if (maxChars <= 0) text[0] = 0;
+}
+
+void fitText(char *text, int xLeft, int scale) {
+  fitTextTo(text, xLeft, scale, W - 6);
 }
 
 // Overhead only: something you could plausibly see or hear from the
@@ -3861,6 +3989,32 @@ void renderScreensaverPage() {
 
   drawOperatorTile(margin, tileY, tile, a.flight, a.hex);
 
+  // The type photograph sits opposite the logo, at the top right, so the two
+  // pictures frame the identity lines between them. Decided before those
+  // lines are laid out because they have to be truncated to make room -
+  // which is why availability is answered without decoding anything.
+  char designator[8];
+  const bool hasDesignator = typePhotoCode(a.aircraftType, designator);
+  const int photoLeft = W - margin - PHOTO_WIDTH;
+  // Only where there is genuinely room. The route codes are the widest thing
+  // on this page and matter more than a photograph, so require space for at
+  // least eight of them at their own scale. On the 480x480 board that fails,
+  // and it keeps its full text and goes without - checked, not assumed:
+  // reserving 160 px there leaves 116, and "BRS-FAO" needs 126.
+  const int widestScale = W >= 800 ? 5 : 3;  // routeScale, declared below
+  const bool roomForPhoto = photoLeft - 8 - textX >= 8 * 6 * widestScale;
+  const bool showPhoto = hasDesignator && roomForPhoto && typePhotoAvailable(designator);
+  if (showPhoto) drawCachedTypePhoto(photoLeft, tileY, designator);
+  else if (hasDesignator && roomForPhoto && !photoFetchPending &&
+           !photoKnownUnavailable(designator)) {
+    // Asked for here because this is the only place that knows a type is
+    // being shown to someone, so the device only fetches photographs it is
+    // about to display.
+    memcpy(photoFetchCode, designator, sizeof(designator));
+    photoFetchPending = true;
+  }
+  const int identityRight = showPhoto ? photoLeft - 8 : W - 6;
+
   // Line 1 - who. The operator name when the feed carries one, otherwise the
   // callsign, which is the most identifying thing left.
   char line[64];
@@ -3875,7 +4029,7 @@ void renderScreensaverPage() {
   if (!operatorLabel) operatorLabel = a.flight[0] ? a.flight : a.hex;
   snprintf(line, sizeof(line), "%s", operatorLabel);
   const int nameScale = W >= 800 ? 3 : 2;
-  fitText(line, textX, nameScale);
+  fitTextTo(line, textX, nameScale, identityRight);
   text5(textX, tileY, line, white, nameScale);
 
   // Line 2 - where. Airport codes are the headline; the full names go in a
@@ -3883,7 +4037,7 @@ void renderScreensaverPage() {
   if (hasRoute) snprintf(line, sizeof(line), "%s-%s", route->origin, route->destination);
   else snprintf(line, sizeof(line), "%s", a.flight[0] ? a.flight : a.hex);
   const int routeScale = W >= 800 ? 5 : 3;
-  fitText(line, textX, routeScale);
+  fitTextTo(line, textX, routeScale, identityRight);
   text5(textX, tileY + 10 * nameScale, line, cyan, routeScale);
 
   // Line 3 - what. The full model where the aggregator resolved one, since
@@ -3894,7 +4048,7 @@ void renderScreensaverPage() {
            a.typeName[0] ? a.typeName : (a.aircraftType[0] ? a.aircraftType : "UNKNOWN"),
            a.registration[0] ? a.registration : a.hex,
            a.flight[0] ? a.flight : "");
-  fitText(line, textX, 2);
+  fitTextTo(line, textX, 2, identityRight);
   text5(textX, tileY + 10 * nameScale + 11 * routeScale, line, dim, 2);
 
   int y = tileY + tile + H / 16;
@@ -6266,6 +6420,20 @@ void networkTask(void *) {
       // later rotation rather than immediately, and clearing it here stops
       // one unreachable logo blocking every other airline's.
       logoFetchPending = false;
+    }
+
+    // And the type photograph, on the same terms. Separate from the logo so
+    // one missing image cannot block the other, and after it so a first
+    // sighting fetches the logo first - it is the smaller download and the
+    // more identifying picture.
+    if (photoFetchPending && !logoFetchPending) {
+      char code[8];
+      { MutexGuard guard(dataMutex); memcpy(code, photoFetchCode, sizeof(code)); }
+      const LogoFetch outcome = cacheTypePhoto(code);
+      MutexGuard guard(dataMutex);
+      if (outcome == LogoFetch::Cached) screensaverNeedsRedraw = true;
+      else if (outcome == LogoFetch::Unavailable) rememberPhotoUnavailable(code);
+      photoFetchPending = false;
     }
 
     // One place to record a network that works, whichever route got us

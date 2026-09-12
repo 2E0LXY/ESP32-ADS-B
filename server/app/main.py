@@ -10,6 +10,7 @@ from .routes import RouteResolver
 from .database import Base, SessionLocal, add_missing_columns, engine
 from .feed_ingest import FeedIngestManager
 from .logos import LogoStore
+from .photos import PhotoStore
 from .reference import ReferenceData
 from .routers import admin, public
 
@@ -87,12 +88,19 @@ async def startup():
             "initials instead of real logos (see .env.example)"
         )
 
+    # Aircraft type photographs, CC0 and public-domain-mark only, cropped to
+    # the panel's band and cached on disk. See app/photos.py for why the
+    # licence restriction rules out Wikimedia Commons for civil types.
+    app.state.photos = PhotoStore()
+    app.state.photos.start()
+
     app.state.feed_ingest = FeedIngestManager(app.state.aggregator, SessionLocal)
     await app.state.feed_ingest.sync_from_db()
 
 
 @app.on_event("shutdown")
 async def shutdown():
+    await app.state.photos.stop()
     await app.state.logos.stop()
     await app.state.routes.stop()
     await app.state.aggregator.stop()

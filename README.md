@@ -239,6 +239,7 @@ Everything on that page, and where it comes from:
 | Line | Content | Source |
 | --- | --- | --- |
 | Logo tile | The airline's real logo, or three initials in a tinted square | Fetched once from the aggregator and cached on the microSD card |
+| Photograph | A picture of the aircraft type, top right, opposite the logo | Fetched once per type from the aggregator and cached on the card. Only on the 800 x 480 board: reserving the space on the 480 x 480 one would truncate the route codes, which matter more |
 | Operator | Trading name with corporate form removed, e.g. "Ryanair" not "RYANAIR DAC" | Resolved by the aggregator from the operator list, else the feed, else a compiled-in prefix table |
 | Route | Airport codes as the headline, full names on a later row | adsbdb, resolved by the aggregator and cached |
 | Type line | Full model, registration and callsign, e.g. "Boeing 737 Max 8  EI-IHG  RYR282D" | Model from the ICAO type list; the four-character designator when unresolved |
@@ -473,6 +474,7 @@ Map data is © OpenStreetMap contributors. The browser and LCD show attribution.
 | Public share links | An unlisted read-only URL for that map, for anyone the owner sends it to, with no account needed; revocable and replaceable |
 | Operator and type enrichment | Fills in operator name, telephony, IATA code, aircraft model, country from the ICAO hex range, and special livery from offline lists covering 6,008 operators and 2,735 type designators |
 | Aircraft silhouettes | Resolves each aircraft's shape from its real ICAO class and engine configuration and sends it with the aircraft, so the device is not limited to the 91 callsign prefixes it can carry itself |
+| Aircraft photographs | Finds a licence-free photograph of each aircraft type, crops it to the panel's band, and caches it. CC0 and Public Domain Mark only, so nothing needs crediting |
 | Airline logos | Fetches each operator's logo from logo.dev once for the whole deployment, keeps it on disk beside the database, and serves it from `/logo/callsign/<callsign>.png`, so a viewer never contacts logo.dev and the token never leaves the server |
 | Feeder client | `server/tools/` has a standard-library Python forwarder with a systemd unit, a Windows launcher, and a `--check` mode, for receiver software that cannot push SBS out on its own |
 
@@ -499,6 +501,14 @@ That split is also a licensing decision: the provenance of those lists is not es
 | `route` | Origin, destination, both airports' full names and cities, and the operating airline |
 
 **If you add a field here, add it to the firmware's filter as well.** The ESP32 parses that response through an ArduinoJson filter listing every field it keeps, to avoid holding a second copy of a 39 KB body in memory. A field absent from that list is discarded during parsing, before any code that reads it runs. This is not hypothetical: `shape`, `type_name` and `telephony` were all sent, read and displayed correctly in code, and silently dropped in transit, for exactly this reason. The list is the `fields[]` array in `fetchAdsbV2Aircraft()` in `src/main.cpp`.
+
+**Aircraft type photographs.** `/aircraft-photo/B738.png` returns a photograph of that type, cropped to the panel's 5:3 band and quantised to a 256-colour palette, or 404 when there is no licence-free one. The caller passes only the designator; the model name the search needs comes from the reference lists here, which is the point of the device not carrying them.
+
+**Restricted to CC0 and Public Domain Mark, and that decides the source.** Wikimedia Commons has better aircraft photography, but its civil aircraft photos are effectively all CC BY-SA - measured across A320, B738, B38M, C172, AT76 and SR22, none of which had an attribution-free option, because only military and government photographs there are public domain. Openverse aggregates Flickr and others and lets the search itself be filtered by licence, and CC0 and PDM waive attribution entirely: no credits page to maintain, no share-alike question, nothing to carry into a commercial product. `AIRCRAFT_PHOTOS=0` turns the feature off.
+
+**Choosing a usable photograph is the substance, not fetching one.** Searching by model name returns engine close-ups, cockpits, cabins, diecast models and museum pieces alongside aircraft. Candidates are rejected on a keyword list, on being smaller than 480 px wide, on any aspect ratio outside 1.2 to 2.4 since aircraft are photographed landscape, and on a title that never mentions the model, because full-text search happily matches an airport article that mentions a 737. Against live results that keeps nine or ten of every ten and rejects exactly the engine and detail shots.
+
+Licence, creator, title and source URL are recorded beside every cached image and served at `/aircraft-photo/credits`. Neither licence requires it. It exists because being unable to say where a picture came from is its own problem, and a claim of "licence-free" should be checkable rather than asserted.
 
 **Airline logos.** `/logo/callsign/RYR2BH.png` and `/logo/airline/RYR.png` return the operator's logo, or 404 when there is not one, which every caller answers by drawing its own initials badge instead.
 
