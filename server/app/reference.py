@@ -21,6 +21,7 @@ or shipped in the USB installer.
 import csv
 import logging
 import os
+import re
 
 logger = logging.getLogger("reference")
 
@@ -94,6 +95,76 @@ def shape_for_type(type_class: str, engines: str) -> str | None:
     return None
 
 
+# Corporate form, not part of the name. Compared with dots removed so
+# "S.A", "S.A." and "SA" all match. Deliberately excludes AIRLINES, AIRWAYS,
+# AIR, AVIATION, SERVICES and FORCE, which are common trailing words and are
+# part of the name.
+LEGAL_SUFFIXES = {
+    "LTD", "LTD.", "LIMITED", "LLC", "LLP", "LC", "PC", "INC", "INCORPORATED",
+    "CORP", "CORPORATION", "COMPANY", "CO", "PLC", "PTY", "GMBH", "MBH", "AG",
+    "KG", "LTDA", "LDA", "SA", "SL", "SAS", "SPA", "SRL", "CV", "BV", "NV",
+    "AB", "AS", "A/S", "OY", "OYJ", "APS", "KFT", "ZRT", "DOO", "PT", "TBK",
+    "JSC", "OJSC", "PJSC", "CJSC", "OAO", "ZAO", "SARL", "SDN", "BHD",
+    "DAC", "CC", "SE", "UG", "AD", "OOD", "EOOD", "SP", "ZOO", "NUF",
+}
+
+_SUFFIXES_WITHOUT_DOTS = {w.replace(".", "") for w in LEGAL_SUFFIXES}
+
+# Short all-caps words that are ordinary words, not acronyms. Without this
+# "AIR" stayed shouted in 1,203 of these names - "Delta AIR Lines" - because
+# the rule protecting KLM and TUI from becoming "Klm" and "Tui" caught it too.
+SHORT_WORDS = {
+    "AIR", "JET", "SKY", "FLY", "SUN", "AER", "SEA", "NEW", "ONE", "TWO",
+    "RED", "TOP", "WAY", "BIG", "PRO", "OUR", "ALL", "OIL", "CAB", "VIP",
+}
+
+# Lowercase within a name, capitalised when they start one.
+MINOR_WORDS = {
+    "DE", "DEL", "DU", "DA", "DO", "DOS", "LA", "LE", "LOS", "LAS", "OF",
+    "AND", "THE", "VAN", "VON", "Y", "E", "EL", "AL", "IN",
+}
+
+# "BALLARD AVIATION, INC. D/B/A EAGLEMED" - the trading name is the part
+# people would recognise, and the registered one is noise in a popup.
+_DBA = re.compile(r"\bD/?B/?A\b", re.IGNORECASE)
+# FAA registration addresses trail these names: "(WICHITA, KS)", "(FL)".
+_TRAILING_PARENS = re.compile(r"\s*\([^)]*\)\s*$")
+
+
+def _clean_operator_name(value: str) -> str:
+    """Strips corporate form and registration address from an operator name.
+
+    Never returns empty: if the rules would remove everything, the original
+    stands. A shouted name is better than a blank one.
+    """
+    name = (value or "").strip()
+    if not name:
+        return ""
+    original = name
+
+    # Trailing address first, since it can itself end in a suffix-looking
+    # token: "AIR METHODS CORP (ENGLEWOOD, CO)".
+    while True:
+        trimmed = _TRAILING_PARENS.sub("", name).strip()
+        if trimmed == name:
+            break
+        name = trimmed
+
+    parts = _DBA.split(name)
+    if len(parts) > 1 and parts[-1].strip():
+        name = parts[-1].strip()
+
+    # Repeatedly, so "CO., LTD" loses both, but never down to nothing: SAS is
+    # both a French corporate form and the name of an airline, so "SAS AB"
+    # would otherwise strip to empty and fall back to the untrimmed original.
+    # Stopping at one word keeps the name and still drops the suffix.
+    words = name.replace(",", " ").split()
+    while len(words) > 1 and words[-1].upper().replace(".", "") in _SUFFIXES_WITHOUT_DOTS:
+        words.pop()
+    name = " ".join(words).strip(" ,.-")
+    return name or original
+
+
 def _titlecase(value: str) -> str:
     """These lists are shouted: "RYANAIR DAC", "BOEING, 737-800". Mixed case
     reads better in the browser, and the firmware upper-cases for the LCD
@@ -103,13 +174,19 @@ def _titlecase(value: str) -> str:
     Plain capitalisation turned KLM into "Klm" and DAC into "Dac", which is
     worse than leaving them shouted.
     """
-    words = []
-    for word in (value or "").strip().split():
-        if not word.isupper() or len(word) <= 3 or not any(v in word for v in "AEIOU"):
-            words.append(word)
+    out = []
+    for index, word in enumerate((value or "").strip().split()):
+        if not word.isupper():
+            out.append(word)  # already mixed case; whoever wrote it meant it
+            continue
+        bare = word.upper()
+        if bare in MINOR_WORDS:
+            out.append(bare.capitalize() if index == 0 else bare.lower())
+        elif bare in SHORT_WORDS or len(bare) > 3:
+            out.append(word.capitalize())
         else:
-            words.append(word.capitalize())
-    return " ".join(words)
+            out.append(word)  # KLM, TUI, UK - an acronym, leave it shouted
+    return " ".join(out)
 
 
 # Designators that carry no class or engine data but are perfectly
@@ -200,7 +277,7 @@ class ReferenceData:
             if len(code) != 3:
                 continue
             self.airlines[code] = {
-                "name": _titlecase(row.get("Company", "")),
+                "name": _titlecase(_clean_operator_name(row.get("Company", ""))),
                 "country": _titlecase(row.get("Country", "")),
                 "telephony": _titlecase(row.get("Telephony", "")),
             }
@@ -213,7 +290,9 @@ class ReferenceData:
                 continue
             entry = self.airlines.setdefault(code, {})
             entry.update({
-                "name": (row.get("Airline Name") or entry.get("name") or "").strip(),
+                # Cleaned the same way as the other list, or "Ryanair DAC"
+                # keeps its corporate form purely because it arrived here.
+                "name": _clean_operator_name(row.get("Airline Name") or "") or entry.get("name") or "",
                 "country": (row.get("Country") or entry.get("country") or "").strip(),
                 "telephony": _titlecase(row.get("Callsign") or entry.get("telephony") or ""),
                 # "---" is this list's way of saying an operator has no

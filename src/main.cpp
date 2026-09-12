@@ -796,6 +796,12 @@ struct AircraftDisplay {
   char operatorName[36];
   char country[28];
   char emergency[16];
+  // Sent by the aggregator from the offline ICAO lists: the full model name
+  // rather than the four-character designator, and the radio callsign ATC
+  // actually says. Neither can be derived on the device - the lists are
+  // 450 KB - so they arrive already resolved or not at all.
+  char typeName[40];
+  char telephony[24];
   // Resolved once per fetch rather than per frame - the type table is a
   // linear scan and icons are redrawn several times a second.
   PlaneShape iconShape = PlaneShape::Generic;
@@ -3863,10 +3869,12 @@ void renderScreensaverPage() {
   fitText(line, textX, routeScale);
   text5(textX, tileY + 10 * nameScale, line, cyan, routeScale);
 
-  // Line 3 - what. Type, registration and callsign together, since the
-  // callsign is no longer the headline when a route resolved.
+  // Line 3 - what. The full model where the aggregator resolved one, since
+  // "Boeing 737-800" tells a viewer something and "B738" does not; the bare
+  // designator otherwise. Registration and callsign alongside, as the
+  // callsign is no longer the headline once a route has resolved.
   snprintf(line, sizeof(line), "%s  %s  %s",
-           a.aircraftType[0] ? a.aircraftType : "UNKNOWN",
+           a.typeName[0] ? a.typeName : (a.aircraftType[0] ? a.aircraftType : "UNKNOWN"),
            a.registration[0] ? a.registration : a.hex,
            a.flight[0] ? a.flight : "");
   fitText(line, textX, 2);
@@ -3891,6 +3899,17 @@ void renderScreensaverPage() {
   fitText(line, margin, rowScale);
   text5(margin, y, line, white, rowScale);
   y += rowStep;
+
+  // The radio callsign, which is what would be heard on the air and is
+  // rarely the operator's trading name: Jet2 answers to "Channex" and
+  // British Airways to "Speedbird". Only when the aggregator resolved one,
+  // and only when it differs from the operator name already above.
+  if (a.telephony[0] && strcasecmp(a.telephony, a.operatorName)) {
+    snprintf(line, sizeof(line), "RADIO:%s", a.telephony);
+    fitText(line, margin, rowScale);
+    text5(margin, y, line, cyan, rowScale);
+    y += rowStep;
+  }
 
   // Everything else the feed gives us for this airframe. Squawk is shown in
   // red when it is one of the three emergency codes, which is the one value
@@ -4270,6 +4289,8 @@ void fetchAdsbV2Aircraft() {
     strncpy(display.squawk, aircraft["squawk"] | "", sizeof(display.squawk) - 1);
     strncpy(display.category, aircraft["category"] | "", sizeof(display.category) - 1);
     strncpy(display.operatorName, aircraft["ownOp"] | "", sizeof(display.operatorName) - 1);
+    strncpy(display.typeName, aircraft["type_name"] | "", sizeof(display.typeName) - 1);
+    strncpy(display.telephony, aircraft["telephony"] | "", sizeof(display.telephony) - 1);
     strncpy(display.country, aircraft["cou"] | "", sizeof(display.country) - 1);
     strncpy(display.emergency, aircraft["emergency"] | "none", sizeof(display.emergency) - 1);
     // Resolve the silhouette once, here, rather than on every redraw: the
@@ -5112,6 +5133,11 @@ void handleAircraftApi() {
     item["source"] = display.positionSource == 2 ? "MLAT" : "ADSB";
     item["registration"] = display.registration;
     item["aircraftType"] = display.aircraftType;
+    // Resolved by the aggregator from the ICAO lists: the full model name and
+    // the radio callsign. Empty on any other provider, which is why the
+    // browser falls back to the designator rather than showing a blank.
+    item["typeName"] = display.typeName;
+    item["telephony"] = display.telephony;
     item["squawk"] = display.squawk;
     item["category"] = display.category;
     // The browser map draws the same silhouette and colour as the panel, and

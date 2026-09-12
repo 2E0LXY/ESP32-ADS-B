@@ -134,9 +134,10 @@ def test_the_unassigned_designator_placeholder_is_not_a_model(reference):
 
 
 def test_acronyms_are_not_mangled(reference):
-    """Plain capitalisation turned KLM into "Klm" and DAC into "Dac"."""
+    """Plain capitalisation turned KLM into "Klm" and LOT into "Lot"."""
     assert "KLM" in reference.airlines["KLM"]["name"]
-    assert reference.airlines["RYR"]["name"].endswith("DAC")
+    assert reference.airlines["LOT"]["name"].startswith("LOT")
+    assert reference.airlines["UPS"]["name"].startswith("UPS")
 
 
 def test_a_special_livery_is_reported(reference):
@@ -150,3 +151,64 @@ def test_missing_files_degrade_rather_than_raise(tmp_path):
     empty.load()
     assert empty.stats()["airlines"] == 0
     assert empty.enrich({"hex": "4ca2d5", "flight": "RYR2BH"}) == {"hex": "4ca2d5", "flight": "RYR2BH"}
+
+
+# --- operator name tidying ------------------------------------------------
+
+@pytest.mark.parametrize("raw,expected", [
+    ("JET2.COM LTD", "Jet2.com"),
+    ("BRITISH AIRWAYS PLC", "British Airways"),
+    ("SINGAPORE AIRLINES LIMITED", "Singapore Airlines"),
+    ("DELTA AIR LINES, INC.", "Delta Air Lines"),
+    ("LUFTHANSA CARGO AG", "Lufthansa Cargo"),
+    ("SOME CO., LTD", "Some"),                     # both halves of CO., LTD
+    ("TRANSAVIA AIRLINES C.V", "Transavia Airlines"),  # dotted form
+    ("RYANAIR DAC", "Ryanair"),
+    ("AIR FRANCE SAS", "Air France"),
+])
+def test_corporate_form_is_dropped(raw, expected):
+    from app.reference import _clean_operator_name, _titlecase
+    assert _titlecase(_clean_operator_name(raw)) == expected
+
+
+def test_a_name_is_never_trimmed_to_nothing():
+    """SAS is both a French corporate form and an airline. Stripping to empty
+    and falling back to the raw string gave "SAS AB"; stopping at one word
+    gives the name without the suffix."""
+    from app.reference import _clean_operator_name, _titlecase
+    assert _titlecase(_clean_operator_name("SAS AB")) == "SAS"
+    assert _clean_operator_name("LTD") == "LTD"
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("BALLARD AVIATION, INC. D/B/A EAGLEMED (WICHITA, KS)", "Eaglemed"),
+    ("AIR METHODS CORP (ENGLEWOOD, CO)", "Air Methods"),
+    ("ISLAND AIR EXPRESS (FRIDAY HARBOR, WA)", "Island Air Express"),
+])
+def test_registration_addresses_and_trading_names(raw, expected):
+    """These names carry an FAA registration address, and sometimes the
+    registered company with the trading name after a "d/b/a"."""
+    from app.reference import _clean_operator_name, _titlecase
+    assert _titlecase(_clean_operator_name(raw)) == expected
+
+
+def test_short_ordinary_words_are_cased_but_acronyms_are_not():
+    """AIR appears in 1,203 of these names. The rule that keeps KLM from
+    becoming "Klm" was also leaving "Delta AIR Lines"."""
+    from app.reference import _titlecase
+    assert _titlecase("DELTA AIR LINES") == "Delta Air Lines"
+    assert _titlecase("SKY EXPRESS") == "Sky Express"
+    assert _titlecase("KLM ROYAL DUTCH AIRLINES") == "KLM Royal Dutch Airlines"
+    assert _titlecase("LOT POLISH AIRLINES") == "LOT Polish Airlines"
+    assert _titlecase("UPS AIRLINES") == "UPS Airlines"
+    # Connectives read better lowercase inside a name, capitalised leading it.
+    assert _titlecase("AEROLINEAS DE ESPANA") == "Aerolineas de Espana"
+    assert _titlecase("DE HAVILLAND") == "De Havilland"
+
+
+def test_the_cleaning_applies_to_both_operator_lists(reference):
+    """ICAO.txt is applied over Airlines.csv, so it needs the same tidying or
+    a name keeps its corporate form purely because of which file it came
+    from."""
+    assert reference.airlines["RYR"]["name"] == "Ryanair"
+    assert reference.airlines["EXS"]["name"] == "Jet2.com"
