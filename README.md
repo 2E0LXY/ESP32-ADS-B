@@ -402,9 +402,18 @@ Map data is © OpenStreetMap contributors. The browser and LCD show attribution.
 | Receiver position inference | For a feeder that never states where it is, estimates the position from the radio horizon of the low aircraft it hears |
 | My-feed map | A live map of only what one customer's own receiver is reporting, with track-aligned icons, an altitude colour ramp, and every field the feed carries on click |
 | Public share links | An unlisted read-only URL for that map, for anyone the owner sends it to, with no account needed; revocable and replaceable |
+| Airline logos | Fetches each operator's logo from logo.dev once for the whole deployment, keeps it on disk beside the database, and serves it from `/logo/callsign/<callsign>.png`, so a viewer never contacts logo.dev and the token never leaves the server |
 | Feeder client | `server/tools/` has a standard-library Python forwarder with a systemd unit, a Windows launcher, and a `--check` mode, for receiver software that cannot push SBS out on its own |
 
 **Public share links.** The owner presses Create link in the feeder table of the account dashboard and gets a URL of the form `/share/<token>`. The token is 24 random bytes and is the entire credential, so the link is unlisted rather than access-controlled: anyone holding it can view the map, which is the point. Pages are served with `X-Robots-Tag: noindex` so a link pasted somewhere public does not become searchable. A link holder sees the station name and its aircraft, and nothing else: no account, no API key, no feeder port, no other device. Revoking clears the token, so the old URL stops resolving; New link mints a different one. Worth knowing before sharing: a map of what one station hears implies roughly where that station is, so this is not a way to publish a feed anonymously.
+
+**Airline logos.** `/logo/callsign/RYR2BH.png` and `/logo/airline/RYR.png` return the operator's logo, or 404 when there is not one, which every caller answers by drawing its own initials badge instead.
+
+Lookup is by airline domain rather than by company name. That is not a style choice: on logo.dev's name path `fallback=404` is ignored and a generated monogram comes back with `200 OK`, so an airline we cannot match is indistinguishable from one we can and the cache fills with monograms we could draw ourselves. On the domain path the 404 is real. The ICAO prefix table is keyed to match the firmware's own operator list so the panel and the browser agree on who is flying, and every domain in it was checked against the live API rather than assumed.
+
+A logo is fetched once per deployment, written atomically so a reader never sees a half-written file, and served from disk thereafter. Concurrent requests for the same logo make one upstream call. A 404 is remembered for a week, so a newly added airline is not re-asked on every page view. A transport error is deliberately not remembered, since a network blip is not the same as "this airline has no logo". Set `LOGO_DEV_TOKEN` to enable it; left unset, every logo reports as missing and the badges fall back to initials.
+
+The free tier requires an attribution link for commercial use, so there is one on every page that shows a logo. Do not remove it without moving to a paid plan.
 
 **Deployment shape.** One Docker container behind a reverse proxy, SQLite in a mounted volume, host networking so the feeder port range needs no per-port NAT rule. Schema changes for nullable columns and missing indexes are applied at boot; anything beyond that needs a hand-written migration.
 
