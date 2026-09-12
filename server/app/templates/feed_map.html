@@ -60,7 +60,7 @@ function logoTag(flight) {
   if (callsign.length < 4) return '';
   return '<img src="/logo/callsign/' + encodeURIComponent(callsign) + '.png?size=64"'
        + ' alt="" width="32" height="32" loading="lazy"'
-       + ' style="border-radius:4px;background:#fff;object-fit:contain;flex:none"'
+       + ' style="border-radius:4px;object-fit:contain;flex:none"'
        + ' onerror="this.remove()">';
 }
 

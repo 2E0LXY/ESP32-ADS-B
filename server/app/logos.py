@@ -230,6 +230,14 @@ class LogoStore:
                     "token": self._token,
                     "size": size,
                     "format": "png",
+                    # Every consumer of these is dark: the feed maps are dark
+                    # panels and the LCD screensaver is black. Asking for the
+                    # dark variant means the logo arrives on a matching
+                    # background as plain RGB, so nothing downstream - least
+                    # of all the ESP32 - has to composite an alpha channel.
+                    # Not part of the cache key because it never varies; make
+                    # it a parameter and it has to be.
+                    "theme": "dark",
                     # The real 404 this whole design depends on - see the
                     # module docstring.
                     "fallback": "404",

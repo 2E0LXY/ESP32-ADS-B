@@ -1802,6 +1802,174 @@ int drawPngLine(PNGDRAW *draw) {
   return 1;
 }
 
+// Operator logos.
+//
+// The screensaver drew three initials in a tinted square because that is all
+// the device could produce on its own. The aggregator now caches each
+// airline's real logo (see server/app/logos.py), so the panel can fetch one
+// once, keep it on the card, and draw it for ever after.
+//
+// Same machinery as the map tiles deliberately: an HTTPS GET written
+// straight to a file, then read back into PSRAM and handed to PNGdec, whose
+// line callback writes into the framebuffer. That path is already proven on
+// this board. The logos are 128x128 8-bit RGB, non-interlaced and without an
+// alpha channel - checked against the live API, not assumed - which is the
+// same shape as a map tile, so nothing new has to handle transparency.
+constexpr int LOGO_PIXELS = 128;  // must be one of the server's allowed sizes
+// One outstanding request at a time, set by the render path and consumed by
+// the network task. Deliberately not a queue: the screensaver shows one
+// airline at a time, so the next rotation asks for the next logo, and a
+// backlog would only mean fetching logos for aircraft that have since left.
+volatile bool logoFetchPending = false;
+char logoFetchCode[4] = {0};
+
+// What a fetch attempt actually achieved. The distinction matters: only a
+// newly written image justifies a repaint. Treating "already know there is
+// no logo" as success repainted the whole screen, which set the tile asking
+// again, which repainted again - a spin of full-frame repaints, and a
+// full-frame repaint is the exact burst that makes this panel slip.
+enum class LogoFetch { Cached, Unavailable, Retry };
+
+// Airlines the aggregator has no logo for, remembered in RAM as well as on
+// the card so the render path stops asking at all rather than asking and
+// being told no from disk on every rotation.
+constexpr int MAX_LOGOS_UNAVAILABLE = 24;
+char logoUnavailable[MAX_LOGOS_UNAVAILABLE][4] = {};
+int logoUnavailableCount = 0;
+
+bool logoKnownUnavailable(const char *code) {
+  for (int i = 0; i < logoUnavailableCount; ++i)
+    if (!strcmp(logoUnavailable[i], code)) return true;
+  return false;
+}
+
+void rememberLogoUnavailable(const char *code) {
+  if (logoKnownUnavailable(code)) return;
+  if (logoUnavailableCount >= MAX_LOGOS_UNAVAILABLE) return;  // the card still remembers
+  memcpy(logoUnavailable[logoUnavailableCount++], code, 4);
+}
+// The decoded logo, held in PSRAM, and which airline it belongs to.
+//
+// Decoded once per airline rather than once per repaint. The screensaver's
+// repaint signature includes the aircraft's age, so it repaints about every
+// second, and reading the card and running PNGdec at 1 Hz - on the bus the
+// panel refills its bounce buffer from - is exactly the kind of load this
+// display cannot absorb. One 32 KB staging buffer turns that into a memcpy.
+uint16_t *logoPixels = nullptr;
+char logoPixelsCode[4] = {0};
+
+int decodeLogoPngLine(PNGDRAW *draw) {
+  // Too wide would run past the end of the row it is writing into. The
+  // request asks for 128, but a cache file written by an older build - or a
+  // server that starts answering differently - must not be able to corrupt
+  // memory here.
+  if (!logoPixels || draw->iWidth > LOGO_PIXELS) return 0;
+  if (draw->y < 0 || draw->y >= LOGO_PIXELS) return 1;  // taller than asked for: ignore the rest
+  pngDecoder.getLineAsRGB565(draw, logoPixels + draw->y * LOGO_PIXELS,
+                             PNG_RGB565_LITTLE_ENDIAN, 0xffffffff);
+  return 1;
+}
+
+// Centred in the tile rather than scaled to it: 128 into 160 leaves an even
+// margin, and a scaler here would be a lot of code for sixteen pixels.
+void blitOperatorLogo(int x, int y, int size) {
+  const int left = x + (size - LOGO_PIXELS) / 2;
+  const int top = y + (size - LOGO_PIXELS) / 2;
+  for (int row = 0; row < LOGO_PIXELS; ++row) {
+    const int destinationY = top + row;
+    if (destinationY < 0 || destinationY >= H) continue;
+    const int destinationX = max(0, left);
+    const int sourceX = max(0, -left);
+    const int count = min(LOGO_PIXELS - sourceX, W - destinationX);
+    if (count > 0) memcpy(framebuffer + destinationY * W + destinationX,
+                          logoPixels + row * LOGO_PIXELS + sourceX,
+                          count * sizeof(uint16_t));
+  }
+}
+
+// The ICAO operator prefix of a callsign: RYR2BH is Ryanair. Empty when the
+// callsign cannot carry one, which is most GA traffic - those keep the
+// initials tile.
+bool operatorLogoCode(const char *flight, char *out) {
+  out[0] = 0;
+  if (!flight) return false;
+  // Four characters minimum: three letters and at least one of the flight
+  // number. A bare three-letter callsign is not an airline flight.
+  if (strlen(flight) < 4) return false;
+  for (int i = 0; i < 3; ++i) {
+    const char c = static_cast<char>(toupper(static_cast<unsigned char>(flight[i])));
+    if (c < 'A' || c > 'Z') return false;
+    out[i] = c;
+  }
+  out[3] = 0;
+  return true;
+}
+
+String operatorLogoPath(const char *code) {
+  return (sdMounted ? "/adsb/logo_" : "/logo_") + String(code) + ".png";
+}
+
+// A logo the aggregator has none of. Recorded so the device stops asking;
+// without it every screensaver rotation past a cargo or charter operator
+// would spend another request for the same 404.
+String operatorLogoMissPath(const char *code) {
+  return (sdMounted ? "/adsb/logo_" : "/logo_") + String(code) + ".none";
+}
+
+bool drawCachedOperatorLogo(int x, int y, int size, const char *code) {
+  if (!framebuffer || !pngDecoderPtr) return false;
+  // Already decoded and still the same airline: nothing to do but copy it.
+  if (logoPixels && !strcmp(logoPixelsCode, code)) {
+    blitOperatorLogo(x, y, size);
+    return true;
+  }
+
+  fs::FS &cache = sdMounted ? static_cast<fs::FS &>(SDCARD) : static_cast<fs::FS &>(LittleFS);
+  const String path = operatorLogoPath(code);
+  File file = cache.open(path, FILE_READ);
+  if (!file) return false;
+  const size_t bytes = file.size();
+  if (!bytes || bytes > 128UL * 1024UL) { file.close(); cache.remove(path); return false; }
+
+  if (!logoPixels) {
+    logoPixels = static_cast<uint16_t *>(heap_caps_malloc(
+        LOGO_PIXELS * LOGO_PIXELS * sizeof(uint16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    // PSRAM only. This is 32 KB and internal RAM is the scarce resource the
+    // TLS handshake needs; taking it from there to draw a logo would trade a
+    // working feed for a prettier tile.
+    if (!logoPixels) { file.close(); return false; }
+  }
+  uint8_t *data = static_cast<uint8_t *>(heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (!data) data = static_cast<uint8_t *>(malloc(bytes));
+  if (!data) { file.close(); return false; }
+  const size_t read = file.read(data, bytes);
+  file.close();
+  if (read != bytes) {
+    heap_caps_free(data);
+    cache.remove(path);
+    return false;
+  }
+
+  // Cleared first: a logo narrower or shorter than 128 would otherwise leave
+  // the previous airline's pixels showing around the edges of this one.
+  memset(logoPixels, 0, LOGO_PIXELS * LOGO_PIXELS * sizeof(uint16_t));
+  logoPixelsCode[0] = 0;
+  const int opened = pngDecoder.openRAM(data, bytes, decodeLogoPngLine);
+  const bool success = opened == PNG_SUCCESS && pngDecoder.decode(nullptr, 0) == PNG_SUCCESS;
+  if (opened == PNG_SUCCESS) pngDecoder.close();
+  heap_caps_free(data);
+  if (!success) {
+    // Same reasoning as the map tiles: a corrupt file would otherwise sit
+    // there failing to draw for ever.
+    cache.remove(path);
+    Serial.printf("Removed undecodable operator logo %s\n", code);
+    return false;
+  }
+  memcpy(logoPixelsCode, code, 4);
+  blitOperatorLogo(x, y, size);
+  return true;
+}
+
 String osmTilePath(uint8_t zoom, int tileX, int tileY) {
   return (sdMounted ? "/adsb/osm_" : "/osm_") + String(zoom) + "_" +
          String(tileX) + "_" + String(tileY) + ".png";
@@ -1896,6 +2064,76 @@ bool cacheOsmTile(uint8_t zoom, int tileX, int tileY, const String &path) {
     return false;
   }
   return true;
+}
+
+// Fetched from our own aggregator rather than logo.dev directly: the logo is
+// already cached there for every customer, so this costs the provider
+// nothing, needs no token on the device, and works whichever aircraft feed
+// the user has selected - the endpoint is deliberately unauthenticated.
+constexpr char LOGO_ENDPOINT[] = "https://adsb.2e0lxy.uk/logo/airline/";
+// The TLS handshake for this needs a contiguous internal block, and that is
+// exactly what the device has least of - it is why the route lookups had to
+// move to the server. So a logo is only ever fetched when there is
+// comfortable headroom; otherwise it waits for a later rotation. Worst case
+// the initials tile stays, which is what was there before.
+constexpr size_t LOGO_MIN_INTERNAL_BLOCK = 48u * 1024u;
+
+LogoFetch cacheOperatorLogo(const char *code) {
+  fs::FS &cache = sdMounted ? static_cast<fs::FS &>(SDCARD) : static_cast<fs::FS &>(LittleFS);
+  const String path = operatorLogoPath(code);
+  const String missPath = operatorLogoMissPath(code);
+  if (cache.exists(missPath)) return LogoFetch::Unavailable;
+  // Present already means the draw that asked for this failed to decode it
+  // and removed it, or another pass just fetched it. Either way it is worth
+  // one repaint to find out.
+  if (cache.exists(path)) return LogoFetch::Cached;
+  if (WiFi.status() != WL_CONNECTED) return LogoFetch::Retry;
+  if (tileCacheFreeBytes() < MIN_TILE_CACHE_FREE_BYTES) return LogoFetch::Retry;
+  const size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (largest < LOGO_MIN_INTERNAL_BLOCK) {
+    Serial.printf("Logo %s deferred: largestInternal=%u\n", code, static_cast<unsigned>(largest));
+    return LogoFetch::Retry;
+  }
+
+  WiFiClientSecure client;
+  applyTlsPolicy(client);
+  HTTPClient http;
+  http.setTimeout(12000); http.setConnectTimeout(12000);
+  // No theme parameter: the aggregator already requests the dark-background
+  // variant for every consumer, which is why these arrive as plain RGB with
+  // no alpha channel for this device to composite.
+  const String url = String(LOGO_ENDPOINT) + code + ".png?size=" + String(LOGO_PIXELS);
+  if (!http.begin(client, url)) return LogoFetch::Retry;
+  http.addHeader("User-Agent", userAgent());
+  const int status = http.GET();
+  if (status == HTTP_CODE_NOT_FOUND) {
+    // A real answer, not a failure: the aggregator has no logo for this
+    // airline. Remember it so we stop asking.
+    http.end();
+    File marker = cache.open(missPath, FILE_WRITE);
+    if (marker) marker.close();
+    Serial.printf("Logo %s: none available\n", code);
+    return LogoFetch::Unavailable;
+  }
+  if (status != HTTP_CODE_OK) {
+    Serial.printf("Logo %s HTTP %d\n", code, status);
+    http.end();
+    return LogoFetch::Retry;
+  }
+  const int expected = http.getSize();
+  File file = cache.open(path, FILE_WRITE);
+  const int written = file ? http.writeToStream(&file) : -1;
+  if (file) file.close();
+  http.end();
+  // Same short-write check as the map tiles: a truncated PNG committed to
+  // the cache would fail to decode for ever after.
+  if (written <= 0 || (expected > 0 && written != expected)) {
+    Serial.printf("Logo %s write failed: %d of %d bytes\n", code, written, expected);
+    cache.remove(path);
+    return LogoFetch::Retry;
+  }
+  Serial.printf("Logo %s cached (%d bytes)\n", code, written);
+  return LogoFetch::Cached;
 }
 
 bool drawCachedOsmTile(const String &path, int screenX, int screenY) {
@@ -2588,6 +2826,19 @@ void drawMlatPlane(int x, int y, float heading) {
 // airline's colour with its ICAO prefix reversed out of it, which reads at a
 // glance from across a room in the same way the logo does.
 void drawOperatorTile(int x, int y, int size, const char *flight, const char *hex) {
+  // The real logo when we have one, initials when we do not. Asking for the
+  // logo here rather than anywhere else is on purpose: this is the only
+  // place that knows an airline is actually being shown to someone, so the
+  // device only ever fetches logos it is about to display.
+  char airline[4];
+  if (size >= LOGO_PIXELS && operatorLogoCode(flight, airline)) {
+    if (drawCachedOperatorLogo(x, y, size, airline)) return;
+    if (!logoFetchPending && !logoKnownUnavailable(airline)) {
+      memcpy(logoFetchCode, airline, 4);
+      logoFetchPending = true;
+    }
+  }
+
   char code[4] = {'?', '?', '?', 0};
   const char *src = (flight && strlen(flight) >= 3) ? flight : hex;
   for (int i = 0; i < 3 && src && src[i]; ++i) code[i] = toupper(static_cast<unsigned char>(src[i]));
@@ -5908,6 +6159,33 @@ void networkTask(void *) {
       previousWifiSsid = "";
       previousWifiPassword = "";
     }
+    // A logo the screensaver has just asked for. On the network task, so the
+    // TLS handshake and the SD write never happen on the core that drives
+    // the panel. At most one per pass, and the render path only asks for one
+    // at a time, so this cannot turn into a burst of HTTPS requests.
+    if (logoFetchPending) {
+      // Under the lock: the render task writes the code and the flag, and a
+      // three-byte copy read while it was being written would fetch some
+      // other airline's logo.
+      char code[4];
+      { MutexGuard guard(dataMutex); memcpy(code, logoFetchCode, 4); }
+      const LogoFetch outcome = cacheOperatorLogo(code);
+      MutexGuard guard(dataMutex);
+      if (outcome == LogoFetch::Cached) {
+        // Repaint so the logo replaces the initials now rather than at the
+        // next rotation. The screensaver skips repaints whose content has
+        // not changed, and the logo is not part of that signature, so
+        // without this the tile it was fetched for would already be gone.
+        screensaverNeedsRedraw = true;
+      } else if (outcome == LogoFetch::Unavailable) {
+        rememberLogoUnavailable(code);
+      }
+      // Cleared whatever happened: a Retry is worth another go, but on a
+      // later rotation rather than immediately, and clearing it here stops
+      // one unreachable logo blocking every other airline's.
+      logoFetchPending = false;
+    }
+
     // One place to record a network that works, whichever route got us
     // there: the boot autoConnect, the setup portal, or the Wi-Fi page. The
     // alternative was remembering at each of those call sites and missing
