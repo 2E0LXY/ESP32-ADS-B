@@ -86,14 +86,14 @@ def admin_dashboard(
         recent = (
             db.query(models.UsageLog)
             .filter(models.UsageLog.device_id == device.id)
-            .order_by(models.UsageLog.created_at.desc())
+            .order_by(models.UsageLog.at.desc())
             .first()
         )
         device.last_aircraft = recent.aircraft_returned if recent else None
         device.polls_today = (
             db.query(models.UsageLog)
             .filter(models.UsageLog.device_id == device.id,
-                    models.UsageLog.created_at >= day_ago)
+                    models.UsageLog.at >= day_ago)
             .count()
         )
         device.feeder_state = (

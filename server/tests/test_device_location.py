@@ -6,6 +6,7 @@ with different registered locations get different aircraft, and the
 aggregator polls upstream for both areas rather than one global point.
 """
 
+import os
 import asyncio
 
 import pytest
@@ -253,3 +254,24 @@ def test_a_poll_without_a_version_does_not_blank_a_known_one(client):
                headers={"Authorization": f"Bearer {key}", "User-Agent": "curl/8.5.0"})
 
     assert _recorded_firmware(device_id) == "2.6.0"
+
+
+def test_the_admin_dashboard_renders_the_new_device_detail(client):
+    """Nothing rendered /admin in the suite, so a wrong column name on the
+    UsageLog query would only have shown up as a 500 in production."""
+    device_id, key = _registered_device(client, "fw3@example.com")
+    client.get("/v1/aircraft?lat=53.73&lon=-1.57&radius=25",
+               headers={"Authorization": f"Bearer {key}",
+                        "User-Agent": "2E0LXY-ESP32-ADSB/2.6.0 (+x)"})
+
+    client.post("/admin/login",
+                data={"email": os.environ["ADMIN_BOOTSTRAP_EMAIL"],
+                      "password": os.environ["ADMIN_BOOTSTRAP_PASSWORD"]},
+                follow_redirects=False)
+    page = client.get("/admin")
+    assert page.status_code == 200, page.text
+    assert "Loft receiver" in page.text
+    assert "2.6.0" in page.text
+    # The columns that were added, each fed by a separate query.
+    for heading in ("Firmware", "Location", "Last result", "Polls 24h", "Feeder"):
+        assert heading in page.text
