@@ -944,8 +944,11 @@ bool screensaverEnabled = false;
 uint16_t screensaverIdleMinutes = 5;
 bool screensaverActive = false;
 uint32_t lastInteractionAt = 0;
-uint32_t screensaverRotateAt = 0;
-int screensaverAircraftIndex = 0;
+// How often the screensaver reconsiders what it is showing. Slow on purpose:
+// each repaint is a full-screen clear, and the signature check inside
+// renderScreensaverPage() means a tick on an unchanged sky costs nothing.
+constexpr uint32_t SCREENSAVER_REFRESH_MS = 10000UL;
+uint32_t screensaverRefreshAt = 0;
 uint8_t brightnessPercent = 100;
 bool webServerReady = false;
 bool restartPending = false;
@@ -3705,11 +3708,6 @@ int collectOverheadAircraft(int *matches, int capacity) {
   return count;
 }
 
-int overheadAircraftCount() {
-  int matches[32];
-  return collectOverheadAircraft(matches, 32);
-}
-
 // Set when the screensaver is entered, so the first frame after it appears
 // is always painted even if the content signature happens to match.
 bool screensaverNeedsRedraw = true;
@@ -3754,7 +3752,7 @@ void renderScreensaverPage() {
   mix(static_cast<uint32_t>(overheadCount));
   mixText(address);
   if (overheadCount > 0) {
-    const AircraftDisplay &shown = latestAircraft[overheadMatches[screensaverAircraftIndex % overheadCount]];
+    const AircraftDisplay &shown = latestAircraft[overheadMatches[0]];
     mixText(shown.hex);
     mixText(shown.flight);
     mixText(shown.squawk);
@@ -3798,7 +3796,12 @@ void renderScreensaverPage() {
     present();
     return;
   }
-  AircraftDisplay &a = latestAircraft[overheadMatches[screensaverAircraftIndex % overheadCount]];
+  // The closest thing overhead, not a rotation through all of them.
+  // latestAircraft is sorted by distance (sortAircraftByDistance), so the
+  // first match is the nearest, and it changes only when something actually
+  // overtakes it - which is a far better trigger for a full-screen repaint
+  // than a timer that cycles whether or not the picture would differ.
+  AircraftDisplay &a = latestAircraft[overheadMatches[0]];
   RouteCacheEntry *route = cachedRoute(a.flight);
   const bool hasRoute = route && route->hasRoute;
 
@@ -3933,8 +3936,10 @@ void renderScreensaverPage() {
 
   // Which of the overhead aircraft this is, and the way out.
   char footer[48];
-  snprintf(footer, sizeof(footer), "%d/%d OVERHEAD - TAP OR SWIPE TO RETURN",
-           (screensaverAircraftIndex % overheadCount) + 1, overheadCount);
+  if (overheadCount > 1)
+    snprintf(footer, sizeof(footer), "NEAREST OF %d OVERHEAD - TAP OR SWIPE TO RETURN", overheadCount);
+  else
+    snprintf(footer, sizeof(footer), "OVERHEAD - TAP OR SWIPE TO RETURN");
   text5(margin, H - 14, footer, rgb(70, 90, 110));
   present();
 }
@@ -6645,23 +6650,21 @@ void loop() {
       millis() - lastInteractionAt > screensaverIdleMinutes * 60000UL) {
     screensaverActive = true;
     screensaverNeedsRedraw = true;
-    screensaverAircraftIndex = 0;
-    screensaverRotateAt = millis() + 6000UL;
+    screensaverRefreshAt = millis() + SCREENSAVER_REFRESH_MS;
     MutexGuard guard(dataMutex);
     renderCurrentPage();
-  } else if (screensaverActive && static_cast<int32_t>(millis() - screensaverRotateAt) >= 0) {
-    screensaverRotateAt = millis() + 6000UL;
-    // Rotating through one aircraft, or none, redraws an identical frame.
-    // Every one of those repaints clears the full screen - 768 KB of writes
-    // across the bus the panel refills its bounce buffers from - so it is a
-    // burst of exactly the kind that makes the picture slip, spent on a
-    // frame no one can tell from the one already on screen. Only redraw
-    // when the content will actually differ.
-    if (overheadAircraftCount() > 1) {
-      ++screensaverAircraftIndex;
-      MutexGuard guard(dataMutex);
-      renderCurrentPage();
-    }
+  } else if (screensaverActive && static_cast<int32_t>(millis() - screensaverRefreshAt) >= 0) {
+    screensaverRefreshAt = millis() + SCREENSAVER_REFRESH_MS;
+    // Every repaint clears the full screen - 768 KB of writes across the bus
+    // the panel refills its bounce buffers from - so it is a burst of
+    // exactly the kind that makes the picture slip. Hence a deliberately
+    // slow cadence, and renderScreensaverPage() still compares a signature
+    // of everything it draws and returns without touching the framebuffer
+    // when the frame would be identical. So this tick costs nothing on a
+    // quiet sky and repaints only when a value on screen has actually
+    // moved, or when a closer aircraft has taken over the display.
+    MutexGuard guard(dataMutex);
+    renderCurrentPage();
   }
   delay(15);
 }
