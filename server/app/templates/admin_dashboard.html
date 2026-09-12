@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block header_title %}Admin{% endblock %}
+{% block nav %}<a href="/admin/accounts">Accounts</a><a href="/admin/audit-log">Audit log</a><a href="/admin/logout">Log out</a>{% endblock %}
+{% block content %}
+
+<div class="panel">
+<h2>Upstream source health</h2>
+<table>
+<thead><tr><th>Source</th><th>Status</th><th>Last success</th><th>Consecutive errors</th><th>Last error</th></tr></thead>
+<tbody>
+{% for name, h in health.items() %}
+<tr>
+<td>{{ name }}</td>
+<td>{% if h.ok %}<span class="badge ok">Up</span>{% else %}<span class="badge bad">Down</span>{% endif %}</td>
+<td>{{ h.last_success_str }}</td>
+<td>{{ h.consecutive_errors }}</td>
+<td class="sub">{{ h.last_error or '--' }}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+<p class="sub" style="margin-top:10px">Cache holds {{ cache_size }} aircraft. Poll interval: {{ poll_interval }}s.</p>
+</div>
+
+<div class="panel">
+<h2>Overview</h2>
+<table>
+<tbody>
+<tr><td>Accounts</td><td>{{ account_count }}</td></tr>
+<tr><td>Devices</td><td>{{ device_count }}</td></tr>
+<tr><td>Active API keys</td><td>{{ active_key_count }}</td></tr>
+<tr><td>Donated feeder keys</td><td>{{ feeder_key_count }}</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="panel">
+<h2>Recently active devices</h2>
+<table>
+<thead><tr><th>Device</th><th>Account</th><th>Last seen</th><th>Firmware</th></tr></thead>
+<tbody>
+{% for device in recent_devices %}
+<tr>
+<td>{{ device.name }}</td>
+<td>{{ device.account.email }}</td>
+<td>{{ device.last_seen_at.strftime('%Y-%m-%d %H:%M UTC') if device.last_seen_at else 'Never' }}</td>
+<td>{{ device.firmware_version or '--' }}</td>
+</tr>
+{% else %}
+<tr><td colspan="4" class="sub">No devices have checked in yet.</td></tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+
+{% endblock %}

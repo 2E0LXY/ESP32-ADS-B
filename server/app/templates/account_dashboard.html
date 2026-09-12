@@ -1,0 +1,157 @@
+{% extends "base.html" %}
+{% block header_title %}My account{% endblock %}
+{% block nav %}<a href="/logout">Log out</a>{% endblock %}
+{% block content %}
+
+{% if new_key %}
+<div class="panel" style="border-color:var(--green)">
+<h2 style="color:var(--green)">Your new API key</h2>
+<p>Copy this now - it will never be shown again. Paste it into your device's admin page under
+<b>Data API &rarr; 2E0LXY Aggregator &rarr; API key</b>.</p>
+<code style="font-size:15px;display:block;padding:10px;word-break:break-all">{{ new_key }}</code>
+</div>
+{% endif %}
+
+<div class="panel">
+<h2>My devices</h2>
+<table>
+<thead><tr><th>Name</th><th>Last seen</th><th>Location</th><th>Firmware</th><th>Key</th><th></th></tr></thead>
+<tbody>
+{% for device in devices %}
+<tr>
+<td>
+<form class="inline" method="post" action="/devices/{{ device.id }}/rename">
+<input class="input" name="name" value="{{ device.name }}" maxlength="120" required style="width:180px">
+<button type="submit">Rename</button>
+</form>
+</td>
+<td>{{ device.last_seen_at.strftime('%Y-%m-%d %H:%M UTC') if device.last_seen_at else 'Never' }}</td>
+<td>
+{% set loc = device.location() %}
+{% if loc %}<code>{{ '%.4f'|format(loc[0]) }}, {{ '%.4f'|format(loc[1]) }}</code> · {{ loc[2]|int }} nm<br>
+<span class="sub">{{ device.location_source() }}{% if device.inferred_lat is not none and device.reported_lat is none and device.manual_lat is none %} (±{{ device.inferred_spread_nm|int }} nm){% endif %}</span>
+{% else %}<span class="sub">Not set - using the server default</span>{% endif %}
+</td>
+<td>{{ device.firmware_version or '--' }}</td>
+<td>{% if device.active_key %}<code>{{ device.active_key.key_prefix }}...</code>{% else %}<span class="sub">No key issued</span>{% endif %}</td>
+<td>
+<form class="inline" method="post" action="/devices/{{ device.id }}/reissue-key"><button type="submit">{{ 'Reissue key' if device.active_key else 'Issue key' }}</button></form>
+<form class="inline" method="post" action="/devices/{{ device.id }}/delete" onsubmit="return confirm('Delete this device and revoke its key?')"><button class="danger" type="submit">Delete</button></form>
+</td>
+</tr>
+<tr><td colspan="6" class="sub" style="padding-top:0">
+<form class="inline" method="post" action="/devices/{{ device.id }}/location">
+Location:
+<input class="input" name="latitude" placeholder="53.7326" value="{{ device.manual_lat if device.manual_lat is not none else '' }}" style="width:110px">
+<input class="input" name="longitude" placeholder="-1.4579" value="{{ device.manual_lon if device.manual_lon is not none else '' }}" style="width:110px">
+<input class="input" name="radius" placeholder="50" value="{{ device.manual_radius_nm|int if device.manual_radius_nm is not none else '' }}" style="width:70px"> nm
+<button type="submit">Save</button>
+</form>
+&nbsp;Only needed until the receiver reports its own position - it sends one with every request. Clear both coordinates to fall back to the server default.
+{% if device.inferred_lat is not none %}<br>&nbsp;Your feed puts this receiver near <code>{{ '%.4f'|format(device.inferred_lat) }}, {{ '%.4f'|format(device.inferred_lon) }}</code>, estimated from the low-altitude aircraft it hears. Used only while nothing better is known.{% endif %}
+</td></tr>
+{% else %}
+<tr><td colspan="6" class="sub">No devices yet - add one below.</td></tr>
+{% endfor %}
+</tbody>
+</table>
+<form method="post" action="/devices" style="margin-top:14px;display:flex;gap:10px;align-items:end">
+<div><label>New device name</label><input class="input" name="name" placeholder="Living room receiver" required></div>
+<button type="submit">Add device</button>
+</form>
+</div>
+
+<div class="panel">
+<h2>Feed your own receiver into this system</h2>
+<p class="sub">Already run a physical receiver (readsb, dump1090, PiAware) feeding FlightAware, FlightRadar24, or
+similar? Point one more output at this server and two things happen: you get a live map of exactly what your own
+receiver sees, and those aircraft are added into the shared feed every device (including yours) can see - useful
+for local coverage the public APIs might miss. This is separate from the donated API keys below - this is your
+receiver's own raw data, not a key to someone else's network.</p>
+<table>
+<thead><tr><th>Device</th><th>Status</th><th>Assigned port</th><th>Last message</th><th>Public link</th><th></th></tr></thead>
+<tbody>
+{% for device in devices %}
+<tr>
+<td>
+<form class="inline" method="post" action="/devices/{{ device.id }}/rename">
+<input class="input" name="name" value="{{ device.name }}" maxlength="120" required style="width:150px">
+<button type="submit">Rename</button>
+</form>
+</td>
+<td>{% if device.feeder_enabled %}<span class="badge ok">Enabled</span>{% else %}<span class="badge bad">Off</span>{% endif %}</td>
+<td>{{ device.feeder_port or '--' }}</td>
+<td>{{ device.feeder_last_message_at.strftime('%Y-%m-%d %H:%M UTC') if device.feeder_last_message_at else 'Never' }}</td>
+<td>
+{% if device.share_token %}
+<input class="input" readonly style="width:230px;font-size:11px"
+       value="{{ request.url.scheme }}://{{ request.url.netloc }}/share/{{ device.share_token }}"
+       onclick="this.select()">
+<div class="sub" style="margin-top:4px">
+<form class="inline" method="post" action="/devices/{{ device.id }}/share"><button type="submit">New link</button></form>
+<form class="inline" method="post" action="/devices/{{ device.id }}/share/revoke"><button class="danger" type="submit">Revoke</button></form>
+</div>
+{% else %}
+<form class="inline" method="post" action="/devices/{{ device.id }}/share"><button type="submit">Create link</button></form>
+{% endif %}
+</td>
+<td>
+{% if device.feeder_enabled %}
+<a href="/account/my-feed/{{ device.id }}"><button type="button">View my feed</button></a>
+<form class="inline" method="post" action="/devices/{{ device.id }}/feeder/disable"><button class="danger" type="submit">Turn off</button></form>
+{% else %}
+<form class="inline" method="post" action="/devices/{{ device.id }}/feeder/enable"><button type="submit">Enable</button></form>
+{% endif %}
+</td>
+</tr>
+{% if device.feeder_enabled and device.feeder_port %}
+<tr><td colspan="6" class="sub" style="padding-top:0">
+Point your receiver's SBS/BaseStation output at <code>{{ request.url.hostname }}:{{ device.feeder_port }}</code>.
+For readsb/dump1090-fa, add to your config: <code>--net-connector={{ request.url.hostname }},{{ device.feeder_port }},sbs_out</code>
+(or the equivalent "additional SBS output" field if you're using a web-based config tool). No firewall changes needed
+on your end - your receiver connects out to us, nothing connects in to you.
+<br>If your receiver software can't push SBS out on its own - most Windows setups, or a managed image whose
+config you'd rather not edit - run the small feeder client instead: see <code>server/tools/README.md</code>
+for Debian and Windows instructions. It needs only <code>{{ request.url.hostname }}</code> and port
+<code>{{ device.feeder_port }}</code>.
+</td></tr>
+{% endif %}
+{% else %}
+<tr><td colspan="6" class="sub">Add a device above first.</td></tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+
+<div class="panel">
+<h2>Donated feeder keys</h2>
+<p class="sub">Already run your own receiver and feed adsb.fi, airplanes.live, or adsb.lol? Donate that personal
+key here and the aggregator will use it (within your own allowance) to help serve every device, yours included.
+This never shares your credential with anyone else - it's only used server-side by this aggregator.</p>
+<table>
+<thead><tr><th>Provider</th><th>Label</th><th>Status</th><th></th></tr></thead>
+<tbody>
+{% for fk in feeder_keys %}
+<tr>
+<td>{{ fk.provider.value }}</td>
+<td>{{ fk.label or '--' }}</td>
+<td>{% if fk.enabled %}<span class="badge ok">Active</span>{% else %}<span class="badge bad">Disabled</span>{% endif %}</td>
+<td>
+<form class="inline" method="post" action="/feeder-keys/{{ fk.id }}/toggle"><button type="submit">{{ 'Disable' if fk.enabled else 'Enable' }}</button></form>
+<form class="inline" method="post" action="/feeder-keys/{{ fk.id }}/delete" onsubmit="return confirm('Remove this donated key?')"><button class="danger" type="submit">Remove</button></form>
+</td>
+</tr>
+{% else %}
+<tr><td colspan="4" class="sub">None donated yet.</td></tr>
+{% endfor %}
+</tbody>
+</table>
+<form method="post" action="/feeder-keys" style="margin-top:14px;display:flex;gap:10px;align-items:end;flex-wrap:wrap">
+<div><label>Provider</label><select class="input" name="provider"><option value="adsbfi">adsb.fi</option><option value="airplaneslive">airplanes.live</option><option value="adsblol">adsb.lol</option></select></div>
+<div><label>Your API key / credential</label><input class="input" name="credential" required></div>
+<div><label>Label (optional)</label><input class="input" name="label" placeholder="Home station"></div>
+<button type="submit">Donate key</button>
+</form>
+</div>
+
+{% endblock %}

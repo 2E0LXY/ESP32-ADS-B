@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block header_title %}Accounts{% endblock %}
+{% block nav %}<a href="/admin">Dashboard</a><a href="/admin/audit-log">Audit log</a><a href="/admin/logout">Log out</a>{% endblock %}
+{% block content %}
+
+<div class="panel">
+<h2>Create account</h2>
+<form method="post" action="/admin/accounts" style="display:flex;gap:10px;align-items:end;flex-wrap:wrap">
+<div><label>Email</label><input class="input" type="email" name="email" required></div>
+<div><label>Initial password</label><input class="input" type="text" name="password" required minlength="8"></div>
+<button type="submit">Create</button>
+</form>
+<p class="sub" style="margin-top:8px">For inviting a customer directly rather than waiting for self-service signup. Give them this password to log in and change it themselves.</p>
+</div>
+
+<div class="panel">
+<h2>All accounts ({{ accounts|length }})</h2>
+<table>
+<thead><tr><th>Email</th><th>Devices</th><th>Active keys</th><th>Joined</th><th>Status</th><th></th></tr></thead>
+<tbody>
+{% for account in accounts %}
+<tr>
+<td>{{ account.email }}</td>
+<td>{{ account.devices|length }}</td>
+<td>{{ account.devices|sum(attribute='active_key_count') }}</td>
+<td>{{ account.created_at.strftime('%Y-%m-%d') }}</td>
+<td>{% if account.is_active %}<span class="badge ok">Active</span>{% else %}<span class="badge bad">Suspended</span>{% endif %}</td>
+<td>
+<form class="inline" method="post" action="/admin/accounts/{{ account.id }}/toggle"><button type="submit">{{ 'Suspend' if account.is_active else 'Reactivate' }}</button></form>
+<form class="inline" method="post" action="/admin/accounts/{{ account.id }}/delete" onsubmit="return confirm('Delete this account, its devices, and all its keys? This cannot be undone.')"><button class="danger" type="submit">Delete</button></form>
+</td>
+</tr>
+{% else %}
+<tr><td colspan="6" class="sub">No accounts yet.</td></tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+
+{% endblock %}

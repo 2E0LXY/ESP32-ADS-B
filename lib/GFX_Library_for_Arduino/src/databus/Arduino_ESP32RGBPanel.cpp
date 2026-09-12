@@ -47,6 +47,8 @@ bool Arduino_ESP32RGBPanel::begin(int32_t speed)
   return true;
 }
 
+uint16_t Arduino_ESP32RGBPanel::_bounce_buffer_lines = RGB_BOUNCE_BUFFER_LINES;
+
 uint16_t *Arduino_ESP32RGBPanel::getFrameBuffer(int16_t w, int16_t h)
 {
   esp_lcd_rgb_panel_config_t panel_config = {
@@ -84,7 +86,7 @@ uint16_t *Arduino_ESP32RGBPanel::getFrameBuffer(int16_t w, int16_t h)
       // On the 800x480 boards that starves mbedTLS and every HTTPS request
       // fails with MBEDTLS_ERR_SSL_ALLOC_FAILED (-32512). Override with
       // -DRGB_BOUNCE_BUFFER_LINES=<n>; 0 disables bounce buffers entirely.
-      .bounce_buffer_size_px = static_cast<size_t>(RGB_BOUNCE_BUFFER_LINES) * static_cast<size_t>(w),
+      .bounce_buffer_size_px = static_cast<size_t>(_bounce_buffer_lines) * static_cast<size_t>(w),
 #endif
       .sram_trans_align = 8,
       .psram_trans_align = 64,
@@ -145,6 +147,28 @@ uint16_t *Arduino_ESP32RGBPanel::getFrameBuffer(int16_t w, int16_t h)
 
   ESP_ERROR_CHECK(esp_lcd_new_rgb_panel(&panel_config, &_panel_handle));
 
+  // There is one framebuffer (num_fbs above) and the panel scans it out
+  // continuously, so anything writing a full frame into it races the beam
+  // and tears. Signalling vsync lets a caller start its write at the top of
+  // the blanking interval and stay ahead of the scan for the rest of the
+  // frame. Binary semaphore: only the most recent vsync matters, and a
+  // counting one would let a waiter return immediately on a stale count.
+  _vsync_sem = xSemaphoreCreateBinary();
+  if (_vsync_sem)
+  {
+    esp_lcd_rgb_panel_event_callbacks_t callbacks = {};
+    callbacks.on_vsync = [](esp_lcd_panel_handle_t, const esp_lcd_rgb_panel_event_data_t *,
+                            void *user_ctx) -> bool {
+      BaseType_t higher_priority_woken = pdFALSE;
+      xSemaphoreGiveFromISR(static_cast<SemaphoreHandle_t>(user_ctx), &higher_priority_woken);
+      return higher_priority_woken == pdTRUE;
+    };
+    // Not IRAM-safe, and must not be: CONFIG_LCD_RGB_ISR_IRAM_SAFE is
+    // deliberately off on this board - with fb_in_psram and bounce buffers
+    // an IRAM-safe RGB ISR reads PSRAM with the cache disabled and panics.
+    esp_lcd_rgb_panel_register_event_callbacks(_panel_handle, &callbacks, _vsync_sem);
+  }
+
   ESP_ERROR_CHECK(esp_lcd_panel_reset(_panel_handle));
   ESP_ERROR_CHECK(esp_lcd_panel_init(_panel_handle));
 
@@ -164,6 +188,18 @@ uint16_t *Arduino_ESP32RGBPanel::getFrameBuffer(int16_t w, int16_t h)
 bool Arduino_ESP32RGBPanel::restartAtNextVsync()
 {
   return _panel_handle && esp_lcd_rgb_panel_restart(_panel_handle) == ESP_OK;
+}
+
+bool Arduino_ESP32RGBPanel::waitForVsync(uint32_t timeout_ms)
+{
+  if (!_vsync_sem)
+  {
+    return false;
+  }
+  // Clear any vsync that arrived while the caller was busy - that one is
+  // already partly scanned out, and waiting for the next is the whole point.
+  xSemaphoreTake(_vsync_sem, 0);
+  return xSemaphoreTake(_vsync_sem, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
 }
 
 #endif // #if defined(ESP32) && (CONFIG_IDF_TARGET_ESP32S3)
