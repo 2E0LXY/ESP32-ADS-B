@@ -11,7 +11,34 @@ Also runs on the **Waveshare ESP32-S3-Touch-LCD-7 / -4.3, 800 × 480, GT911 touc
 
 Current firmware: **v2.6.0**
 
-### Unreleased
+### v2.6.0 display, server-side routes, and the aggregator backend
+
+Firmware:
+
+- **Real aircraft silhouettes on the LCD.** Icons were two or three filled triangles, which cannot express a fuselage with a swept wing and a tailplane, so every airframe read as the same arrowhead. Each class is now a traced outline filled by a scanline polygon fill, with engine nacelles, a propeller arc on light singles, and a rotor on helicopters
+- **Punctuation in the panel font.** The 5x7 font defined only `0-9`, `A-Z`, `>` and `-`, so everything else rendered blank: `ALT:3.4KFT` appeared as `ALT 3 4KFT` and coordinates lost their decimal points. A dropped decimal point does not read as a missing glyph, it reads as a different number
+- **Screensaver rebuilt as a full departure board**, carrying every field the feed supplies: operator, callsign, route codes and full airport names, type, altitude both barometric and geometric, speed, track, vertical rate, distance, squawk and its meaning, signal, message count, hex, ADS-B/MLAT, age, country, and position. Emergency squawks (7500/7600/7700) render in red
+- **Squawk codes are explained** rather than shown as four bare digits: the emergency codes, the routine conspicuity codes (1200/7000/2000/0000/7777), and discrete assignments
+- **Operator names from the callsign** for roughly eighty ICAO airline prefixes, so a callsign identifies its airline even before a route lookup returns
+- **Selectable pixel clock and bounce-buffer size** in the web UI, with the resulting refresh rate shown, for tuning the RGB panel against the artefacts described under [Known limitations](#known-limitations). Also a direct-draw mode that renders into the panel's own framebuffer instead of copying a frame each time
+- **Table page scrolls properly.** A tap used to advance to the next page, which made the table unscrollable; swipe gesture thresholds were retuned with peak-excursion tracking so a scroll is no longer read as a page change
+- **53 KB of internal RAM reclaimed** by moving the PNG decoder and the route cache into PSRAM, which is what the TLS handshake allocation failures were competing for
+
+Data:
+
+- **Routes are resolved by the server, not the device.** The ESP32 queried adsbdb itself at roughly 2.2 seconds of blocked network task per callsign, needing more contiguous internal RAM for the TLS handshake than was free. That is what the intermittent `PK verify failed 0x4290` errors actually were: an allocation failure reported as a certificate failure. The aggregator now attaches origin and destination to each aircraft in the response the device already fetches, so there is no extra connection, no handshake and no throttle. One resolution serves every customer who can see that flight, which is also less load on adsbdb than before
+- **Fetch-phase instrumentation.** A slow refresh now reports where its time went, and a slow route lookup logs the largest free internal block at that instant
+
+Backend (`server/`), see [Aggregator backend](#aggregator-backend):
+
+- **Per-device receiver location**, so the aggregator polls upstream for each customer's sky rather than only the operator's. A device reports its own position on every request, so a receiver that moves follows itself
+- **Receiver position inferred from the feed** for a feeder that never states one, from the radio horizon of the low aircraft it hears
+- **Public share links**: an unlisted read-only URL for one receiver's live map, viewable by anyone the owner sends it to, with no account
+- **Feeder client** for Debian and Windows in `server/tools/`, for receiver software that cannot push SBS out on its own
+- **Devices and feeder stations can be renamed** from the account dashboard
+- **Live "my feed" map** showing only what a customer's own receiver is reporting, with track-aligned icons, an altitude colour ramp, and full detail on click
+
+### Also in v2.6.0
 
 - **LCD Overview page**: adds a route (`RTE`) column next to the nearest-aircraft strip, sourced from the same route cache used by the Table and Map pages
 - **LCD Table page**: redesigned as an airport-departure-board style layout — alternating row colours, a yellow callsign, a single-letter green `A` / red `M` source instead of the word ADSB/MLAT, and tightened columns that give the freed width to the route column
@@ -102,6 +129,13 @@ Current firmware: **v2.6.0**
 - Centred, wide-screen admin pages with receiver quick actions and live health summaries
 - One-click radar range presets, Wi-Fi quality meter, recovery links, and privacy-safe diagnostic export
 - Boot screen displays the management IP address after Wi-Fi connects
+- Six physical LCD pages in a swipe cycle: Overview, Table, Map, Radar, Marine, and an idle departure-board screensaver
+- Live AIS vessel tracking on the LCD and in the browser, from a choice of four marine providers
+- Real aircraft silhouettes per airframe class, coloured by altitude and pointed along the track
+- Route lookups resolved by the aggregator backend rather than by the device, so a callsign costs no TLS handshake on the ESP32
+- Resolved routes cached to SD (or LittleFS) and reloaded at boot, so a receiver that sees the same flights daily never starts cache-cold
+- Selectable pixel clock, bounce-buffer size, and direct-draw rendering for tuning the RGB panel
+- Optional multi-tenant aggregator backend in `server/` with accounts, per-device keys, own-receiver feed ingestion, and public share links
 
 ## Supported hardware
 
@@ -164,6 +198,8 @@ Searchable live table containing operator name, ICAO address, callsign, registra
 Select the physical Map, Radar, or Table page, set brightness, enable or disable the zero-mile alert, and request an immediate refresh. One-click range presets set 10, 25, 50, or 100 nautical miles. Radar mode uses the saved receiver position and radius, draws a moving sweep, and marks out-of-range aircraft in red at the rim. The page also reports LCD tile-cache rebuild progress after a position, range, or zoom change. The selected page remains active after reboot.
 
 A **Screensaver** toggle and an idle-time field (1-120 minutes, off by default) control the idle screensaver: after the panel goes untouched for that long, it switches to a rotating departure-board style display of whichever aircraft are currently overhead (within about 5 miles of slant range - distance and altitude combined, so a jet at cruise directly above doesn't count as "overhead"), showing its operator badge, callsign, route, type, and a departing/arriving/en-route guess. Any tap, swipe, or the boot button dismisses it back to the page it interrupted.
+
+**Panel tuning.** Three further controls exist for the RGB panel itself, because the right values depend on the individual board and on what else is competing for the PSRAM bus. **Pixel clock** (9-21 MHz) sets the panel clock and shows the refresh rate each choice produces. **Bounce buffer** sets how many scanlines of internal DMA RAM the panel driver refills ahead of the scan; larger values are more tolerant of a busy bus but take internal RAM away from the TLS handshake. **Direct draw** renders straight into the panel's own framebuffer instead of composing a frame and copying it. Changing the pixel clock or the bounce buffer reboots the device. See [Known limitations](#known-limitations) for what these are for.
 
 ![Display page](docs/screenshots/display.png)
 
@@ -304,6 +340,73 @@ If the board does not enter download mode, hold **BOOT**, tap **RESET**, begin t
 ## OpenStreetMap usage
 
 Map data is © OpenStreetMap contributors. The browser and LCD show attribution. The LCD requests only the tiles visible for the configured receiver area, identifies this firmware in its User-Agent, and caches tiles on microSD when available or LittleFS otherwise. Do not modify the firmware to bulk-download tiles from the public OpenStreetMap tile service.
+
+## Known limitations
+
+- **Frame roll and flickering scanlines on the 800 x 480 panel.** The top few
+  lines of the frame can appear at the bottom, and text can be cut mid-word
+  with the halves at different offsets. Both are the same fault at different
+  magnitudes: the RGB panel's bounce buffer misses its refill deadline while
+  the CPU saturates the same PSRAM bus, so the scan position slips. The
+  panel's DMA recovery on vertical blank is supported and does fire; the
+  artefacts happen anyway.
+
+  The pixel clock, bounce buffer and direct-draw controls on the **Display**
+  page are there to trade this off against the internal RAM the TLS handshake
+  needs. A 40-scanline bounce buffer clears the display but leaves too little
+  contiguous internal RAM for HTTPS; 20 or less leaves HTTPS working but the
+  artefacts return. Moving route lookups to the backend and reclaiming 53 KB
+  of internal RAM widened that margin but did not remove the trade. The real
+  fix is to stop `present()` copying 768 KB from PSRAM to PSRAM every frame
+  and draw only the regions that changed, which is not done.
+
+  The 480 x 480 board is not affected in the same way; it has a smaller frame
+  and more headroom.
+
+- **Do not set the RGB panel sdkconfig options via `custom_sdkconfig`.**
+  `CONFIG_LCD_RGB_RESTART_IN_VSYNC` is already enabled in the stock prebuilt
+  Arduino libraries, and enabling `CONFIG_LCD_RGB_ISR_IRAM_SAFE` boot-loops
+  this board with a cache-disabled panic. See the comment in
+  `platformio.ini`.
+
+- **A local `.bin` upload is not signature-checked.** It is validated for the
+  ESP32 image header and a minimum size only. GitHub OTA is fully verified;
+  a hand-uploaded image is trusted.
+
+- **The admin interface has no TLS** and is intended for a trusted local
+  network.
+
+- **The backend has open gaps before commercial launch**, listed at the end of
+  [`server/README.md`](server/README.md): feeder ingestion is authenticated
+  only by the per-device port, there is no email verification or password
+  reset, the aggregator cache is in-process so it cannot be scaled to a
+  second instance as written, and map tiles still come from the public
+  OpenStreetMap tile service.
+
+## Aggregator backend
+
+`server/` holds a separate FastAPI service, not part of the ESP32 firmware. It is what the **2E0LXY Aggregator** provider in **Data API** talks to, and anyone can self-host it. Full deployment instructions, configuration and known gaps are in [`server/README.md`](server/README.md); this is what it does.
+
+**Why it exists.** Every free ADS-B API restricts how often a client may ask and, in several cases, forbids commercial use outright. One backend polling on behalf of many receivers stays inside those limits where a fleet of devices each querying directly would not. It also removes work the ESP32 is poorly suited to: a TLS handshake per callsign needed more contiguous internal RAM than the device had free.
+
+| Function | What it does |
+| --- | --- |
+| Central polling | Polls adsb.fi, airplanes.live and adsb.lol into one shared in-process cache, deduplicating by ICAO hex and preferring the freshest report of each aircraft |
+| Per-device polling areas | Polls the sky each registered receiver is actually under, merging receivers that are close together into one area, rotating across areas past a configurable limit so free APIs are not asked for the whole hemisphere |
+| Source backoff | A source that starts failing is retried on a widening interval instead of every cycle, and stops writing a warning per attempt |
+| Route resolution | Resolves callsign to origin, destination, full airport names and operating airline via adsbdb, caching hits for six hours and misses for thirty minutes, and attaches the result to each aircraft in the device's own response |
+| Customer accounts | Email and password signup, per-account device list, per-device API keys that are shown once and stored hashed |
+| Admin panel | Separate admin login, account list, usage log, and per-source feed health |
+| Feeder-key pooling | An account can donate an upstream credential it already holds; each poll cycle round-robins across the pool, so no one credential carries more than its owner's allowance |
+| Own-receiver feed ingestion | A customer's receiver pushes its raw SBS/BaseStation output to a dedicated TCP port; those aircraft join the shared cache and are served to every device like any upstream's |
+| Receiver position inference | For a feeder that never states where it is, estimates the position from the radio horizon of the low aircraft it hears |
+| My-feed map | A live map of only what one customer's own receiver is reporting, with track-aligned icons, an altitude colour ramp, and every field the feed carries on click |
+| Public share links | An unlisted read-only URL for that map, for anyone the owner sends it to, with no account needed; revocable and replaceable |
+| Feeder client | `server/tools/` has a standard-library Python forwarder with a systemd unit, a Windows launcher, and a `--check` mode, for receiver software that cannot push SBS out on its own |
+
+**Public share links.** The owner presses Create link in the feeder table of the account dashboard and gets a URL of the form `/share/<token>`. The token is 24 random bytes and is the entire credential, so the link is unlisted rather than access-controlled: anyone holding it can view the map, which is the point. Pages are served with `X-Robots-Tag: noindex` so a link pasted somewhere public does not become searchable. A link holder sees the station name and its aircraft, and nothing else: no account, no API key, no feeder port, no other device. Revoking clears the token, so the old URL stops resolving; New link mints a different one. Worth knowing before sharing: a map of what one station hears implies roughly where that station is, so this is not a way to publish a feed anonymously.
+
+**Deployment shape.** One Docker container behind a reverse proxy, SQLite in a mounted volume, host networking so the feeder port range needs no per-port NAT rule. Schema changes for nullable columns and missing indexes are applied at boot; anything beyond that needs a hand-written migration.
 
 ## Security notes
 
