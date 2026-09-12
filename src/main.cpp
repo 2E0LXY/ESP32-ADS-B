@@ -2143,6 +2143,14 @@ LogoFetch cacheOperatorLogo(const char *code) {
     Serial.printf("Logo %s: none available\n", code);
     return LogoFetch::Unavailable;
   }
+  if (status == 503) {
+    // The aggregator is reachable but has no logo token configured. Worth
+    // saying plainly rather than as a bare status code, because the fix is
+    // on the server and nothing on the device will change until it is made.
+    Serial.printf("Logo %s: aggregator has no logo token configured\n", code);
+    http.end();
+    return LogoFetch::Retry;
+  }
   if (status != HTTP_CODE_OK) {
     Serial.printf("Logo %s HTTP %d\n", code, status);
     http.end();

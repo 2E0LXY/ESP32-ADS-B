@@ -596,6 +596,15 @@ async def logo_for_airline(code: str, request: Request, size: int = DEFAULT_SIZE
 
 async def _logo_response(request: Request, code: str, size: int) -> Response:
     store = request.app.state.logos
+    # "Not configured" is not "this airline has no logo", and the difference
+    # matters to the ESP32: it writes a marker on its card when told 404 and
+    # then stops asking, permanently. A deployment missing its token would
+    # otherwise poison every receiver's cache with "no logo" for every
+    # airline it happened to see first, and setting the token later would
+    # not undo it. 503 says come back, and the device treats it as such.
+    if not store.configured():
+        return Response(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        headers={"Retry-After": "3600"})
     data = await store.logo(code, size)
     if data is None:
         return Response(status_code=status.HTTP_404_NOT_FOUND, headers=LOGO_CACHE_HEADERS)

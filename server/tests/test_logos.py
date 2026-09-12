@@ -193,3 +193,22 @@ def _assert_endpoint_behaviour(client, tmp_path):
     assert client.get("/logo/airline/ZZZ.png").status_code == 404
     # Cached inside the temporary directory, not the real one.
     assert [p.name for p in tmp_path.glob("*.png")] == ["RYR-128.png"]
+
+
+def test_an_unconfigured_deployment_says_retry_not_missing(client, tmp_path):
+    """503, not 404. The ESP32 records a permanent marker on its card when
+    told 404 and stops asking, so a deployment with no token would poison
+    every receiver's cache for every airline it saw first, and setting the
+    token later would not undo it."""
+    from app.main import app
+
+    original = app.state.logos
+    app.state.logos = LogoStore(cache_dir=str(tmp_path), token="")
+    try:
+        response = client.get("/logo/airline/RYR.png")
+        assert response.status_code == 503
+        assert response.headers["retry-after"] == "3600"
+        # And nothing cacheable, so a proxy cannot pin the outage in place.
+        assert "cache-control" not in response.headers
+    finally:
+        app.state.logos = original
