@@ -11,6 +11,38 @@ Also runs on the **Waveshare ESP32-S3-Touch-LCD-7 / -4.3, 800 × 480, GT911 touc
 
 Current firmware: **v2.6.0**
 
+### Unreleased
+
+Display:
+
+- **Real airline logos on the screensaver**, replacing the three-initial tile. Fetched once per airline from the aggregator's own cache, kept on the microSD card and drawn from there afterwards; an airline with no logo, or a callsign carrying no airline prefix, keeps the initials tile. Guarded so it cannot cost the feed: a logo is only fetched when the largest free internal block is at least 48 KB, the decoded image is staged in PSRAM and never in internal RAM, and the fetch runs on the network task rather than the core driving the panel
+- **The screensaver shows the nearest aircraft** and reconsiders every ten seconds, instead of rotating through everything overhead every six. The aircraft only changes when something genuinely overtakes it, which is a better trigger for a full-screen repaint than a timer
+- **The device's address appears in the top corner of both screensaver frames.** It is the one page with no header, so it was the one place the management address could not be read off the screen
+- **The full model name and the radio callsign** on the screensaver where the aggregator resolved them: "Boeing 737-800" rather than "B738", and the callsign heard on the air, which is rarely the trading name - Jet2 answers to Channex
+- **Unclassified traffic gets an aircraft silhouette** in the browser map rather than the old arrowhead, which read as a different kind of object next to the other eleven shapes. Traffic reporting on the ground with no type and no category now draws the surface-vehicle square, so airport ground stations and service vehicles stop appearing as aircraft on the taxiways
+
+Browser:
+
+- **Clicking an aircraft on the map works.** Tracking could only be set from the table while the map re-asserted it on every refresh, so a marker click was overridden seconds later and closing a popup was undone. Clicking a marker now selects it, clicking it again or closing the popup releases it, and the map recentres only when the selection changes rather than fighting a pan every five seconds
+- **Four-level Wi-Fi signal bands** driven by RSSI rather than a derived percentage, with the level in words beside the reading in the top corner: strong at or above -60 dBm, normal to -70, weak to -80, bad below
+- **A feed indicator in the header** naming the active provider, green when it is returning data and red when it is failing, so feed health is readable from any page
+- **Check for updates lives only on the Firmware page.** It was in the footer of every page and duplicated as an Overview quick action
+- **Radar range presets highlight on press** instead of waiting for the next status poll, which made a press look as though it had not registered
+
+Wi-Fi:
+
+- **Up to six saved networks.** The ESP32 remembers exactly one, so moving the receiver between places meant retyping a password already entered. Every network that works is now kept, newest first, and the Wi-Fi page lists them with a Forget button. Additive by design: the stock connection path at boot is unchanged and tried first, and the saved list is only walked when that fails or a working connection has been down for a minute
+
+Backend:
+
+- **Airline logos cached server-side** and served from `/logo/callsign/<callsign>.png`, so a logo is fetched from logo.dev once for the whole deployment rather than once per viewer, and the account token never reaches a browser. Requires `LOGO_DEV_TOKEN`; without it every logo reports as missing and badges fall back to initials. See [Aggregator backend](#aggregator-backend)
+- **Operator, model, country and livery enrichment** from offline ICAO lists covering 6,008 operators and 2,735 type designators, including the aircraft silhouette resolved from real class and engine data. Retires the firmware's 91 hand-written callsign prefixes for anyone using this provider
+- **Operator names are tidied** rather than passed through as filed: corporate form, trailing registration addresses and the registered company in front of a trading name are all dropped, so "JET2.COM LTD" reads "Jet2.com"
+- **airplanes.live is disabled by default.** It answers 403 to every request from any address, so it sat permanently red in the admin panel implying an outage and kept spending requests to re-learn the same answer
+- **The event loop no longer stalls on the database.** Several hot paths made synchronous SQLite calls straight from coroutines, which stops reading every live feed until the database answers. Those now run in threads, the database runs in WAL mode with an explicit busy timeout, and the upstream poll areas are worked out once per cycle instead of three times
+- **Public share links** for a receiver's live map: an unlisted read-only URL, revocable and replaceable, that needs no account
+- **Two feeder faults fixed.** Attribution was recorded only on the record that won the freshness comparison, so the traffic nearest a customer's own receiver was exactly what vanished from their map; and a feeder's merge loop raised on its first pass and died, leaving the connection up and draining normally while contributing nothing
+
 ### v2.6.0 display, server-side routes, and the aggregator backend
 
 Firmware:
@@ -136,6 +168,9 @@ Backend (`server/`), see [Aggregator backend](#aggregator-backend):
 - Resolved routes cached to SD (or LittleFS) and reloaded at boot, so a receiver that sees the same flights daily never starts cache-cold
 - Selectable pixel clock, bounce-buffer size, and direct-draw rendering for tuning the RGB panel
 - Optional multi-tenant aggregator backend in `server/` with accounts, per-device keys, own-receiver feed ingestion, and public share links
+- Real airline logos on the idle screensaver, cached on the receiver's own card after one fetch
+- Up to six saved Wi-Fi networks, tried in turn when the usual one cannot be reached
+- Operator name, full model name, radio callsign, country and silhouette resolved by the aggregator from offline ICAO lists
 
 ## Supported hardware
 
@@ -161,15 +196,15 @@ Change the management password in **Device** after installation. The replacement
 
 ## Web administration
 
-Each sidebar entry opens a separate page. The footer on every page shows `Firmware (c) 2E0LXY D.Loxley 2026`, the installed version, and the GitHub update control.
+Each sidebar entry opens a separate page. The footer on every page shows `Firmware (c) 2E0LXY D.Loxley 2026` and the installed version. The header carries the device and feed indicators, uptime, and the Wi-Fi signal level. Checking for a firmware update lives on the **Firmware** page only.
 
 | Page | Live information | Main controls | Saved after reboot |
 | --- | --- | --- | --- |
-| Overview | Receiver health, traffic totals, provider, Wi-Fi, uptime, and full aircraft table | Refresh traffic, open Map/Radar, check updates | — |
+| Overview | Receiver health, traffic totals, provider, Wi-Fi, uptime, and full aircraft table | Refresh traffic, open Map/Radar, open Firmware | — |
 | Map | Receiver position, range, zoom, OpenStreetMap tiles, and aircraft | Position, radius, centre, zoom, click-to-track, 5-minute trails | Yes |
 | Aircraft | Every available aircraft field, operator name, source, age, signal, and emergency | Search, source filter, click a row to track it on the map | — |
 | Display | Active LCD page, brightness, alert state, and map-tile rebuild state | Map/Radar/Table, brightness, range presets, zero-mile alert, refresh | Yes |
-| Wi-Fi | SSID, signal quality, IP, gateway, DNS, and scan results | Scan, copy address, connect to a different network | Wi-Fi credentials |
+| Wi-Fi | SSID, four-level signal quality, IP, gateway, DNS, scan results, and up to six saved networks | Scan, copy address, connect to a different network, forget a saved one | Wi-Fi credentials |
 | Data API | Selected provider, request health, aircraft count, latency, and credential state | Select feed, edit/clear credentials, refresh test | Yes |
 | Marine | Live AIS vessel positions, connection state, vessel count | Provider selection, credential, tracking radius, browser vessel map and table | Yes |
 | Firmware | Installed/latest version, update availability, and release status | GitHub OTA, local `.bin` upload, installer/release recovery links | Firmware only |
@@ -197,7 +232,7 @@ Searchable live table containing operator name, ICAO address, callsign, registra
 
 Select the physical Map, Radar, or Table page, set brightness, enable or disable the zero-mile alert, and request an immediate refresh. One-click range presets set 10, 25, 50, or 100 nautical miles. Radar mode uses the saved receiver position and radius, draws a moving sweep, and marks out-of-range aircraft in red at the rim. The page also reports LCD tile-cache rebuild progress after a position, range, or zoom change. The selected page remains active after reboot.
 
-A **Screensaver** toggle and an idle-time field (1-120 minutes, off by default) control the idle screensaver: after the panel goes untouched for that long, it switches to a rotating departure-board style display of whichever aircraft are currently overhead (within about 5 miles of slant range - distance and altitude combined, so a jet at cruise directly above doesn't count as "overhead"), showing its operator badge, callsign, route, type, and a departing/arriving/en-route guess. Any tap, swipe, or the boot button dismisses it back to the page it interrupted.
+A **Screensaver** toggle and an idle-time field (1-120 minutes, off by default) control the idle screensaver: after the panel goes untouched for that long, it switches to a rotating departure-board style display of whichever aircraft are currently overhead (within about 5 miles of slant range - distance and altitude combined, so a jet at cruise directly above doesn't count as "overhead"), showing the airline's real logo where one is available, the callsign, route, full model name, radio callsign, and a departing/arriving/en-route guess. It shows whichever aircraft is nearest and reconsiders every ten seconds. The device's own address sits in the top corner, since this is the only page without a header. Any tap, swipe, or the boot button dismisses it back to the page it interrupted.
 
 **Panel tuning.** Three further controls exist for the RGB panel itself, because the right values depend on the individual board and on what else is competing for the PSRAM bus. **Pixel clock** (9-21 MHz) sets the panel clock and shows the refresh rate each choice produces. **Bounce buffer** sets how many scanlines of internal DMA RAM the panel driver refills ahead of the scan; larger values are more tolerant of a busy bus but take internal RAM away from the TLS handshake. **Direct draw** renders straight into the panel's own framebuffer instead of composing a frame and copying it. Changing the pixel clock or the bounce buffer reboots the device. See [Known limitations](#known-limitations) for what these are for.
 
@@ -205,7 +240,9 @@ A **Screensaver** toggle and an idle-time field (1-120 minutes, off by default) 
 
 ### Wi-Fi
 
-View the active connection, signal quality, LAN address, gateway, and DNS server; copy the management address; scan nearby networks; and move the receiver to a different 2.4 GHz Wi-Fi network.
+View the active connection, signal quality, LAN address, gateway, and DNS server; copy the management address; scan nearby networks; and move the receiver to a different 2.4 GHz Wi-Fi network. The quality bar and the reading in the header are coloured by RSSI in four bands: green at or above -60 dBm, blue to -70, amber to -80, red below.
+
+**Saved networks.** Every network that connects successfully is remembered, newest first, up to six, and listed with a Forget button. If the usual one cannot be reached at boot the receiver tries the others in turn, so moving it between a house and a club site needs no password retyped. Forgetting the network currently in use does not disconnect it; it stops the receiver rejoining it later.
 
 ![Wi-Fi page](docs/screenshots/wifi.png)
 
@@ -326,6 +363,7 @@ If the board does not enter download mode, hold **BOOT**, tap **RESET**, begin t
 ## Physical display behaviour
 
 - Short BOOT-button press (or a swipe on the WS7 touch panel): cycles the LCD through Overview, Table, Map, Radar, and Marine, and saves the selection
+- Screensaver page: appears on its own after the idle time set on the **Display** page, showing the nearest aircraft overhead as a departure board with the airline's logo, full model name and radio callsign, and the device's address in the top corner
 - Overview page: map on the left with a compact nearest-aircraft strip (callsign, distance, altitude, route) on the right
 - Table page: airport-departure-board style list with operator badge, callsign, distance, source, direction, altitude, and the fullest airport name that fits the panel width
 - Marine page: the same base map with live AIS vessel positions plotted as heading-oriented ship markers; shows vessel count and AIS connection state, or `AIS NOT CONFIGURED` until an API key is saved in the Marine admin page
