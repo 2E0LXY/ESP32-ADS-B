@@ -234,6 +234,21 @@ Select the physical Map, Radar, or Table page, set brightness, enable or disable
 
 A **Screensaver** toggle and an idle-time field (1-120 minutes, off by default) control the idle screensaver: after the panel goes untouched for that long, it switches to a rotating departure-board style display of whichever aircraft are currently overhead (within about 5 miles of slant range - distance and altitude combined, so a jet at cruise directly above doesn't count as "overhead"), showing the airline's real logo where one is available, the callsign, route, full model name, radio callsign, and a departing/arriving/en-route guess. It shows whichever aircraft is nearest and reconsiders every ten seconds. The device's own address sits in the top corner, since this is the only page without a header. Any tap, swipe, or the boot button dismisses it back to the page it interrupted.
 
+Everything on that page, and where it comes from:
+
+| Line | Content | Source |
+| --- | --- | --- |
+| Logo tile | The airline's real logo, or three initials in a tinted square | Fetched once from the aggregator and cached on the microSD card |
+| Operator | Trading name with corporate form removed, e.g. "Ryanair" not "RYANAIR DAC" | Resolved by the aggregator from the operator list, else the feed, else a compiled-in prefix table |
+| Route | Airport codes as the headline, full names on a later row | adsbdb, resolved by the aggregator and cached |
+| Type line | Full model, registration and callsign, e.g. "Boeing 737 Max 8  EI-IHG  RYR282D" | Model from the ICAO type list; the four-character designator when unresolved |
+| `ALT` / `SPD` / `TRK` / `VR` | Altitude, speed, track and vertical rate | The feed |
+| `RADIO` | Radio telephony callsign | The operator list; shown only when it differs from the operator name |
+| `SQK` and its meaning | Squawk, and what the code signifies | Emergency and conspicuity codes are named; a discrete code is labelled as ATC-assigned |
+| Position row | Hex, source, age, country, coordinates, both altitudes | The feed, with country filled in from the ICAO hex range when absent |
+
+**About the `RADIO` line.** That is the callsign spoken on the air, which is frequently nothing like the airline's name: Jet2 is "Channex", British Airways is "Speedbird", Aer Lingus is "Shamrock", TUI is "Tomjet". Callsigns are assigned by ICAO and tend to outlive rebrands, which is why Jet2 still answers to the name of Channel Express, the cargo airline it grew out of. It is the name you would hear if you were listening to air traffic control alongside the display, so it is shown when it adds something and suppressed when it merely repeats the operator name.
+
 **Panel tuning.** Three further controls exist for the RGB panel itself, because the right values depend on the individual board and on what else is competing for the PSRAM bus. **Pixel clock** (9-21 MHz) sets the panel clock and shows the refresh rate each choice produces. **Bounce buffer** sets how many scanlines of internal DMA RAM the panel driver refills ahead of the scan; larger values are more tolerant of a busy bus but take internal RAM away from the TLS handshake. **Direct draw** renders straight into the panel's own framebuffer instead of composing a frame and copying it. Changing the pixel clock or the bounce buffer reboots the device. See [Known limitations](#known-limitations) for what these are for.
 
 ![Display page](docs/screenshots/display.png)
@@ -401,6 +416,22 @@ Map data is © OpenStreetMap contributors. The browser and LCD show attribution.
   The 480 x 480 board is not affected in the same way; it has a smaller frame
   and more headroom.
 
+- **Internal RAM, not PSRAM, is the constraint on this board.** There is 8 MB
+  of PSRAM and the largest free *internal* block settles at about 31,700
+  bytes, which is what a TLS handshake competes for. That single figure
+  explains several design decisions that otherwise look odd: why route
+  lookups moved to the server, why the screensaver's decoded logo is staged
+  in PSRAM and never allowed to fall back to internal RAM, and why a logo is
+  only fetched when at least 28 KB of contiguous internal memory is free.
+
+  That 28 KB threshold is measured rather than cautious. The aircraft fetch
+  completes a handshake at 31,700 every thirty seconds with a 39 KB response
+  body, so a logo at a fifth of that size on the same task faces conditions
+  the feed already survives. An earlier attempt used 48 KB, which is more
+  than this board ever has free, so the guard could never pass and no logo
+  was ever fetched. If you change it, read the number off
+  `heap[fetch-start]` in the serial log rather than guessing.
+
 - **Do not set the RGB panel sdkconfig options via `custom_sdkconfig`.**
   `CONFIG_LCD_RGB_RESTART_IN_VSYNC` is already enabled in the stock prebuilt
   Arduino libraries, and enabling `CONFIG_LCD_RGB_ISR_IRAM_SAFE` boot-loops
@@ -452,6 +483,22 @@ Map data is © OpenStreetMap contributors. The browser and LCD show attribution.
 The most useful part is the silhouette. The firmware can only carry 91 hand-written designator prefixes, so anything outside them drew a generic shape. The server derives the shape from real class and engine data for 2,735 designators and sends it, and the device prefers it over its own guess while keeping that guess as the fallback for anyone using a different provider.
 
 That split is also a licensing decision: the provenance of those lists is not established, so they stay server-side and out of every released binary and the USB installer. `server/reference/README.md` records what each file is, why the work-in-progress type list is deliberately unused, and what needs resolving before commercial launch.
+
+**What the aggregator attaches to each aircraft.** These arrive in the `/v1/aircraft` response the device already fetches, so none of them costs an extra request:
+
+| Field | Content |
+| --- | --- |
+| `shape` | The silhouette, resolved from the type's real ICAO class and engine configuration |
+| `type_name` | Manufacturer and model, e.g. "Boeing 737 Max 8" |
+| `type_class`, `type_engines` | The underlying class and engine string the shape came from |
+| `ownOp` | Operator trading name, only when the feed did not supply one |
+| `telephony` | Radio callsign, e.g. "Channex" for Jet2 |
+| `operator_iata` | Two-letter IATA code where the operator has one |
+| `cou` | Country, from the ICAO hex address range, only when the feed did not supply one |
+| `livery` | Special colour scheme by registration, where one is recorded |
+| `route` | Origin, destination, both airports' full names and cities, and the operating airline |
+
+**If you add a field here, add it to the firmware's filter as well.** The ESP32 parses that response through an ArduinoJson filter listing every field it keeps, to avoid holding a second copy of a 39 KB body in memory. A field absent from that list is discarded during parsing, before any code that reads it runs. This is not hypothetical: `shape`, `type_name` and `telephony` were all sent, read and displayed correctly in code, and silently dropped in transit, for exactly this reason. The list is the `fields[]` array in `fetchAdsbV2Aircraft()` in `src/main.cpp`.
 
 **Airline logos.** `/logo/callsign/RYR2BH.png` and `/logo/airline/RYR.png` return the operator's logo, or 404 when there is not one, which every caller answers by drawing its own initials badge instead.
 
