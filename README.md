@@ -138,7 +138,7 @@ Backend (`server/`), see [Aggregator backend](#aggregator-backend):
 4. Open that address, sign in with `admin` / `aircraft`, and immediately set a new password in **Device**.
 5. Set the receiver latitude, longitude, radius, and zoom in **Map**, then choose an aircraft feed in **Data API**.
 
-![Boot screen](assets/boot-800x480.png)
+![Boot screen](assets/boot-preview-800x480.png)
 
 The boot screen is generated from `assets/boot-source.png` by
 `tools/make_boot_asset.py`, which writes `src/boot_asset.h` and a preview of
@@ -146,8 +146,11 @@ each panel's crop. Replace the source image and re-run it to change the
 splash. Both panels get a full-bleed centre crop, so the source needs enough
 margin around the title to survive losing height for the 800 × 480 boards and
 width for the 480 × 480 one — check the previews it writes before flashing.
-The firmware decodes it a line at a time straight to the panel, so the
-picture costs 1.6 KB of RAM while it paints rather than a staged copy.
+The picture is decoded off-screen and blitted in one go so it appears at
+once, and the buffer is freed immediately afterwards — so the 768 KB is held
+for the decode rather than from boot until the live display starts. Over the
+top go the firmware version (top right), the copyright line, and the network
+status, which carries the receiver's LAN address once Wi-Fi is up.
 
 ## Main features
 

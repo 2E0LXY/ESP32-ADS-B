@@ -2004,54 +2004,59 @@ void blitStage(const ImageStage &stage, int left, int top) {
   }
 }
 
-// One line of the boot screen on its way from flash to the panel, and where
-// on the panel it goes. 1,600 bytes, rather than staging the whole decoded
-// 800x480 picture in 768 KB of PSRAM: the boot screen is drawn and finished
-// with, while the map tiles, airline logos and aircraft photographs want
-// PSRAM for the rest of the run.
-uint16_t *bootLine = nullptr;
-int bootLineLeft = 0;
-int bootLineTop = 0;
+// One decoded copy of the boot screen, on its way from the PNG in flash to
+// the panel. Allocated for the decode and freed the moment it has been
+// drawn.
+//
+// Decoding straight to the panel a line at a time needs only 1.6 KB, but it
+// paints visibly from the top down over a couple of hundred milliseconds.
+// The picture should appear at once, so it is assembled off-screen and
+// blitted in one go - and then handed straight back, so the 768 KB is held
+// for the decode rather than from boot until the live display starts. Map
+// tiles, airline logos and aircraft photographs all want that PSRAM for the
+// rest of the run.
+uint16_t *bootPixels = nullptr;
 
 int decodeBootPngLine(PNGDRAW *draw) {
-  // A row wider than the buffer would run off the end of it. The asset is
-  // generated to BOOT_IMAGE_W, but a header from another build must not be
-  // able to corrupt memory here.
-  if (!bootLine || draw->iWidth > BOOT_IMAGE_W) return 0;
+  // A row wider than the buffer would run past the end of the line it is
+  // writing into. The asset is generated to BOOT_IMAGE_W, but a header from
+  // another build must not be able to corrupt memory here.
+  if (!bootPixels || draw->iWidth > BOOT_IMAGE_W) return 0;
   if (draw->y < 0 || draw->y >= BOOT_IMAGE_H) return 1;
-  pngDecoder.getLineAsRGB565(draw, bootLine, PNG_RGB565_LITTLE_ENDIAN, 0xffffffff);
-  gfx->draw16bitRGBBitmap(bootLineLeft, bootLineTop + draw->y, bootLine, draw->iWidth, 1);
+  pngDecoder.getLineAsRGB565(draw, bootPixels + draw->y * BOOT_IMAGE_W,
+                             PNG_RGB565_LITTLE_ENDIAN, 0xffffffff);
   return 1;
 }
 
-// Paints the boot screen straight from the PNG in flash. PROGMEM on the
-// ESP32-S3 is memory-mapped, so PNGdec reads the array in place - nothing is
-// copied out of flash first, and nothing but one line exists in RAM at a
-// time.
-//
-// Decoded again on each repaint rather than kept: the boot screen is painted
-// a handful of times while Wi-Fi comes up, each with a different status line,
-// and trading those few decodes for 768 KB held across the whole run is the
-// right way round on a board where PSRAM is what the map and the images
-// compete for.
+// Draws the boot screen from the PNG in flash. PROGMEM on the ESP32-S3 is
+// memory-mapped, so PNGdec reads the array in place - nothing is copied out
+// of flash first.
 bool paintBootImage() {
   if (!pngDecoderPtr) return false;
-  bootLine = static_cast<uint16_t *>(heap_caps_malloc(
-      BOOT_IMAGE_W * sizeof(uint16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-  // Internal RAM as a fallback: one line is 1.6 KB, which even the scarce
-  // pool can spare, and a boot screen that needs PSRAM to appear at all
-  // would be a poor trade.
-  if (!bootLine) bootLine = static_cast<uint16_t *>(malloc(BOOT_IMAGE_W * sizeof(uint16_t)));
-  if (!bootLine) return false;
-  bootLineLeft = (W - BOOT_IMAGE_W) / 2;
-  bootLineTop = (H - BOOT_IMAGE_H) / 2;
+  const size_t bytes = static_cast<size_t>(BOOT_IMAGE_W) * BOOT_IMAGE_H * sizeof(uint16_t);
+  // PSRAM only, with no fallback: 768 KB is not something the internal pool
+  // could give up even if it had it, and the caller draws a plain title
+  // instead rather than failing to boot.
+  bootPixels = static_cast<uint16_t *>(heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (!bootPixels) {
+    Serial.println("Boot image: no PSRAM for the decode buffer");
+    return false;
+  }
   const int opened = pngDecoder.openRAM(const_cast<uint8_t *>(BOOT_IMAGE_PNG),
                                         BOOT_IMAGE_PNG_LEN, decodeBootPngLine);
   const bool success = opened == PNG_SUCCESS && pngDecoder.decode(nullptr, 0) == PNG_SUCCESS;
   if (opened == PNG_SUCCESS) pngDecoder.close();
-  heap_caps_free(bootLine);
-  bootLine = nullptr;
-  if (!success) Serial.printf("Boot image decode failed (open=%d)\n", opened);
+  // Only on success: half a picture is worse than the fallback title, and a
+  // partial decode would otherwise show whatever the rest of the buffer
+  // happened to contain.
+  if (success) {
+    gfx->draw16bitRGBBitmap((W - BOOT_IMAGE_W) / 2, (H - BOOT_IMAGE_H) / 2,
+                            bootPixels, BOOT_IMAGE_W, BOOT_IMAGE_H);
+  } else {
+    Serial.printf("Boot image decode failed (open=%d)\n", opened);
+  }
+  heap_caps_free(bootPixels);
+  bootPixels = nullptr;
   return success;
 }
 
@@ -3533,9 +3538,9 @@ void renderBootScreen(const String &networkLine = "", uint16_t networkColour = R
   // exactly; clearing first covers a header built for the other board.
   if (BOOT_IMAGE_W != W || BOOT_IMAGE_H != H) gfx->fillScreen(rgb(4, 10, 16));
   if (!paintBootImage()) {
-    // No decoder, no memory for even one line, or an asset that will not
-    // decode. A plain title beats a blank panel, and the lines below still
-    // say what is happening.
+    // No decoder, no PSRAM for the decode buffer, or an asset that will
+    // not decode. A plain title beats a blank panel, and the version,
+    // credit and status lines below are drawn either way.
     gfx->fillScreen(rgb(4, 10, 16));
     gfx->setTextSize(3);
     gfx->setTextColor(RGB565_CYAN);
@@ -3545,7 +3550,13 @@ void renderBootScreen(const String &networkLine = "", uint16_t networkColour = R
   }
   gfx->setTextWrap(false);
   gfx->setTextSize(2);
+  // Top right rather than down with the credit: both crops are dark sky
+  // there (measured at mean 14 of 255), the title occupies the middle, and
+  // it matches where the screensaver puts the device address.
   gfx->setTextColor(RGB565_WHITE);
+  const String version = String("v") + FIRMWARE_VERSION;
+  gfx->setCursor(W - static_cast<int>(version.length()) * 12 - 10, 10);
+  gfx->print(version);
   const String credit = "Firmware (c) 2E0LXY D.Loxley 2026";
   gfx->setCursor(max(4, (W - static_cast<int>(credit.length()) * 12) / 2), 414);
   gfx->print(credit);
