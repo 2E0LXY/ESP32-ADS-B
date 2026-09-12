@@ -50,9 +50,18 @@ class _FakeOpenverse:
 
 
 def _store(tmp_path, upstream):
+    """A store whose worker is not running: the tests drive _fetch directly
+    where they are testing the fetch, and photo() where they are testing the
+    queueing contract."""
     store = PhotoStore(cache_dir=str(tmp_path))
     store._client = upstream
     return store
+
+
+async def _fetch_now(store, code, model, width=240):
+    """What the background worker does, run inline so a test can assert on
+    the result rather than waiting on a task."""
+    return await store._fetch(code, model, width)
 
 
 # --- the candidate filter ------------------------------------------------
@@ -130,7 +139,8 @@ async def test_a_photo_is_fetched_once_then_served_from_disk(tmp_path):
     upstream = _FakeOpenverse([_result("Boeing 737-800")])
     store = _store(tmp_path, upstream)
 
-    first = await store.photo("B738", "Boeing 737-800", 240)
+    first = await _fetch_now(store, "B738", "Boeing 737-800")
+    # Once cached, photo() answers from disk without touching the upstream.
     second = await store.photo("B738", "Boeing 737-800", 240)
 
     assert first == second and first.startswith(b"\x89PNG")
@@ -141,7 +151,7 @@ async def test_a_photo_is_fetched_once_then_served_from_disk(tmp_path):
 async def test_provenance_is_recorded_even_though_attribution_is_not_required(tmp_path):
     upstream = _FakeOpenverse([_result("Boeing 737-800")])
     store = _store(tmp_path, upstream)
-    await store.photo("B738", "Boeing 737-800", 240)
+    await _fetch_now(store, "B738", "Boeing 737-800")
 
     recorded = json.loads((tmp_path / "B738-240.json").read_text())
     assert recorded["licence"] == "cc0"
@@ -159,7 +169,7 @@ async def test_the_first_acceptable_candidate_wins(tmp_path):
     ])
     store = _store(tmp_path, upstream)
 
-    assert await store.photo("B738", "Boeing 737-800", 240) is not None
+    assert await _fetch_now(store, "B738", "Boeing 737-800") is not None
     assert upstream.downloads == ["https://example.invalid/good.jpg"]
     assert store.rejected == 2
 
@@ -168,10 +178,12 @@ async def test_no_usable_candidate_records_a_miss(tmp_path):
     upstream = _FakeOpenverse([_result("Boeing 737-800 engine")])
     store = _store(tmp_path, upstream)
 
-    assert await store.photo("B738", "Boeing 737-800", 240) is None
+    assert await _fetch_now(store, "B738", "Boeing 737-800") is None
     assert (tmp_path / "B738-240.miss").exists()
+    # photo() now answers from the marker without queueing anything.
     assert await store.photo("B738", "Boeing 737-800", 240) is None
     assert upstream.searches == 1, "a known-missing photo was searched for twice"
+    assert store.misses == 1
 
 
 async def test_a_search_failure_is_not_cached_as_a_miss(tmp_path):
@@ -187,10 +199,13 @@ async def test_a_search_failure_is_not_cached_as_a_miss(tmp_path):
             raise httpx.ConnectError("no route to host")
 
     store = _store(tmp_path, _Broken())
-    assert await store.photo("B738", "Boeing 737-800", 240) is None
-    assert await store.photo("B738", "Boeing 737-800", 240) is None
+    assert await _fetch_now(store, "B738", "Boeing 737-800") is None
+    assert await _fetch_now(store, "B738", "Boeing 737-800") is None
     assert store._client.calls == 2
     assert not (tmp_path / "B738-240.miss").exists()
+    # And it says so, rather than only at DEBUG where a permanent failure
+    # would have been invisible.
+    assert store.search_failures == 2
 
 
 async def test_only_attribution_free_licences_are_ever_requested(tmp_path):
@@ -205,7 +220,7 @@ async def test_only_attribution_free_licences_are_ever_requested(tmp_path):
             return await super().get(url, params, timeout)
 
     store = _store(tmp_path, _Capturing([_result("Boeing 737-800")]))
-    await store.photo("B738", "Boeing 737-800", 240)
+    await _fetch_now(store, "B738", "Boeing 737-800")
     assert captured["license"] == "cc0,pdm"
 
 
@@ -232,13 +247,69 @@ async def test_a_lowercase_designator_is_normalised(tmp_path):
     """Leniently, the same way the logo endpoints treat a callsign."""
     upstream = _FakeOpenverse([_result("Boeing 737-800")])
     store = _store(tmp_path, upstream)
-    assert await store.photo("b738", "Boeing 737-800", 240) is not None
+    assert await _fetch_now(store, "b738".upper(), "Boeing 737-800") is not None
     assert [p.name for p in tmp_path.glob("*.png")] == ["B738-240.png"]
+    # And photo() normalises before looking in the cache.
+    assert await store.photo("b738", "Boeing 737-800", 240) is not None
 
 
 async def test_an_odd_width_falls_back_to_the_default(tmp_path):
     """Otherwise a caller could fill the disk asking for every pixel width."""
     upstream = _FakeOpenverse([_result("Boeing 737-800")])
     store = _store(tmp_path, upstream)
-    await store.photo("B738", "Boeing 737-800", 999)
+    store.start()
+    try:
+        await store.photo("B738", "Boeing 737-800", 999)
+        await store._queue.join()
+    finally:
+        await store.stop()
     assert [p.name for p in tmp_path.glob("*.png")] == ["B738-240.png"]
+
+
+# --- the queueing contract ----------------------------------------------
+#
+# The workers are stopped in these tests before anything is queued. With them
+# running the fake upstream answers instantly, so the queue drains before the
+# assertion can read it and the test measures scheduling luck rather than
+# behaviour.
+
+
+async def _queue_without_workers(store):
+    store.start()
+    for task in store._workers:
+        task.cancel()
+    store._workers.clear()
+
+
+async def test_a_caller_is_never_made_to_wait(tmp_path):
+    """The first version searched and downloaded while the device held the
+    connection open, which exceeded the ESP32's fifteen-second read timeout
+    and failed with HTTPC_ERROR_READ_TIMEOUT. Now it queues and answers
+    immediately, and the picture arrives on a later request."""
+    upstream = _FakeOpenverse([_result("Boeing 737-800")])
+    store = _store(tmp_path, upstream)
+    await _queue_without_workers(store)
+    try:
+        assert await store.photo("B738", "Boeing 737-800", 240) is None
+        assert upstream.searches == 0, "the caller did the fetch itself"
+        assert store.stats()["queued"] == 1
+
+        # What the worker would have done, and the result is then cached.
+        await _fetch_now(store, "B738", "Boeing 737-800")
+        assert (await store.photo("B738", "Boeing 737-800", 240)).startswith(b"\x89PNG")
+    finally:
+        await store.stop()
+
+
+async def test_the_same_type_is_only_queued_once(tmp_path):
+    """A map full of one type must not queue twenty identical searches."""
+    upstream = _FakeOpenverse([_result("Boeing 737-800")])
+    store = _store(tmp_path, upstream)
+    await _queue_without_workers(store)
+    try:
+        for _ in range(20):
+            await store.photo("B738", "Boeing 737-800", 240)
+        assert store.stats()["queued"] == 1
+        assert store._queue.qsize() == 1
+    finally:
+        await store.stop()

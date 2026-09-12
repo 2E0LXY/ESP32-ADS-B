@@ -508,6 +508,8 @@ That split is also a licensing decision: the provenance of those lists is not es
 
 **Choosing a usable photograph is the substance, not fetching one.** Searching by model name returns engine close-ups, cockpits, cabins, diecast models and museum pieces alongside aircraft. Candidates are rejected on a keyword list, on being smaller than 480 px wide, on any aspect ratio outside 1.2 to 2.4 since aircraft are photographed landscape, and on a title that never mentions the model, because full-text search happily matches an airport article that mentions a 737. Against live results that keeps nine or ten of every ten and rejects exactly the engine and detail shots.
 
+**Nothing here makes the device wait.** A type with no cached photograph is queued and answered "not yet"; the picture appears on a later request. The first version searched, downloaded and cropped while the device held the connection open, which took longer than its fifteen-second read timeout and failed with `HTTPC_ERROR_READ_TIMEOUT` - so no photograph ever arrived and the work was thrown away each time. Same shape as the route resolver, for the same reason.
+
 Licence, creator, title and source URL are recorded beside every cached image and served at `/aircraft-photo/credits`. Neither licence requires it. It exists because being unable to say where a picture came from is its own problem, and a claim of "licence-free" should be checkable rather than asserted.
 
 **Airline logos.** `/logo/callsign/RYR2BH.png` and `/logo/airline/RYR.png` return the operator's logo, or 404 when there is not one, which every caller answers by drawing its own initials badge instead.

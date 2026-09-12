@@ -20,6 +20,14 @@ say where a picture came from is its own problem.
 Searching by model name returns engine close-ups, cabins, museum pieces and
 cockpit shots alongside whole aircraft, so the candidate filtering below is
 the substance of this module rather than the fetching.
+
+**Nothing here ever makes a caller wait.** A type with no cached photograph
+is queued and answered "not yet"; the picture appears on a later request.
+The first version did the search, the download and the crop while the device
+held the connection open, which took longer than the ESP32's fifteen-second
+read timeout and failed with HTTPC_ERROR_READ_TIMEOUT - so the device never
+got a photograph and the work was thrown away each time. Same reasoning, and
+the same shape, as the route resolver in app/routes.py.
 """
 
 import asyncio
@@ -51,6 +59,11 @@ SEARCH_TIMEOUT_SECONDS = 15
 DOWNLOAD_TIMEOUT_SECONDS = 20
 MAX_SOURCE_BYTES = 8 * 1024 * 1024
 CANDIDATES = 20
+# One at a time. These are other people's servers and a photograph is never
+# urgent - the device asks again on its next rotation.
+WORKERS = 1
+# Bounded so a sky full of unphotographed types cannot grow without limit.
+MAX_QUEUE = 200
 
 DESIGNATOR_PATTERN = re.compile(r"^[A-Z0-9]{2,4}$")
 
@@ -105,11 +118,19 @@ class PhotoStore:
         self._dir = cache_dir
         self._enabled = enabled
         self._client: httpx.AsyncClient | None = None
-        self._locks: dict[str, asyncio.Lock] = {}
+        # A search that fails is not cached as a miss, so a systemic failure
+        # - the host unreachable from this deployment, say - retries for ever
+        # and silently returns 404 to every caller. Counted and reported so
+        # that condition is visible in the log instead of invisible at DEBUG.
+        self.search_failures = 0
         self.hits = 0
         self.fetches = 0
         self.misses = 0
         self.rejected = 0
+        self.queued_now = 0
+        self._queue: asyncio.Queue[tuple[str, str, int]] | None = None
+        self._queued: set[str] = set()
+        self._workers: list[asyncio.Task] = []
 
     def start(self):
         os.makedirs(self._dir, exist_ok=True)
@@ -117,11 +138,46 @@ class PhotoStore:
             timeout=DOWNLOAD_TIMEOUT_SECONDS, headers={"User-Agent": USER_AGENT},
             follow_redirects=True,
         )
+        self._queue = asyncio.Queue(maxsize=MAX_QUEUE)
+        self._workers = [asyncio.create_task(self._worker()) for _ in range(WORKERS)]
 
     async def stop(self):
+        for task in self._workers:
+            task.cancel()
+        for task in self._workers:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        self._workers.clear()
         if self._client:
             await self._client.aclose()
             self._client = None
+
+    async def _worker(self):
+        while True:
+            code, model, width = await self._queue.get()
+            try:
+                await self._fetch(code, model, width)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("photo fetch failed for %s", code)
+            finally:
+                self._queued.discard(f"{code}-{width}")
+                self.queued_now = len(self._queued)
+                self._queue.task_done()
+
+    def _enqueue(self, code: str, model: str, width: int):
+        key = f"{code}-{width}"
+        if self._queue is None or key in self._queued:
+            return
+        try:
+            self._queue.put_nowait((code, model, width))
+        except asyncio.QueueFull:
+            return
+        self._queued.add(key)
+        self.queued_now = len(self._queued)
 
     def configured(self) -> bool:
         return self._enabled
@@ -154,13 +210,11 @@ class PhotoStore:
         if self._client is None:
             return None
 
-        lock = self._locks.setdefault(f"{code}-{width}", asyncio.Lock())
-        async with lock:
-            cached = await asyncio.to_thread(_read_if_present, image_path)
-            if cached is not None:
-                self.hits += 1
-                return cached
-            return await self._fetch(code, model, width)
+        # Queued, not fetched here: a caller must never wait on a search and
+        # a download. The device asks again on its next rotation and gets the
+        # picture then, which is exactly how route lookups behave.
+        self._enqueue(code, model, width)
+        return None
 
     async def _fetch(self, code: str, model: str, width: int) -> bytes | None:
         image_path, meta_path, miss_path = self._paths(code, width)
@@ -177,8 +231,13 @@ class PhotoStore:
         except (httpx.HTTPError, ValueError) as exc:
             # Not recorded as a miss: a search that failed is not a type
             # without a photograph, and caching it as one would hide a real
-            # photo for a month.
-            logger.debug("photo search %s (%s): %s", code, model, exc)
+            # photo for a month. But it does need saying out loud - the first
+            # few times, then occasionally, so a permanent failure is
+            # obvious without one line per request.
+            self.search_failures += 1
+            if self.search_failures <= 3 or self.search_failures % 25 == 0:
+                logger.warning("photo search failed for %s (%s) [%d so far]: %s: %s",
+                               code, model, self.search_failures, type(exc).__name__, exc)
             return None
 
         for result in results:
@@ -253,6 +312,8 @@ class PhotoStore:
             "fetches": self.fetches,
             "misses": self.misses,
             "rejected_candidates": self.rejected,
+            "search_failures": self.search_failures,
+            "queued": self.queued_now,
         }
 
 

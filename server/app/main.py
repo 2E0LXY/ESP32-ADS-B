@@ -15,6 +15,14 @@ from .reference import ReferenceData
 from .routers import admin, public
 
 logging.basicConfig(level=logging.INFO)
+# httpx logs every request it makes at INFO. This service makes two upstream
+# polls every fifteen seconds plus one adsbdb lookup per new callsign, so on
+# a busy sky that is thousands of lines an hour and `docker compose logs
+# --tail=100` returns nothing but those. The interesting lines - route
+# resolutions, feeder connections, image caching, anything that went wrong -
+# were being buried by a library narrating its own success.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger("main")
 
 DEBUG = os.environ.get("DEBUG") == "1"

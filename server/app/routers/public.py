@@ -639,7 +639,12 @@ async def aircraft_photo(designator: str, request: Request, size: int = PHOTO_DE
         return Response(status_code=status.HTTP_404_NOT_FOUND, headers=LOGO_CACHE_HEADERS)
     data = await store.photo(code, type_info["name"], size)
     if data is None:
-        return Response(status_code=status.HTTP_404_NOT_FOUND, headers=LOGO_CACHE_HEADERS)
+        # Distinguish "no free photograph of this type" from "the search is
+        # not working at all". Both are 404 to the device, which retries
+        # either way, but only one of them is something to go and fix.
+        headers = dict(LOGO_CACHE_HEADERS)
+        headers["X-Photo-Search-Failures"] = str(store.search_failures)
+        return Response(status_code=status.HTTP_404_NOT_FOUND, headers=headers)
     return Response(content=data, media_type="image/png", headers=LOGO_CACHE_HEADERS)
 
 
