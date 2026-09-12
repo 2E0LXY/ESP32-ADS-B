@@ -139,6 +139,13 @@ class UsageLogPruner:
         self.last_run_at: datetime.datetime | None = None
 
     def start(self):
+        # Idempotent: this is called when a worker gains the single-instance
+        # lease, and main.py also calls it directly at startup for the
+        # single-process case. Starting twice would leave two prune loops
+        # running for the life of the process, both deleting the same rows
+        # against SQLite's one writer lock, with only one of them stoppable.
+        if self._task is not None and not self._task.done():
+            return
         self._task = asyncio.create_task(self._loop())
 
     async def stop(self):

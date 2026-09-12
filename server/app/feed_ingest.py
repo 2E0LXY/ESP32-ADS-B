@@ -53,6 +53,15 @@ class FeedIngestManager:
         self._guards: dict[int, FeedGuard] = {}
 
     async def sync_from_db(self):
+        """Brings the running listeners into line with the database.
+
+        This only ever started listeners. Nothing closed one whose device
+        had stopped being feeder-enabled, so a feed disabled anywhere other
+        than by the request that owns the listener kept being accepted
+        until the service restarted - which matters now that the listeners
+        follow the single-instance lease rather than startup, and that an
+        operator can disable a feed from the admin panel.
+        """
         db = self._session_factory()
         try:
             devices = (
@@ -60,10 +69,15 @@ class FeedIngestManager:
                 .filter(models.Device.feeder_enabled.is_(True), models.Device.feeder_port.isnot(None))
                 .all()
             )
-            for device in devices:
-                await self.start_for_device(device.id, device.feeder_port)
+            wanted = {device.feeder_port: device.id for device in devices}
         finally:
             db.close()
+        # Closed first, so a port reassigned from one device to another is
+        # free by the time the new listener asks for it.
+        for port in [port for port in self._servers if port not in wanted]:
+            await self.stop_for_device(port)
+        for port, device_id in wanted.items():
+            await self.start_for_device(device_id, port)
 
     async def start_for_device(self, device_id: int, port: int):
         if port in self._servers:

@@ -3515,16 +3515,21 @@ void present() {
     // cache so the LCD DMA reads what was drawn. No vsync wait either -
     // there is no bulk copy to keep ahead of the scan.
     gfx->flush(true);
-  } else {
-    rgbpanel->waitForVsync(50);
-    gfx->draw16bitRGBBitmap(0, 0, framebuffer, W, H);
+    // And no restart: the realign below exists to recover from that copy
+    // starving the bounce-buffer refill, and in this mode there is no copy.
+    // It was firing on every frame here regardless - re-initialising the
+    // panel's DMA and the refill that is already the tight deadline, for a
+    // frame that never put a load on either.
+    return;
   }
-  // esp_lcd_rgb_panel_restart() returns ESP_ERR_INVALID_STATE unless
-  // CONFIG_LCD_RGB_RESTART_IN_VSYNC is set in the sdkconfig, which cannot be
-  // changed from platformio.ini with the prebuilt Arduino libraries. The
-  // return value used to be discarded, so a permanent no-op was invisible.
-  // Log it once at boot; if it reports 0 this call does nothing and the
-  // corrected panel timings above are the real fix.
+  rgbpanel->waitForVsync(50);
+  gfx->draw16bitRGBBitmap(0, 0, framebuffer, W, H);
+  // Realign the scan after the copy. esp_lcd_rgb_panel_restart() needs
+  // CONFIG_LCD_RGB_RESTART_IN_VSYNC, which cannot be set from
+  // platformio.ini with the prebuilt Arduino libraries - but it is already
+  // enabled there, so this reports yes and does work. See the long note in
+  // platformio.ini: the restart is not what is missing, and the roll
+  // happens in spite of it firing.
   const bool restarted = rgbpanel->restartAtNextVsync();
   static bool logged = false;
   if (!logged) {

@@ -166,3 +166,30 @@ async def test_the_prune_does_not_block_the_event_loop(db):
     assert ticks >= 3, ticks
     assert pruner.total_removed == 399
     assert pruner.last_run_at is not None
+
+
+async def test_starting_the_pruner_twice_leaves_one_loop(db):
+    """start() is called when a worker gains the single-instance lease, and
+    directly at startup for the single-process case. Two loops would both
+    delete the same rows against SQLite's one writer lock, and stop() would
+    only cancel one of them."""
+    pruner = UsageLogPruner(SessionLocal)
+    pruner.start()
+    first = pruner._task
+    pruner.start()
+
+    assert pruner._task is first, "a second loop was started"
+    await pruner.stop()
+    assert pruner._task is None
+
+
+async def test_a_restarted_pruner_gets_a_fresh_loop(db):
+    """Idempotence must not mean a pruner can never be restarted - a worker
+    that loses the lease and takes it back has to start pruning again."""
+    pruner = UsageLogPruner(SessionLocal)
+    pruner.start()
+    await pruner.stop()
+    pruner.start()
+
+    assert pruner._task is not None and not pruner._task.done()
+    await pruner.stop()

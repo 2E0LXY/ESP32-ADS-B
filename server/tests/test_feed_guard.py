@@ -359,3 +359,81 @@ async def test_the_checks_can_be_turned_off_from_the_settings(monkeypatch):
         await manager.stop_for_device(port)
 
     assert [entry["hex"] for entry in cached] == ["badbad"]
+
+
+async def test_syncing_closes_a_listener_whose_feed_was_disabled():
+    """sync_from_db() only ever started listeners. Nothing closed one whose
+    device had stopped being feeder-enabled, so a feed disabled anywhere
+    other than by the request owning the listener kept being accepted until
+    the service restarted."""
+    from app import models
+    from app.aggregator import Aggregator
+    from app.database import Base, SessionLocal, engine
+    from app.feed_ingest import FeedIngestManager
+
+    Base.metadata.drop_all(bind=engine)
+    Base.metadata.create_all(bind=engine)
+    port = _free_port()
+    db = SessionLocal()
+    try:
+        account = models.Account(email="sync@example.com", password_hash="x")
+        db.add(account)
+        db.commit()
+        device = models.Device(account_id=account.id, name="rx",
+                               feeder_enabled=True, feeder_port=port)
+        db.add(device)
+        db.commit()
+        device_id = device.id
+    finally:
+        db.close()
+
+    manager = FeedIngestManager(Aggregator(0.0, 0.0, 50, SessionLocal), SessionLocal)
+    try:
+        await manager.sync_from_db()
+        assert port in manager._servers, "the enabled feeder should be listening"
+
+        db = SessionLocal()
+        try:
+            db.query(models.Device).filter(models.Device.id == device_id).update(
+                {"feeder_enabled": False})
+            db.commit()
+        finally:
+            db.close()
+
+        await manager.sync_from_db()
+
+        assert port not in manager._servers, "the disabled feeder is still being accepted"
+    finally:
+        await manager.stop_all()
+
+
+async def test_syncing_twice_does_not_double_up_or_drop_a_listener():
+    from app import models
+    from app.aggregator import Aggregator
+    from app.database import Base, SessionLocal, engine
+    from app.feed_ingest import FeedIngestManager
+
+    Base.metadata.drop_all(bind=engine)
+    Base.metadata.create_all(bind=engine)
+    port = _free_port()
+    db = SessionLocal()
+    try:
+        account = models.Account(email="sync2@example.com", password_hash="x")
+        db.add(account)
+        db.commit()
+        db.add(models.Device(account_id=account.id, name="rx",
+                             feeder_enabled=True, feeder_port=port))
+        db.commit()
+    finally:
+        db.close()
+
+    manager = FeedIngestManager(Aggregator(0.0, 0.0, 50, SessionLocal), SessionLocal)
+    try:
+        await manager.sync_from_db()
+        server = manager._servers[port]
+        await manager.sync_from_db()
+
+        assert manager._servers[port] is server, "the listener was torn down and rebuilt"
+        assert len(manager._servers) == 1
+    finally:
+        await manager.stop_all()
