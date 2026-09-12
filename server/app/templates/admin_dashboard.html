@@ -37,7 +37,7 @@
 <div class="panel">
 <h2>Recently active devices</h2>
 <table>
-<thead><tr><th>Device</th><th>Account</th><th>Last seen</th><th>Firmware</th></tr></thead>
+<thead><tr><th>Device</th><th>Account</th><th>Last seen</th><th>Firmware</th><th>Address</th><th>Location</th><th>Last result</th><th>Polls 24h</th><th>Feeder</th></tr></thead>
 <tbody>
 {% for device in recent_devices %}
 <tr>
@@ -45,9 +45,14 @@
 <td>{{ device.account.email }}</td>
 <td>{{ device.last_seen_at.strftime('%Y-%m-%d %H:%M UTC') if device.last_seen_at else 'Never' }}</td>
 <td>{{ device.firmware_version or '--' }}</td>
+<td>{{ device.last_seen_ip or '--' }}</td>
+<td>{{ device.location_str }}<div class="sub">{{ device.location_from }}</div></td>
+<td>{% if device.last_aircraft is none %}--{% else %}{{ device.last_aircraft }} aircraft{% endif %}</td>
+<td>{{ device.polls_today }}</td>
+<td>{{ device.feeder_state }}</td>
 </tr>
 {% else %}
-<tr><td colspan="4" class="sub">No devices have checked in yet.</td></tr>
+<tr><td colspan="9" class="sub">No devices have checked in yet.</td></tr>
 {% endfor %}
 </tbody>
 </table>

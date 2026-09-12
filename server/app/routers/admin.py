@@ -72,6 +72,34 @@ def admin_dashboard(
         .limit(20)
         .all()
     )
+    # Everything here is already recorded; none of it needed a firmware
+    # change. The row previously showed a name, an account, a timestamp and
+    # an empty Firmware column, which answered almost nothing about a
+    # receiver that had gone quiet or was returning nothing.
+    day_ago = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=1)
+    for device in recent_devices:
+        location = device.location()
+        device.location_str = (
+            f"{location[0]:.3f}, {location[1]:.3f} @ {location[2]:.0f} nm" if location else "Unknown"
+        )
+        device.location_from = device.location_source()
+        recent = (
+            db.query(models.UsageLog)
+            .filter(models.UsageLog.device_id == device.id)
+            .order_by(models.UsageLog.created_at.desc())
+            .first()
+        )
+        device.last_aircraft = recent.aircraft_returned if recent else None
+        device.polls_today = (
+            db.query(models.UsageLog)
+            .filter(models.UsageLog.device_id == device.id,
+                    models.UsageLog.created_at >= day_ago)
+            .count()
+        )
+        device.feeder_state = (
+            "Off" if not device.feeder_enabled
+            else f"Port {device.feeder_port}" if device.feeder_port else "No port"
+        )
     return templates.TemplateResponse(
         request,
         "admin_dashboard.html",

@@ -92,6 +92,7 @@ async def test_device_poll_does_not_stall_the_loop(monkeypatch):
                                         reference=_StubReference())
         ),
         client=types.SimpleNamespace(host="127.0.0.1"),
+        headers={},
     )
 
     def slow_write(*_args, **_kwargs):

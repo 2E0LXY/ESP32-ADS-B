@@ -1,5 +1,6 @@
 import asyncio
 import datetime
+import re
 
 from fastapi import APIRouter, Cookie, Depends, Form, Header, Request, status
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
@@ -28,6 +29,19 @@ def _routes(request: Request):
 
 def _reference(request: Request):
     return request.app.state.reference
+
+
+# "2E0LXY-ESP32-ADSB/2.6.0 (+https://github.com/2E0LXY/ESP32-ADS-B)". The
+# device has always sent this; nothing ever read it, so the Firmware column
+# on both dashboards rendered "--" for every device forever. Parsed rather
+# than added as a new header so no firmware change is needed and receivers
+# already in the field start reporting on their next poll.
+_AGENT_VERSION = re.compile(r"2E0LXY-ESP32-ADSB/([0-9]+\.[0-9]+\.[0-9]+)")
+
+
+def firmware_from_user_agent(agent: str | None) -> str | None:
+    match = _AGENT_VERSION.search(agent or "")
+    return match.group(1) if match else None
 
 
 @router.get("/", response_class=HTMLResponse)
@@ -66,11 +80,13 @@ async def get_aircraft(
         enriched.append({**entry, "route": route} if route else entry)
     aircraft = enriched
     ip = request.client.host if request.client else None
+    firmware = firmware_from_user_agent(request.headers.get("user-agent"))
     # In a thread, not inline: this endpoint is "async def", so a synchronous
     # commit here stops the whole event loop until SQLite lets go - and the
     # feeder listeners live on that same loop, so a device poll that waited
     # on a write lock stopped reading a customer's live SBS stream with it.
-    await asyncio.to_thread(_record_poll, db, device, ip, lat, lon, radius, len(aircraft))
+    await asyncio.to_thread(_record_poll, db, device, ip, firmware,
+                            lat, lon, radius, len(aircraft))
     return {"ac": aircraft, "total": len(aircraft)}
 
 
@@ -78,6 +94,7 @@ def _record_poll(
     db: Session,
     device: models.Device,
     ip: str | None,
+    firmware: str | None,
     lat: float,
     lon: float,
     radius: float,
@@ -85,6 +102,10 @@ def _record_poll(
 ):
     device.last_seen_at = datetime.datetime.now(datetime.timezone.utc)
     device.last_seen_ip = ip
+    # Only when the agent actually carried one, so a device fetching through
+    # something that rewrites the header does not blank a version we knew.
+    if firmware:
+        device.firmware_version = firmware
     # The device already tells us where it is on every request, so record it:
     # that is what lets the aggregator poll upstream for this customer's sky
     # rather than only the operator's. A receiver that moves - a hotel, a
