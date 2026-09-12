@@ -865,10 +865,15 @@ int16_t *pendingRight = nullptr;
 // buffer and the panel agree on nothing), and whenever baseMap itself
 // changes under everything.
 bool fullFrameNeeded = true;
-// What the last present() actually pushed, for /api/status - the number to
-// watch when judging whether this is working.
+// What the last render actually moved, for /api/status - the numbers to
+// watch when judging whether this is working. Both copies are counted
+// separately because direct-draw mode has no present() copy at all, so
+// presentPixels stays zero there and the restore figure is the only one
+// that means anything.
 uint16_t lastPresentRows = 0;
 uint32_t lastPresentPixels = 0;
+uint16_t lastRestoreRows = 0;
+uint32_t lastRestorePixels = 0;
 
 inline bool spansReady() {
   return paintedLeft && paintedRight && pendingLeft && pendingRight;
@@ -1840,6 +1845,8 @@ void restoreMap() {
   const bool haveMap = physicalMapReady && baseMap;
   if (haveMap && spansReady() && !fullFrameNeeded) {
     // Only the spans the last frame drew over the map need putting back.
+    uint16_t rows = 0;
+    uint32_t pixels = 0;
     for (int y = 0; y < H; ++y) {
       const int x0 = paintedLeft[y];
       const int x1 = paintedRight[y];
@@ -1852,7 +1859,11 @@ void restoreMap() {
       if (x1 > pendingRight[y]) pendingRight[y] = static_cast<int16_t>(x1);
       paintedLeft[y] = static_cast<int16_t>(W);
       paintedRight[y] = 0;
+      ++rows;
+      pixels += static_cast<uint32_t>(x1 - x0);
     }
+    lastRestoreRows = rows;
+    lastRestorePixels = pixels;
     return;
   }
   if (haveMap) memcpy(framebuffer, baseMap, W * H * sizeof(uint16_t));
@@ -1871,6 +1882,8 @@ void restoreMap() {
       pendingRight[y] = static_cast<int16_t>(W);
     }
   }
+  lastRestoreRows = H;
+  lastRestorePixels = static_cast<uint32_t>(W) * H;
   fullFrameNeeded = false;
 }
 
@@ -5515,6 +5528,12 @@ void handleStatusApi() {
   doc["presentRows"] = lastPresentRows;
   doc["presentPixels"] = lastPresentPixels;
   doc["presentKb"] = static_cast<uint32_t>(lastPresentPixels * 2 / 1024);
+  // The restore side, which happens in both rendering modes - in direct
+  // draw there is no present() copy, so this is the only figure that moves.
+  doc["restoreRows"] = lastRestoreRows;
+  doc["restoreKb"] = static_cast<uint32_t>(lastRestorePixels * 2 / 1024);
+  doc["renderKb"] = static_cast<uint32_t>((lastRestorePixels + lastPresentPixels) * 2 / 1024);
+  doc["spanTracking"] = spansReady();
   doc["screensaverActive"] = screensaverActive;
   doc["page"] = displayPageName();
   doc["latitude"] = homeLatitude;
