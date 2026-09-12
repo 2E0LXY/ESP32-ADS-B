@@ -3352,6 +3352,18 @@ void renderScreensaverPage() {
   //
   // The signature covers everything this page actually draws for the
   // selected aircraft; anything not in it cannot change the picture.
+
+  // The no-aircraft frame is otherwise empty, and an empty panel is exactly
+  // when someone wants to know where the admin interface lives - there is
+  // nothing else on screen to read it off. Worked out before the signature
+  // below so a reconnect or a new DHCP lease repaints rather than leaving a
+  // stale address on a page that never otherwise changes.
+  char address[40];
+  if (WiFi.status() == WL_CONNECTED)
+    snprintf(address, sizeof(address), "%s", WiFi.localIP().toString().c_str());
+  else
+    snprintf(address, sizeof(address), "NO WIFI");
+
   uint32_t signature = 2166136261u;
   auto mix = [&signature](uint32_t value) {
     signature = (signature ^ value) * 16777619u;
@@ -3360,6 +3372,7 @@ void renderScreensaverPage() {
     for (const char *c = text; *c; ++c) mix(static_cast<uint8_t>(*c));
   };
   mix(static_cast<uint32_t>(overheadCount));
+  if (overheadCount == 0) mixText(address);
   if (overheadCount > 0) {
     const AircraftDisplay &shown = latestAircraft[overheadMatches[screensaverAircraftIndex % overheadCount]];
     mixText(shown.hex);
@@ -3386,6 +3399,13 @@ void renderScreensaverPage() {
 
   filledRect(0, 0, W, H, rgb(0, 0, 0));
   if (overheadCount == 0) {
+    // Right-aligned in the top corner. Each glyph advances 6*scale with the
+    // last column of that advance being the gap to the next character, so
+    // the drawn width is one scale unit narrower than the advance total.
+    const int addressScale = W >= 800 ? 2 : 1;
+    const int addressWidth = static_cast<int>(strlen(address)) * 6 * addressScale - addressScale;
+    const int edge = W / 40;
+    text5(W - edge - addressWidth, edge, address, rgb(120, 140, 160), addressScale);
     text5(20, H / 2 - 6, "NO OVERHEAD AIRCRAFT", rgb(120, 140, 160), 2);
     text5(20, H / 2 + 24, "TAP OR SWIPE TO RETURN", rgb(70, 90, 110));
     present();
