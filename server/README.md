@@ -123,6 +123,7 @@ raw data being pushed straight into this backend.
 - `app/retention.py` - prunes `usage_log` so it stops growing without bound
 - `app/runtime_settings.py` - the settings an operator can change from the admin panel
 - `app/log_buffer.py` - recent log lines in memory, for `/admin/logs`
+- `app/feed_guard.py` - rejects aircraft a feeder could not really have heard
 - `app/sbs.py` - SBS/BaseStation protocol decoder for incoming feeder connections
 - `app/feed_ingest.py` - per-device TCP listeners that accept customers' own feeds
 - `app/security.py` - password hashing, session tokens, API key generation/hashing
@@ -319,12 +320,18 @@ means the parity they assert goes unchecked - so install from
   worker with no Redis. Turn it on deliberately, with more than one vCPU,
   and watch `/admin` for which worker holds the polling role - see
   "Capacity, measured" above.
-- Feeder ingest has no authentication beyond the per-device port, which is
-  how every feeder network works (readsb and friends cannot send a
-  credential first) but does mean anyone who learns or scans a port can
-  inject aircraft into the shared cache. Before open signup: sanity-check
-  incoming positions against the feeder's own location, and consider
+- Feeder ingest still has no authentication beyond the per-device port,
+  which is how every feeder network works (readsb and friends cannot send a
+  credential first). Injected aircraft are now checked for plausibility
+  rather than trusted (`app/feed_guard.py`): impossible coordinates and
+  altitudes, aircraft teleporting between messages, and - for a receiver
+  whose position is known independently of its own feed - anything far
+  beyond its horizon. `/admin/devices` shows what each feeder is having
+  rejected. The remaining gap is a feeder with no owner-set and no
+  reported position, which gets every check except the range one, so
+  plausible-looking coordinates anywhere on earth would still be accepted
+  from it. Before open signup, consider
   pinning a feeder to its last-seen source IP.
-- Admin panel has no "change your own password" page yet - see the note in
-  `.env.example` for how to rotate the bootstrap admin's password manually
-  in the meantime.
+- The bootstrap admin's password is still in `.env` on the server from
+  first boot. `/admin/password` can change it now; clear that line
+  afterwards.

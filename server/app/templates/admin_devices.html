@@ -18,7 +18,7 @@
 <table>
 <thead><tr>
   <th>Device</th><th>Account</th><th>Last seen</th><th>Firmware</th><th>Address</th>
-  <th>Location</th><th>Keys</th><th>Feeder</th><th>Actions</th>
+  <th>Location</th><th>Keys</th><th>Feeder</th><th>Feed checks</th><th>Actions</th>
 </tr></thead>
 <tbody>
 {% for device in devices %}
@@ -36,6 +36,18 @@
       <span class="badge ok">port {{ device.feeder_port }}</span>
       {% if device.feeder_last_message_at %}<br>{{ device.feeder_last_message_at.strftime('%H:%M') }}{% endif %}
     {% else %}off{% endif %}</td>
+  <td class="sub">
+    {% if not device.guard %}--
+    {% elif device.guard.rejected %}
+      <span class="badge warn">{{ device.guard.rejected }} rejected</span>
+      of {{ device.guard.accepted + device.guard.rejected }}
+      <br>{% for reason, count in device.guard.reasons.items() %}{{ reason }} {{ count }}{% if not loop.last %}, {% endif %}{% endfor %}
+      {% if not device.guard.trusted_centre %}<br>no known position - range unchecked{% endif %}
+    {% else %}
+      <span class="badge ok">{{ device.guard.accepted }} accepted</span>
+      {% if not device.guard.trusted_centre %}<br>no known position - range unchecked{% endif %}
+    {% endif %}
+  </td>
   <td style="white-space:nowrap">
     {% if device.active_key_count %}
     <form method="post" action="/admin/devices/{{ device.id }}/revoke-keys" class="inline"
@@ -52,10 +64,18 @@
   </td>
 </tr>
 {% else %}
-<tr><td colspan="9" class="sub">No devices match{% if q %} "{{ q }}"{% endif %}.</td></tr>
+<tr><td colspan="10" class="sub">No devices match{% if q %} "{{ q }}"{% endif %}.</td></tr>
 {% endfor %}
 </tbody>
 </table>
+<p class="sub">Feed checks reject aircraft a receiver could not really have heard - impossible
+  coordinates or altitudes, aircraft teleporting between messages, and anything far beyond the
+  horizon of a receiver whose position we know independently of its own feed.
+  {% if checks_on %}They are on (<a href="/admin/settings">Settings</a>).{% else %}<b>They are
+  currently off</b> - turn them on in <a href="/admin/settings">Settings</a>.{% endif %}
+  A feeder with no position set by its owner and none reported by its receiver gets the other
+  checks but not the range one, which is why "no known position" is worth chasing.
+  Counts are since this worker started.</p>
 <p class="sub" style="margin-bottom:0">Revoking a device's keys cuts off that one receiver
   without suspending its owner's whole account, which was the only lever before. Stopping a
   feed closes its listener straight away rather than at the next restart - feeder ingestion

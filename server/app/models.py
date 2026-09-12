@@ -112,6 +112,22 @@ class Device(Base):
             return (self.inferred_lat, self.inferred_lon, 50.0)
         return None
 
+    def independent_location(self) -> tuple[float, float] | None:
+        """Position we know without asking this device's own feed.
+
+        Only what the receiver reports on its API polls, or what the owner
+        typed in the dashboard. Deliberately excludes the position inferred
+        from its feed (see app/site_estimate.py), because the plausibility
+        checks in app/feed_guard.py use this to decide whether that feed is
+        believable - and a garbage feed would otherwise move the estimate
+        until the garbage looked fine.
+        """
+        if self.reported_lat is not None and self.reported_lon is not None:
+            return (self.reported_lat, self.reported_lon)
+        if self.manual_lat is not None and self.manual_lon is not None:
+            return (self.manual_lat, self.manual_lon)
+        return None
+
     def location_source(self) -> str:
         if self.reported_lat is not None and self.reported_lon is not None:
             return "reported by the receiver"

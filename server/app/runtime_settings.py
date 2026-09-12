@@ -125,6 +125,25 @@ DEFINITIONS: list[Setting] = [
         help="",
     ),
     Setting(
+        "feeder_position_checks", "bool", os.environ.get("FEEDER_POSITION_CHECKS", "1") != "0",
+        label="Check feeder positions are plausible", group="Feeder ingestion",
+        help="Feeder ingestion has no authentication beyond knowing the port, so anyone "
+             "who scans one can inject aircraft into the shared cache. This rejects "
+             "impossible coordinates, impossible altitudes, aircraft that teleport "
+             "between messages, and - for a receiver whose position we know "
+             "independently of its own feed - aircraft far beyond its horizon.",
+    ),
+    Setting(
+        "feeder_max_range_nm", "float", 300.0,
+        label="Furthest a receiver can hear", unit=" nm", minimum=50, maximum=500,
+        group="Feeder ingestion",
+        help="Line of sight from sea level to an aircraft at 40,000 ft is about 250 nm; "
+             "a hilltop site can beat that, so the default is generous. Only applies to "
+             "feeders whose location the owner set or whose receiver reports one - never "
+             "the position estimated from the feed itself, which a bad feed would move "
+             "until it looked plausible.",
+    ),
+    Setting(
         "usage_log_retention_days", "int", _env_int("USAGE_LOG_RETENTION_DAYS", 30),
         label="Usage history kept", unit=" days", minimum=1, maximum=3650, group="Housekeeping",
         help="One row per device poll, about 2,880 a day per receiver. Each device's "

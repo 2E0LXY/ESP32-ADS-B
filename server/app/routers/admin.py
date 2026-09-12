@@ -528,7 +528,11 @@ def admin_devices(
             | models.Device.firmware_version.ilike(like)
         )
     devices = query.order_by(models.Device.last_seen_at.desc().nullslast()).limit(200).all()
+    # Only the worker running the listeners has these, so with several
+    # workers a follower's page shows no counts rather than wrong ones.
+    guards = request.app.state.feed_ingest.guard_stats()
     for device in devices:
+        device.guard = guards.get(device.id)
         location = device.location()
         device.location_str = (
             f"{location[0]:.3f}, {location[1]:.3f} @ {location[2]:.0f} nm" if location else "Unknown"
