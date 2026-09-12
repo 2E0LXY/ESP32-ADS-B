@@ -2101,10 +2101,19 @@ bool cacheOsmTile(uint8_t zoom, int tileX, int tileY, const String &path) {
 constexpr char LOGO_ENDPOINT[] = "https://adsb.2e0lxy.uk/logo/airline/";
 // The TLS handshake for this needs a contiguous internal block, and that is
 // exactly what the device has least of - it is why the route lookups had to
-// move to the server. So a logo is only ever fetched when there is
-// comfortable headroom; otherwise it waits for a later rotation. Worst case
-// the initials tile stays, which is what was there before.
-constexpr size_t LOGO_MIN_INTERNAL_BLOCK = 48u * 1024u;
+// move to the server. So a logo is only ever fetched when there is headroom;
+// otherwise it waits for a later rotation. Worst case the initials tile
+// stays, which is what was there before.
+//
+// 28 KB from measurement, not from caution. On this board the largest free
+// internal block settles at 31,732 bytes, and the aircraft fetch completes a
+// TLS handshake at exactly that level every thirty seconds with a 39 KB
+// response body. A logo is a fifth of that size and runs on the same task
+// between those fetches, so it faces the same conditions the feed already
+// survives. The first attempt at this was 48 KB, which is more than this
+// board ever has free - the guard could never pass and no logo was ever
+// fetched.
+constexpr size_t LOGO_MIN_INTERNAL_BLOCK = 28u * 1024u;
 
 LogoFetch cacheOperatorLogo(const char *code) {
   fs::FS &cache = sdMounted ? static_cast<fs::FS &>(SDCARD) : static_cast<fs::FS &>(LittleFS);
@@ -4126,7 +4135,14 @@ void fetchAdsbV2Aircraft() {
   const char *fields[] = {"lat", "lon", "track", "true_heading", "mag_heading",
                           "alt_baro", "alt_geom", "gs", "baro_rate", "geom_rate",
                           "seen", "rssi", "messages", "flight", "hex", "r", "t",
-                          "squawk", "category", "ownOp", "cou", "emergency", "mlat"};
+                          "squawk", "category", "ownOp", "cou", "emergency", "mlat",
+                          // Resolved by the aggregator from the offline ICAO
+                          // lists. Reading them elsewhere is not enough: a
+                          // filter drops anything not named here, so these
+                          // arrived and were silently discarded during
+                          // parsing, which is why the panel kept showing
+                          // "B38M" and no radio callsign.
+                          "shape", "type_name", "telephony"};
   for (const char *field : fields) aircraftFilter[field] = true;
   // The aggregator resolves callsign->route server-side and attaches it
   // here, so this device never opens its own connection to adsbdb. A
