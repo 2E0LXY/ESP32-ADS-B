@@ -175,6 +175,12 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt httpx pytest
   token. Acceptable for now (a port number isn't guessable, and it's shown
   only to the logged-in owner), but if abuse becomes a problem, an
   allowlist of expected source IPs per device would tighten this further.
+- **airplanes.live is disabled by default.** It answers 403 to every request,
+  and not because of any one deployment's address - the same request is
+  refused from unrelated networks. Set `DISABLED_SOURCES=` (empty) to try it
+  again if their access rules change, or list other source names there to
+  turn them off. A disabled source is not polled and does not appear in the
+  admin panel's health table at all, rather than sitting there red.
 - A public share link (`/share/<token>`) is unlisted, not access-controlled:
   anyone holding the URL sees that receiver's live map, which is the whole
   point of it. It is served with `X-Robots-Tag: noindex` so a link pasted

@@ -51,6 +51,20 @@ MAX_POLL_RADIUS_NM = 250.0
 # Each region is one request per upstream per cycle. Beyond this many the
 # regions are rotated across cycles instead.
 MAX_POLL_REGIONS = int(os.environ.get("MAX_POLL_REGIONS", "6"))
+# Sources to leave alone entirely, comma separated, by the names used below.
+#
+# airplanes.live is off by default because it now answers 403 to every
+# request from us, and not because of this deployment's address - the same
+# request is refused from unrelated networks too. A source that cannot
+# succeed should not sit red in the admin panel forever implying an outage
+# somebody could fix, nor keep spending requests at someone else's server
+# to re-learn the same answer. Clear this variable to try it again if their
+# access rules change.
+DISABLED_SOURCES = {
+    name.strip()
+    for name in os.environ.get("DISABLED_SOURCES", "airplaneslive").split(",")
+    if name.strip()
+}
 
 
 @dataclass
@@ -171,7 +185,9 @@ class Aggregator:
         self.home_radius_nm = home_radius_nm
         self._session_factory = session_factory
         self._health: dict[str, SourceHealth] = {
-            name: SourceHealth(name) for name in ("adsbfi", "airplaneslive", "adsblol")
+            name: SourceHealth(name)
+            for name in ("adsbfi", "airplaneslive", "adsblol")
+            if name not in DISABLED_SOURCES
         }
         self._feeder_cycle: dict[FeederProvider, itertools.cycle] = {}
         self._region_cursor = 0
@@ -297,6 +313,9 @@ class Aggregator:
             logger.warning("could not read device locations (%s) - polling the home area only", exc)
             return [(self.home_lat, self.home_lon, self.home_radius_nm)]
 
+    def source_enabled(self, name: str) -> bool:
+        return name in self._health
+
     def _source_is_backed_off(self, name: str) -> bool:
         """True while a repeatedly failing source is being left alone.
 
@@ -317,7 +336,10 @@ class Aggregator:
         return time.time() - (health.last_attempt or 0) < delay
 
     async def _record(self, name: str, coro):
-        health = self._health[name]
+        health = self._health.get(name)
+        if health is None:  # disabled - see DISABLED_SOURCES
+            coro.close()
+            return
         if self._source_is_backed_off(name):
             coro.close()  # never awaited, so close it rather than leak a warning
             return
@@ -344,6 +366,8 @@ class Aggregator:
                 )
 
     async def _poll_adsbfi(self, client: httpx.AsyncClient, regions):
+        if "adsbfi" in DISABLED_SOURCES:
+            return
         for lat, lon, radius in regions:
             url = (
                 f"https://opendata.adsb.fi/api/v3/lat/{lat}/lon/{lon}"
@@ -352,6 +376,8 @@ class Aggregator:
             await self._record("adsbfi", self._fetch(client, url, "ac"))
 
     async def _poll_airplaneslive(self, client: httpx.AsyncClient, regions):
+        if "airplaneslive" in DISABLED_SOURCES:
+            return
         # No feeder-key pooling here yet: airplanes.live's own API doesn't
         # take a bearer/query-param key today (access is IP/account based on
         # their end) - the hook is here so it's a one-line change once/if
@@ -361,6 +387,8 @@ class Aggregator:
             await self._record("airplaneslive", self._fetch(client, url, "ac"))
 
     async def _poll_adsblol(self, client: httpx.AsyncClient, regions):
+        if "adsblol" in DISABLED_SOURCES:
+            return
         for lat, lon, radius in regions:
             url = f"https://api.adsb.lol/v2/point/{lat}/{lon}/{radius:.0f}"
             await self._record("adsblol", self._fetch(client, url, "ac"))
