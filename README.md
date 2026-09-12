@@ -143,9 +143,11 @@ Backend (`server/`), see [Aggregator backend](#aggregator-backend):
 The boot screen is generated from `assets/boot-source.png` by
 `tools/make_boot_asset.py`, which writes `src/boot_asset.h` and a preview of
 each panel's crop. Replace the source image and re-run it to change the
-splash; the 800 × 480 boards get a full-bleed crop and the 480 × 480 board
-the same picture letterboxed, since the title spans too much of the width to
-survive a square crop.
+splash. Both panels get a full-bleed centre crop, so the source needs enough
+margin around the title to survive losing height for the 800 × 480 boards and
+width for the 480 × 480 one — check the previews it writes before flashing.
+The firmware decodes it a line at a time straight to the panel, so the
+picture costs 1.6 KB of RAM while it paints rather than a staged copy.
 
 ## Main features
 

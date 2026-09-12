@@ -1919,11 +1919,6 @@ struct ImageStage {
 
 ImageStage logoStage;
 ImageStage photoStage;
-// The boot screen, decoded once from the PNG in flash. It is repainted
-// several times while Wi-Fi comes up (each with a different status line), and
-// decoding 800x480 again for every repaint would cost a few hundred
-// milliseconds each time for a picture that has not changed.
-ImageStage bootStage;
 ImageStage *decodeStageTarget = nullptr;
 
 int decodeStagePngLine(PNGDRAW *draw) {
@@ -2009,36 +2004,55 @@ void blitStage(const ImageStage &stage, int left, int top) {
   }
 }
 
-// Decodes the boot screen from flash into PSRAM. PROGMEM on the ESP32-S3 is
-// memory-mapped, so PNGdec can read the array in place - there is no need to
-// copy 200 KB out of flash first.
-bool decodeBootImage() {
-  if (bootStage.key[0]) return true;  // already decoded
-  if (!pngDecoderPtr) return false;
-  if (!ensureStage(bootStage, BOOT_IMAGE_W, BOOT_IMAGE_H)) return false;
-  decodeStageTarget = &bootStage;
-  const int opened = pngDecoder.openRAM(const_cast<uint8_t *>(BOOT_IMAGE_PNG),
-                                        BOOT_IMAGE_PNG_LEN, decodeStagePngLine);
-  const bool success = opened == PNG_SUCCESS && pngDecoder.decode(nullptr, 0) == PNG_SUCCESS;
-  if (opened == PNG_SUCCESS) pngDecoder.close();
-  decodeStageTarget = nullptr;
-  if (!success) {
-    Serial.printf("Boot image decode failed (open=%d)\n", opened);
-    return false;
-  }
-  strncpy(bootStage.key, "boot", sizeof(bootStage.key) - 1);
-  return true;
+// One line of the boot screen on its way from flash to the panel, and where
+// on the panel it goes. 1,600 bytes, rather than staging the whole decoded
+// 800x480 picture in 768 KB of PSRAM: the boot screen is drawn and finished
+// with, while the map tiles, airline logos and aircraft photographs want
+// PSRAM for the rest of the run.
+uint16_t *bootLine = nullptr;
+int bootLineLeft = 0;
+int bootLineTop = 0;
+
+int decodeBootPngLine(PNGDRAW *draw) {
+  // A row wider than the buffer would run off the end of it. The asset is
+  // generated to BOOT_IMAGE_W, but a header from another build must not be
+  // able to corrupt memory here.
+  if (!bootLine || draw->iWidth > BOOT_IMAGE_W) return 0;
+  if (draw->y < 0 || draw->y >= BOOT_IMAGE_H) return 1;
+  pngDecoder.getLineAsRGB565(draw, bootLine, PNG_RGB565_LITTLE_ENDIAN, 0xffffffff);
+  gfx->draw16bitRGBBitmap(bootLineLeft, bootLineTop + draw->y, bootLine, draw->iWidth, 1);
+  return 1;
 }
 
-// Hands the boot screen's PSRAM back once the live display owns the panel.
-// 768 KB is nothing next to 8 MB, but the map tiles, airline logos and
-// aircraft photographs all want PSRAM for the rest of the run and the boot
-// screen is never drawn again.
-void releaseBootImage() {
-  if (!bootStage.pixels) return;
-  heap_caps_free(bootStage.pixels);
-  bootStage = ImageStage{};
-  Serial.println("Boot image released");
+// Paints the boot screen straight from the PNG in flash. PROGMEM on the
+// ESP32-S3 is memory-mapped, so PNGdec reads the array in place - nothing is
+// copied out of flash first, and nothing but one line exists in RAM at a
+// time.
+//
+// Decoded again on each repaint rather than kept: the boot screen is painted
+// a handful of times while Wi-Fi comes up, each with a different status line,
+// and trading those few decodes for 768 KB held across the whole run is the
+// right way round on a board where PSRAM is what the map and the images
+// compete for.
+bool paintBootImage() {
+  if (!pngDecoderPtr) return false;
+  bootLine = static_cast<uint16_t *>(heap_caps_malloc(
+      BOOT_IMAGE_W * sizeof(uint16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  // Internal RAM as a fallback: one line is 1.6 KB, which even the scarce
+  // pool can spare, and a boot screen that needs PSRAM to appear at all
+  // would be a poor trade.
+  if (!bootLine) bootLine = static_cast<uint16_t *>(malloc(BOOT_IMAGE_W * sizeof(uint16_t)));
+  if (!bootLine) return false;
+  bootLineLeft = (W - BOOT_IMAGE_W) / 2;
+  bootLineTop = (H - BOOT_IMAGE_H) / 2;
+  const int opened = pngDecoder.openRAM(const_cast<uint8_t *>(BOOT_IMAGE_PNG),
+                                        BOOT_IMAGE_PNG_LEN, decodeBootPngLine);
+  const bool success = opened == PNG_SUCCESS && pngDecoder.decode(nullptr, 0) == PNG_SUCCESS;
+  if (opened == PNG_SUCCESS) pngDecoder.close();
+  heap_caps_free(bootLine);
+  bootLine = nullptr;
+  if (!success) Serial.printf("Boot image decode failed (open=%d)\n", opened);
+  return success;
 }
 
 // The ICAO operator prefix of a callsign: RYR2BH is Ryanair. Empty when the
@@ -3515,15 +3529,13 @@ void present() {
 }
 
 void renderBootScreen(const String &networkLine = "", uint16_t networkColour = RGB565_CYAN) {
-  if (decodeBootImage()) {
-    // The asset is generated per panel shape, so this normally fills the
-    // screen exactly; centring covers a mismatched pair of the two.
-    if (bootStage.width != W || bootStage.height != H) gfx->fillScreen(rgb(4, 10, 16));
-    gfx->draw16bitRGBBitmap((W - bootStage.width) / 2, (H - bootStage.height) / 2,
-                            bootStage.pixels, bootStage.width, bootStage.height);
-  } else {
-    // No decoder yet, no PSRAM, or a corrupt asset. A plain title beats a
-    // blank panel, and the lines below still say what is happening.
+  // The asset is generated per panel shape, so it normally fills the screen
+  // exactly; clearing first covers a header built for the other board.
+  if (BOOT_IMAGE_W != W || BOOT_IMAGE_H != H) gfx->fillScreen(rgb(4, 10, 16));
+  if (!paintBootImage()) {
+    // No decoder, no memory for even one line, or an asset that will not
+    // decode. A plain title beats a blank panel, and the lines below still
+    // say what is happening.
     gfx->fillScreen(rgb(4, 10, 16));
     gfx->setTextSize(3);
     gfx->setTextColor(RGB565_CYAN);
@@ -6828,9 +6840,6 @@ void setup() {
     status("MAP", rgb(53,169,244));
     present();
   }
-  // Past this point the panel shows the live display and the boot screen is
-  // never drawn again.
-  releaseBootImage();
   beginWebControl();
   Serial.printf("Web login username: %s\n", WEB_USERNAME);
   { MutexGuard guard(dataMutex); fetchAircraft(); }

@@ -12,10 +12,14 @@ PNGdec, which is already a dependency (map tiles, airline logos and
 aircraft photographs all arrive as PNGs). Two things fall out of that:
 
 * Less flash for more pixels. A 256-colour PNG of the 800x480 image is
-  about 187 KB against 768,000 bytes raw - and less than half what the old
+  around 210 KB against 768,000 bytes raw - less than half what the old
   460,800-byte 480x480 asset cost, for 2.7 times the pixels.
-* One source image, both panels. Each board gets a crop that suits its
-  shape rather than one square asset letterboxed onto the other.
+* Nothing staged in RAM. The firmware decodes it a line at a time straight
+  to the panel, so the picture costs 1.6 KB while it is being painted
+  rather than 768 KB of PSRAM held for the run.
+* One source image, both panels, each a full-bleed centre crop - so a
+  source needs enough margin around the title to survive losing height for
+  the 5:3 panels and width for the square one.
 
 256 colours with Floyd-Steinberg dithering rather than truecolour: the
 panel is RGB565 and cannot show more than 65k colours anyway, truecolour
@@ -40,9 +44,11 @@ except ImportError:  # pragma: no cover - a developer machine without Pillow
     sys.exit("This needs Pillow: python3 -m pip install Pillow")
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
-# The 800x480 boards get the full panel. The 480x480 board gets the same
-# crop letterboxed, not a square crop of the middle: the title spans nearly
-# the whole width, so a square crop would cut the ends off both words.
+# Every panel gets a full-bleed centre crop - no letterboxing. That needs a
+# source with enough margin around the title for both shapes to be cropped
+# out of it: a 4:3 source loses height for the 5:3 panels and width for the
+# square one, and the title has to survive both. Check the previews this
+# writes rather than assuming.
 PANELS = ((800, 480), (480, 480))
 COLOURS = 256
 # renderBootScreen() prints the firmware credit at y=414 and the network
@@ -65,8 +71,8 @@ SCRIM_STRENGTH = 0.86
 
 
 def _darkest(image: Image.Image) -> tuple[int, int, int]:
-    """The image's own darkest tone, used for scrims and letterbox bars so
-    they read as more night sky rather than as pure black."""
+    """The image's own darkest tone, so the shading at the bottom reads as
+    more night sky rather than as pure black."""
     small = image.convert("RGB").resize((32, 32))
     getter = getattr(small, "get_flattened_data", small.getdata)
     return min(list(getter()), key=sum)
@@ -107,22 +113,6 @@ def _shade_text_band(image: Image.Image) -> Image.Image:
     return shaded
 
 
-def _letterbox(source: Image.Image, width: int, height: int) -> Image.Image:
-    """Scales the whole image to fit and centres it on the darkest tone.
-
-    Used for the square panel. The bars are filled from the image's own
-    darkest colour rather than pure black so they read as more night sky,
-    and the lower bar is where renderBootScreen puts its two lines of
-    text - which on the old asset sat on top of the picture.
-    """
-    scaled = source.copy()
-    scaled.thumbnail((width, height), Image.LANCZOS)
-    background = _darkest(source)
-    canvas = Image.new("RGB", (width, height), background)
-    canvas.paste(scaled, ((width - scaled.width) // 2, (height - scaled.height) // 2))
-    return canvas
-
-
 def _as_png_bytes(image: Image.Image, path: pathlib.Path) -> bytes:
     # Floyd-Steinberg (Pillow's default for this conversion) rather than no
     # dithering: the sky is a smooth gradient and 256 flat colours band it
@@ -143,8 +133,9 @@ def _header(entries: list[tuple[int, int, bytes]]) -> str:
         "// (already used for map tiles, airline logos and aircraft photos).",
         "// It was a raw RGB565 array, which cost 460,800 bytes of flash for a",
         "// 480x480 image that the 800x480 panels could only show centred",
-        "// between black bars. One crop per panel shape, and less flash than",
-        "// the single raw asset used.",
+        "// between black bars. One full-bleed crop per panel shape, less flash",
+        "// than the single raw asset used, and decoded a line at a time straight",
+        "// to the panel so nothing is staged in RAM.",
         "",
     ]
     for width, height, blob in entries:
@@ -175,10 +166,7 @@ def main() -> int:
 
     entries = []
     for width, height in PANELS:
-        # A panel as wide as it is tall gets the whole picture letterboxed;
-        # anything wider gets a crop that fills it.
-        fitted = (_letterbox(source, width, height) if width == height
-                  else _fit(source, width, height))
+        fitted = _fit(source, width, height)
         preview = REPO / "assets" / f"boot-{width}x{height}.png"
         blob = _as_png_bytes(fitted, preview)
         entries.append((width, height, blob))
