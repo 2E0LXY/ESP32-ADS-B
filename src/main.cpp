@@ -827,6 +827,77 @@ struct VesselDisplay {
 
 uint16_t *framebuffer = nullptr;
 uint16_t *baseMap = nullptr;
+
+// Which part of each row has been written, so a render moves kilobytes
+// instead of megabytes.
+//
+// Every page render was restoreMap() - 768 KB of baseMap copied into the
+// shadow buffer - then drawing, then present() - 768 KB of the shadow copied
+// into the panel's own framebuffer. 1.5 MB per render, on the same PSRAM bus
+// the panel's DMA refills its bounce buffers from. Missing one of those
+// refills is what leaves the scan permanently offset, so the top of the
+// picture appears part-way down the screen, and what tears text into stray
+// lines part-way through a copy.
+//
+// Almost none of those 1.5 MB change between renders: the map underneath is
+// identical and what moves is a few markers and a few lines of text. So each
+// row carries the span of it that has been written, and both copies work
+// from those spans.
+//
+// Two trackers rather than one, because they answer different questions.
+// restoreMap() needs what the last frame drew over the map, which is history
+// present() would have cleared; present() needs what differs from the panel,
+// which includes the pixels restoreMap() has just repainted. One tracker
+// serving both either loses that history or accumulates every span ever
+// drawn until it covers the screen.
+//
+// In PSRAM rather than internal DRAM: 3,840 bytes is more than a tenth of
+// the largest free internal block this board has at runtime (31,732 bytes
+// measured), and the logo decoder already defers below 28 KB of it. They are
+// touched a row at a time while drawing, so the row in hand stays in cache
+// wherever the array lives.
+int16_t *paintedLeft = nullptr;   // inclusive
+int16_t *paintedRight = nullptr;  // exclusive; right <= left means clean
+int16_t *pendingLeft = nullptr;
+int16_t *pendingRight = nullptr;
+// Set whenever the whole panel has to be rewritten: before the first render
+// after boot (the boot screen drew straight to the panel, so the shadow
+// buffer and the panel agree on nothing), and whenever baseMap itself
+// changes under everything.
+bool fullFrameNeeded = true;
+// What the last present() actually pushed, for /api/status - the number to
+// watch when judging whether this is working.
+uint16_t lastPresentRows = 0;
+uint32_t lastPresentPixels = 0;
+
+inline bool spansReady() {
+  return paintedLeft && paintedRight && pendingLeft && pendingRight;
+}
+
+inline void spanReset(int16_t *left, int16_t *right) {
+  for (int y = 0; y < H; ++y) {
+    left[y] = static_cast<int16_t>(W);
+    right[y] = 0;
+  }
+}
+
+// Records that [x0, x1) of row y now differs from both the map and the panel.
+inline void markRow(int y, int x0, int x1) {
+  if (!spansReady() || (unsigned)y >= (unsigned)H) return;
+  if (x0 < 0) x0 = 0;
+  if (x1 > W) x1 = W;
+  if (x1 <= x0) return;
+  if (x0 < paintedLeft[y]) paintedLeft[y] = static_cast<int16_t>(x0);
+  if (x1 > paintedRight[y]) paintedRight[y] = static_cast<int16_t>(x1);
+  if (x0 < pendingLeft[y]) pendingLeft[y] = static_cast<int16_t>(x0);
+  if (x1 > pendingRight[y]) pendingRight[y] = static_cast<int16_t>(x1);
+}
+
+// The map under everything has changed, or the panel holds something the
+// shadow buffer knows nothing about. Either way the next render has to be a
+// whole frame.
+inline void invalidateWholeFrame() { fullFrameNeeded = true; }
+
 // PNGdec's decoder object carries its own line and Huffman buffers and is
 // 44.5 KB. As a plain global it sits in internal DRAM, which is the scarcest
 // memory on this board - the same pool the RGB bounce buffers and every
@@ -1650,7 +1721,10 @@ uint16_t rgb(uint8_t r, uint8_t g, uint8_t b) {
 }
 
 void pixel(int x, int y, uint16_t c) {
-  if ((unsigned)x < W && (unsigned)y < H) framebuffer[y * W + x] = c;
+  if ((unsigned)x < W && (unsigned)y < H) {
+    framebuffer[y * W + x] = c;
+    markRow(y, x, x + 1);
+  }
 }
 
 void line(int x0, int y0, int x1, int y1, uint16_t c) {
@@ -1763,13 +1837,41 @@ void text5(int x, int y, const char *s, uint16_t c, int scale=1) {
 }
 
 void restoreMap() {
-  if (physicalMapReady && baseMap) memcpy(framebuffer, baseMap, W * H * sizeof(uint16_t));
+  const bool haveMap = physicalMapReady && baseMap;
+  if (haveMap && spansReady() && !fullFrameNeeded) {
+    // Only the spans the last frame drew over the map need putting back.
+    for (int y = 0; y < H; ++y) {
+      const int x0 = paintedLeft[y];
+      const int x1 = paintedRight[y];
+      if (x1 <= x0) continue;
+      memcpy(framebuffer + y * W + x0, baseMap + y * W + x0,
+             static_cast<size_t>(x1 - x0) * sizeof(uint16_t));
+      // Repainted pixels differ from what the panel is showing, so they
+      // still have to be pushed even though nothing has drawn on them yet.
+      if (x0 < pendingLeft[y]) pendingLeft[y] = static_cast<int16_t>(x0);
+      if (x1 > pendingRight[y]) pendingRight[y] = static_cast<int16_t>(x1);
+      paintedLeft[y] = static_cast<int16_t>(W);
+      paintedRight[y] = 0;
+    }
+    return;
+  }
+  if (haveMap) memcpy(framebuffer, baseMap, W * H * sizeof(uint16_t));
   else if (W == ASSET_W && H == ASSET_H)
     memcpy_P(framebuffer, MAP_IMAGE, W * H * sizeof(uint16_t));
   else
     // The baked map is 480x480 and does not fit this panel. Clear instead of
     // overrunning the array; OSM tiles replace it once cached anyway.
     memset(framebuffer, 0, W * H * sizeof(uint16_t));
+  if (spansReady()) {
+    // The whole frame was just rewritten: nothing is drawn over the map yet,
+    // and every row has to reach the panel.
+    spanReset(paintedLeft, paintedRight);
+    for (int y = 0; y < H; ++y) {
+      pendingLeft[y] = 0;
+      pendingRight[y] = static_cast<int16_t>(W);
+    }
+  }
+  fullFrameNeeded = false;
 }
 
 double osmWorldX(double longitude, uint8_t zoom) {
@@ -1827,8 +1929,11 @@ int drawPngLine(PNGDRAW *draw) {
   const int sourceX = max(0, -pngTileScreenX);
   const int destinationX = max(0, pngTileScreenX);
   const int count = min(draw->iWidth - sourceX, W - destinationX);
-  if (count > 0) memcpy(framebuffer + destinationY * W + destinationX,
-                        pixels + sourceX, count * sizeof(uint16_t));
+  if (count > 0) {
+    memcpy(framebuffer + destinationY * W + destinationX,
+           pixels + sourceX, count * sizeof(uint16_t));
+    markRow(destinationY, destinationX, destinationX + count);
+  }
   return 1;
 }
 
@@ -1998,9 +2103,12 @@ void blitStage(const ImageStage &stage, int left, int top) {
     const int destinationX = max(0, left);
     const int sourceX = max(0, -left);
     const int count = min(stage.width - sourceX, W - destinationX);
-    if (count > 0) memcpy(framebuffer + destinationY * W + destinationX,
-                          stage.pixels + row * stage.width + sourceX,
-                          count * sizeof(uint16_t));
+    if (count > 0) {
+      memcpy(framebuffer + destinationY * W + destinationX,
+             stage.pixels + row * stage.width + sourceX,
+             count * sizeof(uint16_t));
+      markRow(destinationY, destinationX, destinationX + count);
+    }
   }
 }
 
@@ -2543,6 +2651,9 @@ bool refreshPhysicalBaseMap() {
   rgbpanel->restartAtNextVsync();
   memcpy(baseMap, framebuffer, W * H * sizeof(uint16_t));
   physicalMapReady = true;
+  // Every pixel of the map underneath has just changed, so the next render
+  // cannot work from spans - see the note above restoreMap().
+  invalidateWholeFrame();
   mapRebuildActive = false;
   mapRebuildMissingTiles = mapRebuildTotal - tilesDrawn;
   Serial.printf("Physical map %d/%d tiles at %.5f, %.5f radius %u nm zoom %u\n",
@@ -3523,7 +3634,29 @@ void present() {
     return;
   }
   rgbpanel->waitForVsync(50);
-  gfx->draw16bitRGBBitmap(0, 0, framebuffer, W, H);
+  if (spansReady()) {
+    uint16_t rows = 0;
+    uint32_t pixels = 0;
+    for (int y = 0; y < H; ++y) {
+      const int x0 = pendingLeft[y];
+      const int x1 = pendingRight[y];
+      if (x1 <= x0) continue;
+      // One row per call: the library's bitmap copy takes no source stride,
+      // so a taller block would have to be contiguous, which a span of the
+      // shadow buffer is not.
+      gfx->draw16bitRGBBitmap(x0, y, framebuffer + y * W + x0, x1 - x0, 1);
+      pendingLeft[y] = static_cast<int16_t>(W);
+      pendingRight[y] = 0;
+      ++rows;
+      pixels += static_cast<uint32_t>(x1 - x0);
+    }
+    lastPresentRows = rows;
+    lastPresentPixels = pixels;
+  } else {
+    gfx->draw16bitRGBBitmap(0, 0, framebuffer, W, H);
+    lastPresentRows = H;
+    lastPresentPixels = static_cast<uint32_t>(W) * H;
+  }
   // Realign the scan after the copy. esp_lcd_rgb_panel_restart() needs
   // CONFIG_LCD_RGB_RESTART_IN_VSYNC, which cannot be set from
   // platformio.ini with the prebuilt Arduino libraries - but it is already
@@ -5377,6 +5510,11 @@ void handleStatusApi() {
   doc["bounceLines"] = panelBounceLines;
   doc["bounceKb"] = 2UL * panelBounceLines * W * 2UL / 1024UL;
   doc["directDraw"] = panelDirectDraw;
+  // What the last present() pushed. 480 rows and 384,000 pixels is a whole
+  // frame; a typical update should be a small fraction of that.
+  doc["presentRows"] = lastPresentRows;
+  doc["presentPixels"] = lastPresentPixels;
+  doc["presentKb"] = static_cast<uint32_t>(lastPresentPixels * 2 / 1024);
   doc["screensaverActive"] = screensaverActive;
   doc["page"] = displayPageName();
   doc["latitude"] = homeLatitude;
@@ -5698,6 +5836,7 @@ void handleLocationSettings() {
   settingsStore.putUChar("map-zoom", physicalMapZoom);
   physicalMapReady = false;
   physicalMapRefreshPending = true;
+  invalidateWholeFrame();
   nextFetchAt = 0;
   clearTileCache();
   sendMessage(202, "Location saved; rebuilding both maps and refreshing aircraft");
@@ -5742,6 +5881,7 @@ void handleSdRescan() {
   if (mounted) clearTileCache(true);
   physicalMapReady = false;
   physicalMapRefreshPending = true;
+  invalidateWholeFrame();
   sendMessage(200, mounted ? "SD card mounted; map cache moved to SD" :
                            "No readable SD card detected; LittleFS remains active");
 }
@@ -6817,6 +6957,22 @@ void setup() {
                                         ? "direct to panel framebuffer"
                                         : "shadow buffer, copied on present()");
   baseMap=(uint16_t*)heap_caps_malloc(W*H*sizeof(uint16_t),MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
+  // One allocation sliced four ways rather than four allocations. If it
+  // fails, spansReady() stays false and restoreMap()/present() fall back to
+  // whole-frame copies - the behaviour before this existed - rather than
+  // drawing nothing.
+  int16_t *spans = static_cast<int16_t *>(heap_caps_malloc(
+      4 * H * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (spans) {
+    paintedLeft = spans;
+    paintedRight = spans + H;
+    pendingLeft = spans + 2 * H;
+    pendingRight = spans + 3 * H;
+    spanReset(paintedLeft, paintedRight);
+    spanReset(pendingLeft, pendingRight);
+  } else {
+    Serial.println("Dirty-span buffers unavailable - falling back to full-frame copies");
+  }
   latestAircraft = static_cast<AircraftDisplay *>(heap_caps_calloc(
       MAX_AIRCRAFT, sizeof(AircraftDisplay), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
   latestVessels = static_cast<VesselDisplay *>(heap_caps_calloc(
