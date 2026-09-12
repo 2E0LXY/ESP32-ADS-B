@@ -138,7 +138,14 @@ Backend (`server/`), see [Aggregator backend](#aggregator-backend):
 4. Open that address, sign in with `admin` / `aircraft`, and immediately set a new password in **Device**.
 5. Set the receiver latitude, longitude, radius, and zoom in **Map**, then choose an aircraft feed in **Data API**.
 
-![Boot screen](assets/boot-screen-preview.png)
+![Boot screen](assets/boot-800x480.png)
+
+The boot screen is generated from `assets/boot-source.png` by
+`tools/make_boot_asset.py`, which writes `src/boot_asset.h` and a preview of
+each panel's crop. Replace the source image and re-run it to change the
+splash; the 800 × 480 boards get a full-bleed crop and the 480 × 480 board
+the same picture letterboxed, since the title spans too much of the width to
+survive a square crop.
 
 ## Main features
 

@@ -177,7 +177,9 @@ extern const uint8_t rootca_crt_bundle_end[] asm("_binary_x509_crt_bundle_end");
 #endif
 
 namespace {
-// boot_asset.h and map_asset.h are generated at 480x480.
+// map_asset.h is a raw RGB565 array generated at 480x480. The boot screen
+// is no longer one of these - it is a PNG decoded at boot, sized per panel,
+// so it carries its own BOOT_IMAGE_W/H from boot_asset.h.
 constexpr int ASSET_W = 480;
 constexpr int ASSET_H = 480;
 constexpr int W = layout::W;
@@ -1917,6 +1919,11 @@ struct ImageStage {
 
 ImageStage logoStage;
 ImageStage photoStage;
+// The boot screen, decoded once from the PNG in flash. It is repainted
+// several times while Wi-Fi comes up (each with a different status line), and
+// decoding 800x480 again for every repaint would cost a few hundred
+// milliseconds each time for a picture that has not changed.
+ImageStage bootStage;
 ImageStage *decodeStageTarget = nullptr;
 
 int decodeStagePngLine(PNGDRAW *draw) {
@@ -2000,6 +2007,38 @@ void blitStage(const ImageStage &stage, int left, int top) {
                           stage.pixels + row * stage.width + sourceX,
                           count * sizeof(uint16_t));
   }
+}
+
+// Decodes the boot screen from flash into PSRAM. PROGMEM on the ESP32-S3 is
+// memory-mapped, so PNGdec can read the array in place - there is no need to
+// copy 200 KB out of flash first.
+bool decodeBootImage() {
+  if (bootStage.key[0]) return true;  // already decoded
+  if (!pngDecoderPtr) return false;
+  if (!ensureStage(bootStage, BOOT_IMAGE_W, BOOT_IMAGE_H)) return false;
+  decodeStageTarget = &bootStage;
+  const int opened = pngDecoder.openRAM(const_cast<uint8_t *>(BOOT_IMAGE_PNG),
+                                        BOOT_IMAGE_PNG_LEN, decodeStagePngLine);
+  const bool success = opened == PNG_SUCCESS && pngDecoder.decode(nullptr, 0) == PNG_SUCCESS;
+  if (opened == PNG_SUCCESS) pngDecoder.close();
+  decodeStageTarget = nullptr;
+  if (!success) {
+    Serial.printf("Boot image decode failed (open=%d)\n", opened);
+    return false;
+  }
+  strncpy(bootStage.key, "boot", sizeof(bootStage.key) - 1);
+  return true;
+}
+
+// Hands the boot screen's PSRAM back once the live display owns the panel.
+// 768 KB is nothing next to 8 MB, but the map tiles, airline logos and
+// aircraft photographs all want PSRAM for the rest of the run and the boot
+// screen is never drawn again.
+void releaseBootImage() {
+  if (!bootStage.pixels) return;
+  heap_caps_free(bootStage.pixels);
+  bootStage = ImageStage{};
+  Serial.println("Boot image released");
 }
 
 // The ICAO operator prefix of a callsign: RYR2BH is Ryanair. Empty when the
@@ -3476,13 +3515,21 @@ void present() {
 }
 
 void renderBootScreen(const String &networkLine = "", uint16_t networkColour = RGB565_CYAN) {
-  if (W == ASSET_W && H == ASSET_H) {
-    gfx->draw16bitRGBBitmap(0, 0, const_cast<uint16_t *>(BOOT_IMAGE), W, H);
+  if (decodeBootImage()) {
+    // The asset is generated per panel shape, so this normally fills the
+    // screen exactly; centring covers a mismatched pair of the two.
+    if (bootStage.width != W || bootStage.height != H) gfx->fillScreen(rgb(4, 10, 16));
+    gfx->draw16bitRGBBitmap((W - bootStage.width) / 2, (H - bootStage.height) / 2,
+                            bootStage.pixels, bootStage.width, bootStage.height);
   } else {
-    // Centre the 480x480 splash rather than overrunning the array.
+    // No decoder yet, no PSRAM, or a corrupt asset. A plain title beats a
+    // blank panel, and the lines below still say what is happening.
     gfx->fillScreen(rgb(4, 10, 16));
-    gfx->draw16bitRGBBitmap((W - ASSET_W) / 2, (H - ASSET_H) / 2,
-                            const_cast<uint16_t *>(BOOT_IMAGE), ASSET_W, ASSET_H);
+    gfx->setTextSize(3);
+    gfx->setTextColor(RGB565_CYAN);
+    const String title = "ADS-B / MLAT";
+    gfx->setCursor(max(4, (W - static_cast<int>(title.length()) * 18) / 2), H / 2 - 40);
+    gfx->print(title);
   }
   gfx->setTextWrap(false);
   gfx->setTextSize(2);
@@ -6717,16 +6764,20 @@ void setup() {
   gfx->println("DISPLAY OK");
   return;
 #endif
-  renderBootScreen();
-  delay(2800);
   // Both of these used to be plain globals in internal DRAM - 44.5 KB for
   // the PNG decoder and 8.4 KB for the route cache - competing with the RGB
   // bounce buffers and every mbedTLS handshake for the scarcest memory on
   // the board. Neither needs the speed.
+  //
+  // The decoder is set up before the first boot screen rather than after it,
+  // because the boot screen is now a PNG and needs it. It only wants a PSRAM
+  // allocation, so there is nothing here that has to wait.
   panelDirectDraw = settingsStore.getBool("direct-draw", false);
   initPngDecoder();
+  if (!pngDecoderPtr) Serial.println("PNG decoder allocation failed - images unavailable");
+  renderBootScreen();
+  delay(2800);
   initRouteCache();
-  if (!pngDecoderPtr) Serial.println("PNG decoder allocation failed - map tiles unavailable");
   if (!routeCache.data) Serial.println("Route cache allocation failed - routes unavailable");
   // In direct mode every pixel() lands in the panel's own buffer, so there
   // is no shadow to allocate and present() has nothing to copy.
@@ -6777,6 +6828,9 @@ void setup() {
     status("MAP", rgb(53,169,244));
     present();
   }
+  // Past this point the panel shows the live display and the boot screen is
+  // never drawn again.
+  releaseBootImage();
   beginWebControl();
   Serial.printf("Web login username: %s\n", WEB_USERNAME);
   { MutexGuard guard(dataMutex); fetchAircraft(); }
