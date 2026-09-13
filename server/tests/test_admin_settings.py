@@ -30,7 +30,10 @@ def admin(client):
 
 def _form(**overrides):
     """A complete submission, as the browser would send it."""
-    form = {}
+    # The template's marker field. Without it the handler refuses the
+    # submission, because a body with no fields at all is indistinguishable
+    # from "every checkbox unticked" - see test_an_empty_post_saves_nothing.
+    form = {"settings_form": "1"}
     for definition in DEFINITIONS:
         if definition.kind == "bool":
             if definition.default:
@@ -387,3 +390,26 @@ def test_a_stored_key_is_never_rendered_back(admin):
         assert stored.value == secret
     finally:
         db.close()
+
+
+def test_an_empty_post_saves_nothing(admin):
+    """Every boolean here is off when absent from the body, which is right
+    for an unticked checkbox and catastrophic for a body that never arrived:
+    one empty POST would stop polling adsb.fi and adsb.lol and turn the
+    feeder plausibility checks off, and report "Saved 4 settings" while
+    doing it. Reproduced with curl following the save's own 303 as a POST."""
+    store = SettingsStore(SessionLocal)
+    assert store.get("source_adsbfi") is True
+
+    response = admin.post("/admin/settings", data={}, follow_redirects=False)
+
+    assert response.status_code == 303
+    assert "flash_error=1" in response.headers["location"]
+    assert "arrived%20empty" in response.headers["location"]
+    # Nothing stored, so every switch is still at its default.
+    db = SessionLocal()
+    try:
+        assert db.query(models.Setting).count() == 0
+    finally:
+        db.close()
+    assert SettingsStore(SessionLocal).reload()["source_adsbfi"] is True

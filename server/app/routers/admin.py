@@ -256,6 +256,17 @@ async def admin_save_settings(
     admin: models.AdminUser = Depends(get_current_admin),
 ):
     form = await request.form()
+    if "settings_form" not in form:
+        # A submission with no body is not "the operator unticked
+        # everything": every boolean here is off when absent, so an empty
+        # POST would stop the upstream polling and the plausibility checks
+        # in one request, with a "Saved 4 settings" flash to say so. The
+        # template always sends this marker, so its absence means the body
+        # never arrived - a redirect followed as a POST, a retried request,
+        # something hand-rolled - and saving nothing is the safe reading.
+        return RedirectResponse(
+            "/admin/settings?flash=That submission arrived empty, so nothing was "
+            "saved&flash_error=1", status_code=status.HTTP_303_SEE_OTHER)
     store = request.app.state.settings
     try:
         changed = store.set_many(runtime_settings.from_form(form), admin.email)

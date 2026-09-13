@@ -4,6 +4,11 @@
 {% block content %}
 
 <form method="post" action="/admin/settings">
+{# An unticked checkbox is absent from a POST body, so an EMPTY body would
+   read as "every switch off" and silently stop polling adsb.fi and adsb.lol.
+   This field is always present in a real submission, so the handler can tell
+   a genuine form from a bodyless POST and refuse the latter. #}
+<input type="hidden" name="settings_form" value="1">
 {% for group, definitions in groups %}
 <div class="panel">
 <h2>{{ group }}</h2>
