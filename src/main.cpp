@@ -3798,11 +3798,22 @@ void present() {
     // nothing else clears them, and the figures would stop meaning
     // anything.
     pushPendingSpans(false);
-    // And no restart: the realign below exists to recover from the copy
-    // starving the bounce-buffer refill, and in this mode there is no copy.
-    // It was firing on every frame here regardless - re-initialising the
-    // panel's DMA and the refill that is already the tight deadline, for a
-    // frame that never put a load on either.
+    // Realign the scan here too. Removing this was wrong: the reasoning was
+    // that the realign only exists to recover from the present() copy
+    // starving the bounce-buffer refill, and this mode has no copy - but a
+    // copy is not the only thing that can starve it. Drawing a full frame
+    // straight into the live framebuffer is itself 750 KB of PSRAM traffic
+    // competing with the panel's own DMA reads, and a slip is permanent:
+    // the scan position never recovers on its own, so one starved frame
+    // leaves the picture offset until something realigns it. With the
+    // realign gone from this path there was nothing left that would.
+    //
+    // Observed on the panel: the radar page with its title drawn at y=9
+    // showing that title at the bottom of the screen instead, the whole
+    // frame offset by about thirty rows. The route loop already calls this
+    // for the same reason mid-fetch (see the note by the adsbdb lookups),
+    // so it is the established recovery here rather than a new idea.
+    rgbpanel->restartAtNextVsync();
     return;
   }
   rgbpanel->waitForVsync(50);
