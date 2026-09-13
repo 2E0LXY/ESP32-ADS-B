@@ -6,6 +6,8 @@ setting it here, at collection, rather than in a fixture. Each test then gets
 an empty schema on the same throwaway file.
 """
 
+import asyncio
+import inspect
 import os
 import tempfile
 
@@ -24,6 +26,30 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from app.database import Base, engine  # noqa: E402
 from app.main import app  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _current_event_loop(request):
+    """Guarantees a current event loop for the synchronous tests.
+
+    Several of them drive the cache with
+    asyncio.get_event_loop().run_until_complete(...). That only worked
+    because some earlier import had left a loop installed - pytest-asyncio
+    closes and unsets the loop it creates for an async test, so as soon as
+    an async test file sorted before one of those, the sync test failed
+    with "There is no current event loop". Installing a fresh loop per
+    synchronous test makes that independent of test order.
+    """
+    if inspect.iscoroutinefunction(request.function):
+        yield  # pytest-asyncio owns the loop for these
+        return
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        yield
+    finally:
+        asyncio.set_event_loop(None)
+        loop.close()
 
 
 @pytest.fixture()

@@ -117,7 +117,13 @@ raw data being pushed straight into this backend.
 ## Data model / files
 
 - `app/models.py` - Account, Device, ApiKey, FeederKey, AdminUser, AuditLog, UsageLog
-- `app/aggregator.py` - background poll loop, in-memory cache, feeder-key round-robin
+- `app/aggregator.py` - background poll loop, feeder-key round-robin
+- `app/cache.py` - the aircraft cache: in-process by default, Redis when shared
+- `app/leader.py` - which worker does the work that must only happen once
+- `app/retention.py` - prunes `usage_log` so it stops growing without bound
+- `app/runtime_settings.py` - the settings an operator can change from the admin panel
+- `app/log_buffer.py` - recent log lines in memory, for `/admin/logs`
+- `app/feed_guard.py` - rejects aircraft a feeder could not really have heard
 - `app/sbs.py` - SBS/BaseStation protocol decoder for incoming feeder connections
 - `app/feed_ingest.py` - per-device TCP listeners that accept customers' own feeds
 - `app/security.py` - password hashing, session tokens, API key generation/hashing
@@ -125,6 +131,114 @@ raw data being pushed straight into this backend.
 - `app/routers/admin.py` - admin login, dashboard, account management, audit log
 - SQLite by default (`DATABASE_URL` in `.env`) - fine at this scale; point at
   Postgres later if it's ever needed, nothing else here is SQLite-specific.
+
+## Admin panel
+
+`/admin` (separate login from customer accounts):
+
+- **Dashboard** - upstream source health, including sources that are
+  switched off rather than failing; cache size; recently active devices
+  with firmware, address, location, last result, polls in 24h and feeder
+  state.
+- **Settings** - `/admin/settings`. Poll interval, maximum polling areas
+  and area radius, which upstream sources are polled, usage-history
+  retention and whether aircraft photos are fetched. These take effect
+  immediately: no restart, so no feeder connection is dropped. Values are
+  validated (a poll interval of zero would hammer three free public APIs in
+  a tight loop), a bad value rejects the whole submission rather than
+  half-applying it, and every change is written to the audit log. There is
+  also a "prune usage history now" button for when the retention window has
+  just been shortened.
+- **System** - `/admin/system`. What this process is actually doing: cache
+  mode, whether Redis is reachable, which worker holds the polling role,
+  database and image-cache sizes, disk free, reference-data counts, feeder
+  listeners. It also lists, explicitly, what **cannot** be changed without a
+  restart and why - `REDIS_URL` and the worker count are read once at
+  startup, so a switch there would be lying.
+- **Password** - `/admin/password`. Until this existed the only admin
+  password was `ADMIN_BOOTSTRAP_PASSWORD`, so it is still sitting in `.env`
+  on the server; change it here and then clear that line.
+- **Devices** - `/admin/devices`. Every registered device, searchable by
+  name, account email, IP or firmware, with the two actions an operator
+  actually needs: revoke one device's API keys (cutting off a single
+  receiver without suspending its owner's whole account, which was the only
+  lever before) and stop accepting one receiver's raw feed. Stopping a feed
+  closes its listener immediately rather than at the next restart - feeder
+  ingestion has no authentication beyond knowing the port, so a feed
+  injecting nonsense has to be stoppable now. Both are audit-logged.
+- **Logs** - `/admin/logs`. The last few hundred log lines from the worker
+  that served the request, filterable by level and text, with optional
+  auto-refresh and a `logs.txt` view for pasting or grepping. Tracebacks are
+  kept whole, since `logger.exception()` is used throughout and the
+  traceback is the useful half. In memory and lost on restart: it answers
+  "what just happened" without an SSH session, and `docker compose logs`
+  remains the full history.
+- **Accounts** and **Audit log** as before.
+
+The environment variables in `.env.example` set where a *fresh* deployment
+starts. Once a setting has been saved in the panel, the stored value wins -
+editing `.env` and restarting will not undo it.
+
+## Capacity, measured
+
+All of these were measured on this codebase rather than estimated. A device
+polls `/v1/aircraft` every 30 seconds (`REFRESH_MS` in the firmware), so
+**devices / 30 = requests per second**.
+
+| | |
+|---|---|
+| One poll, 46 aircraft cached, through the real endpoint | 6.9 ms mean, 8.5 ms p95 |
+| Single-thread ceiling from that | ~145 requests/second |
+| Process memory with all reference data loaded | ~94 MB |
+| `poll_regions()` at 1,000 scattered devices, every 15 s | 131 ms (<1% of one core) |
+| `usage_log` on disk | 95 bytes/row including indexes |
+
+Roughly 300 receivers is comfortable on one vCPU: 10 requests/second, some
+10-15% of one thread, ~3.2 Mbit/s out. What binds, in order:
+
+1. **`usage_log` growth.** One row per poll is 2,880 rows per device per
+   day - at 300 devices, ~82 MB a day and ~2.5 GB a month. This grew
+   forever until `app/retention.py` was added, and a full disk stops
+   feeder ingestion and device polls alike. It is the first thing that
+   would have taken the VPS down, ahead of CPU, RAM or bandwidth.
+2. **Worker count, which used to be architectural rather than
+   hardware.** The aircraft cache was an in-process dict, so a second
+   uvicorn worker would have had its own empty cache and served half the
+   receivers nothing - extra vCPU bought nothing at all. `app/cache.py`
+   moves it to Redis when `REDIS_URL` is set, and `app/leader.py` keeps
+   upstream polling and the feeder listeners in exactly one worker. Only
+   then is more CPU worth buying.
+3. **SQLite's single writer.** Two writes per poll (a usage row and the
+   device's reported position) behind one lock with a 3 s busy timeout,
+   competing with feeder writes. Fine at 20 writes/second; spiky nearer
+   70.
+4. **Sky freshness, not request capacity.** `MAX_POLL_REGIONS` (6) means
+   geographically scattered devices rotate their areas across cycles, so
+   a device outside the busiest six areas sees an older cache. This is
+   about *where* receivers are, not how many - 300 around one county is
+   nothing, 300 across Europe is the real limit.
+
+RAM is not the constraint and adding more does not help: ~94 MB of 1 GB,
+with the cache bounded by how many aircraft are in the sky rather than how
+many devices are asking.
+
+### Running more than one worker
+
+Only worth doing with more than one vCPU, and only with Redis:
+
+1. Uncomment `REDIS_URL` in `.env` and bring up the `redis` service in
+   `docker-compose.yml`.
+2. Add `--workers N` to the uvicorn command in `docker-compose.yml`.
+
+Every worker then answers `/v1/aircraft` from one shared view of the sky,
+while one of them holds a 30-second lease and does the work that must
+happen once: polling the upstream APIs (otherwise each community API is
+asked for the same sky N times a cycle) and binding the per-device feeder
+ports (only one process can bind a given port). If that worker dies the
+lease lapses and another takes over, opening the feeder listeners itself.
+
+With `REDIS_URL` unset none of this is on the path and the service behaves
+exactly as it always has.
 
 ## Known gaps / next steps
 
@@ -164,9 +278,15 @@ systemd unit for Debian and a batch launcher for Windows. See
 Tests live in `tests/` and run against the real app through TestClient:
 
 ```
-python3 -m venv .venv && .venv/bin/pip install -r requirements.txt httpx pytest
+python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 .venv/bin/python -m pytest tests/ -q
 ```
+
+Nothing has to be running for the suite: the database is a throwaway SQLite
+file and Redis is an in-process fake. If `fakeredis` and `lupa` are missing
+the Redis cache and leader-election tests skip rather than fail, which
+means the parity they assert goes unchecked - so install from
+`requirements-dev.txt` rather than picking packages by hand.
 
 - Feeder ingestion has no authentication beyond "knowing which port was
   assigned to you" - standard feeder software (readsb, dump1090, PiAware)
@@ -175,6 +295,12 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt httpx pytest
   token. Acceptable for now (a port number isn't guessable, and it's shown
   only to the logged-in owner), but if abuse becomes a problem, an
   allowlist of expected source IPs per device would tighten this further.
+- **airplanes.live is disabled by default.** It answers 403 to every request,
+  and not because of any one deployment's address - the same request is
+  refused from unrelated networks. Set `DISABLED_SOURCES=` (empty) to try it
+  again if their access rules change, or list other source names there to
+  turn them off. A disabled source is not polled and does not appear in the
+  admin panel's health table at all, rather than sitting there red.
 - A public share link (`/share/<token>`) is unlisted, not access-controlled:
   anyone holding the URL sees that receiver's live map, which is the whole
   point of it. It is served with `X-Robots-Tag: noindex` so a link pasted
@@ -188,15 +314,24 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt httpx pytest
   "forgot password" flow. Fine for an invite-only or early-access launch;
   add an SMTP/transactional-email integration before fully open self-serve
   signup.
-- The aggregator cache is in-process memory - fine for one container
-  instance. If this is ever scaled to multiple instances, the cache needs to
-  move to something shared (Redis) - flagged in `aggregator.py`.
-- Feeder ingest has no authentication beyond the per-device port, which is
-  how every feeder network works (readsb and friends cannot send a
-  credential first) but does mean anyone who learns or scans a port can
-  inject aircraft into the shared cache. Before open signup: sanity-check
-  incoming positions against the feeder's own location, and consider
+- Multi-worker operation works but has not been run in production here: the
+  Redis cache and the leader lease are covered by tests (including parity
+  against the in-process cache) and the deployment still defaults to one
+  worker with no Redis. Turn it on deliberately, with more than one vCPU,
+  and watch `/admin` for which worker holds the polling role - see
+  "Capacity, measured" above.
+- Feeder ingest still has no authentication beyond the per-device port,
+  which is how every feeder network works (readsb and friends cannot send a
+  credential first). Injected aircraft are now checked for plausibility
+  rather than trusted (`app/feed_guard.py`): impossible coordinates and
+  altitudes, aircraft teleporting between messages, and - for a receiver
+  whose position is known independently of its own feed - anything far
+  beyond its horizon. `/admin/devices` shows what each feeder is having
+  rejected. The remaining gap is a feeder with no owner-set and no
+  reported position, which gets every check except the range one, so
+  plausible-looking coordinates anywhere on earth would still be accepted
+  from it. Before open signup, consider
   pinning a feeder to its last-seen source IP.
-- Admin panel has no "change your own password" page yet - see the note in
-  `.env.example` for how to rotate the bootstrap admin's password manually
-  in the meantime.
+- The bootstrap admin's password is still in `.env` on the server from
+  first boot. `/admin/password` can change it now; clear that line
+  afterwards.

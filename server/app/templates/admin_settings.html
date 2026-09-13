@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+{% block header_title %}Settings{% endblock %}
+{% block nav %}<a href="/admin">Dashboard</a><a href="/admin/system">System</a><a href="/admin/accounts">Accounts</a><a href="/admin/audit-log">Audit log</a><a href="/admin/devices">Devices</a><a href="/admin/logs">Logs</a><a href="/admin/logout">Log out</a>{% endblock %}
+{% block content %}
+
+<form method="post" action="/admin/settings">
+{% for group, definitions in groups %}
+<div class="panel">
+<h2>{{ group }}</h2>
+<table>
+<tbody>
+{% for setting in definitions %}
+<tr>
+  <td style="width:34%">
+    <label for="{{ setting.name }}" style="margin:0">{{ setting.label }}</label>
+    {% if setting.help %}<div class="sub">{{ setting.help }}</div>{% endif %}
+  </td>
+  <td style="width:20%">
+    {% if setting.kind == "bool" %}
+      <input type="checkbox" id="{{ setting.name }}" name="{{ setting.name }}"
+             {% if setting.current %}checked{% endif %}>
+    {% else %}
+      <input class="input" type="number" id="{{ setting.name }}" name="{{ setting.name }}"
+             value="{{ setting.current }}"
+             {% if setting.kind == "float" %}step="any"{% endif %}
+             {% if setting.minimum is not none %}min="{{ setting.minimum }}"{% endif %}
+             {% if setting.maximum is not none %}max="{{ setting.maximum }}"{% endif %}
+             style="width:9em">
+      {% if setting.unit %}<span class="sub">{{ setting.unit }}</span>{% endif %}
+    {% endif %}
+  </td>
+  <td class="sub">
+    {% if setting.kind != "bool" and setting.minimum is not none %}
+      {{ setting.minimum }}{{ setting.unit }} to {{ setting.maximum }}{{ setting.unit }}
+    {% endif %}
+  </td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+{% endfor %}
+
+<div class="panel">
+<button type="submit">Save settings</button>
+<p class="sub" style="margin-bottom:0">These take effect immediately - no restart, so no
+  feeder connection is dropped. Anything that cannot be changed while running is shown
+  read-only on <a href="/admin/system">System</a>. Every change is recorded in the
+  <a href="/admin/audit-log">audit log</a>.</p>
+</div>
+</form>
+
+<div class="panel">
+<h2>Housekeeping now</h2>
+<form method="post" action="/admin/settings/prune-now" class="inline">
+  <button type="submit">Prune usage history now</button>
+</form>
+<p class="sub" style="margin-bottom:0">Deletes usage rows past the retention window
+  above without waiting for the six-hourly background run. Each device's most recent
+  row is always kept, so no receiver loses its last result.</p>
+</div>
+
+{% endblock %}

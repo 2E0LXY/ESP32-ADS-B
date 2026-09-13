@@ -6,6 +6,7 @@ with different registered locations get different aircraft, and the
 aggregator polls upstream for both areas rather than one global point.
 """
 
+import os
 import asyncio
 
 import pytest
@@ -181,3 +182,96 @@ def test_a_tiny_requested_radius_still_fills_a_useful_area(client):
         db.close()
     # Polling only 5 nm would cache an aircraft just as it arrives overhead.
     assert Aggregator(0.0, 0.0, 50, SessionLocal).poll_regions()[0][2] >= 25
+
+
+# --- what the dashboards can tell you about a device ---------------------
+
+def test_the_firmware_version_is_recorded_from_the_user_agent(client):
+    """The device has always sent its version in the User-Agent. Nothing read
+    it, so the Firmware column rendered "--" for every device forever."""
+    from app.routers.public import firmware_from_user_agent
+
+    assert firmware_from_user_agent(
+        "2E0LXY-ESP32-ADSB/2.6.0 (+https://github.com/2E0LXY/ESP32-ADS-B)") == "2.6.0"
+    assert firmware_from_user_agent("2E0LXY-ESP32-ADSB/10.2.31 (+x)") == "10.2.31"
+    # Anything else leaves a known version alone rather than blanking it.
+    assert firmware_from_user_agent("curl/8.5.0") is None
+    assert firmware_from_user_agent("2E0LXY-ESP32-ADSB/notaversion") is None
+    assert firmware_from_user_agent("") is None
+    assert firmware_from_user_agent(None) is None
+
+
+def _registered_device(client, email):
+    """An account with one device and a usable API key.
+
+    The plaintext key only exists inside the one-shot flash cookie, so it is
+    read back the same way the dashboard does.
+    """
+    from app import security
+
+    client.post("/signup", data={"email": email, "password": "correct-horse"},
+                follow_redirects=False)
+    client.post("/devices", data={"name": "Loft receiver"}, follow_redirects=False)
+    db = SessionLocal()
+    try:
+        device_id = db.query(models.Device).first().id
+    finally:
+        db.close()
+    client.post(f"/devices/{device_id}/reissue-key", follow_redirects=False)
+    return device_id, security.read_flash_token(client.cookies.get("flash_key"))["key"]
+
+
+def _recorded_firmware(device_id):
+    db = SessionLocal()
+    try:
+        return db.query(models.Device).filter(models.Device.id == device_id).first().firmware_version
+    finally:
+        db.close()
+
+
+def test_a_device_poll_records_its_firmware_and_shows_it(client):
+    device_id, key = _registered_device(client, "fw@example.com")
+
+    response = client.get(
+        "/v1/aircraft?lat=53.73&lon=-1.57&radius=25",
+        headers={"Authorization": f"Bearer {key}",
+                 "User-Agent": "2E0LXY-ESP32-ADSB/2.6.0 (+https://example.invalid)"},
+    )
+    assert response.status_code == 200
+    assert _recorded_firmware(device_id) == "2.6.0"
+    # And it reaches the customer's own dashboard, not just the admin one.
+    assert "2.6.0" in client.get("/account").text
+
+
+def test_a_poll_without_a_version_does_not_blank_a_known_one(client):
+    """A receiver fetching through something that rewrites the header must not
+    erase a version we already recorded."""
+    device_id, key = _registered_device(client, "fw2@example.com")
+
+    client.get("/v1/aircraft?lat=53.73&lon=-1.57&radius=25",
+               headers={"Authorization": f"Bearer {key}", "User-Agent": "2E0LXY-ESP32-ADSB/2.6.0 (+x)"})
+    client.get("/v1/aircraft?lat=53.73&lon=-1.57&radius=25",
+               headers={"Authorization": f"Bearer {key}", "User-Agent": "curl/8.5.0"})
+
+    assert _recorded_firmware(device_id) == "2.6.0"
+
+
+def test_the_admin_dashboard_renders_the_new_device_detail(client):
+    """Nothing rendered /admin in the suite, so a wrong column name on the
+    UsageLog query would only have shown up as a 500 in production."""
+    device_id, key = _registered_device(client, "fw3@example.com")
+    client.get("/v1/aircraft?lat=53.73&lon=-1.57&radius=25",
+               headers={"Authorization": f"Bearer {key}",
+                        "User-Agent": "2E0LXY-ESP32-ADSB/2.6.0 (+x)"})
+
+    client.post("/admin/login",
+                data={"email": os.environ["ADMIN_BOOTSTRAP_EMAIL"],
+                      "password": os.environ["ADMIN_BOOTSTRAP_PASSWORD"]},
+                follow_redirects=False)
+    page = client.get("/admin")
+    assert page.status_code == 200, page.text
+    assert "Loft receiver" in page.text
+    assert "2.6.0" in page.text
+    # The columns that were added, each fed by a separate query.
+    for heading in ("Firmware", "Location", "Last result", "Polls 24h", "Feeder"):
+        assert heading in page.text

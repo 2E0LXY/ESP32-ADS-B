@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% block header_title %}Admin{% endblock %}
-{% block nav %}<a href="/admin/accounts">Accounts</a><a href="/admin/audit-log">Audit log</a><a href="/admin/logout">Log out</a>{% endblock %}
+{% block nav %}<a href="/admin/settings">Settings</a><a href="/admin/system">System</a><a href="/admin/accounts">Accounts</a><a href="/admin/audit-log">Audit log</a><a href="/admin/password">Password</a><a href="/admin/devices">Devices</a><a href="/admin/logs">Logs</a><a href="/admin/logout">Log out</a>{% endblock %}
 {% block content %}
 
 <div class="panel">
@@ -11,15 +11,17 @@
 {% for name, h in health.items() %}
 <tr>
 <td>{{ name }}</td>
-<td>{% if h.ok %}<span class="badge ok">Up</span>{% else %}<span class="badge bad">Down</span>{% endif %}</td>
+<td>{% if not h.enabled %}<span class="badge">Off</span>{% elif h.ok %}<span class="badge ok">Up</span>{% else %}<span class="badge bad">Down</span>{% endif %}</td>
 <td>{{ h.last_success_str }}</td>
 <td>{{ h.consecutive_errors }}</td>
-<td class="sub">{{ h.last_error or '--' }}</td>
+<td class="sub">{% if not h.enabled %}not polled - turn on in <a href="/admin/settings">Settings</a>{% else %}{{ h.last_error or '--' }}{% endif %}</td>
 </tr>
 {% endfor %}
 </tbody>
 </table>
-<p class="sub" style="margin-top:10px">Cache holds {{ cache_size }} aircraft. Poll interval: {{ poll_interval }}s.</p>
+<p class="sub" style="margin-top:10px">Cache holds {{ cache_size }} aircraft. Poll interval: {{ poll_interval }}s.
+  Usage history kept {{ retention_days }} days{% if usage_pruned is not none %}; {{ usage_pruned }} rows pruned since restart{% endif %}.
+  {% if shared_cache %}Shared cache: this worker {% if polls_upstream %}holds{% else %}does not hold{% endif %} the polling role.{% endif %}</p>
 </div>
 
 <div class="panel">
@@ -37,7 +39,7 @@
 <div class="panel">
 <h2>Recently active devices</h2>
 <table>
-<thead><tr><th>Device</th><th>Account</th><th>Last seen</th><th>Firmware</th></tr></thead>
+<thead><tr><th>Device</th><th>Account</th><th>Last seen</th><th>Firmware</th><th>Address</th><th>Location</th><th>Last result</th><th>Polls 24h</th><th>Feeder</th></tr></thead>
 <tbody>
 {% for device in recent_devices %}
 <tr>
@@ -45,9 +47,14 @@
 <td>{{ device.account.email }}</td>
 <td>{{ device.last_seen_at.strftime('%Y-%m-%d %H:%M UTC') if device.last_seen_at else 'Never' }}</td>
 <td>{{ device.firmware_version or '--' }}</td>
+<td>{{ device.last_seen_ip or '--' }}</td>
+<td>{{ device.location_str }}<div class="sub">{{ device.location_from }}</div></td>
+<td>{% if device.last_aircraft is none %}--{% else %}{{ device.last_aircraft }} aircraft{% endif %}</td>
+<td>{{ device.polls_today }}</td>
+<td>{{ device.feeder_state }}</td>
 </tr>
 {% else %}
-<tr><td colspan="4" class="sub">No devices have checked in yet.</td></tr>
+<tr><td colspan="9" class="sub">No devices have checked in yet.</td></tr>
 {% endfor %}
 </tbody>
 </table>

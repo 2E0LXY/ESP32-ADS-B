@@ -11,6 +11,38 @@ Also runs on the **Waveshare ESP32-S3-Touch-LCD-7 / -4.3, 800 × 480, GT911 touc
 
 Current firmware: **v2.6.0**
 
+### Unreleased
+
+Display:
+
+- **Real airline logos on the screensaver**, replacing the three-initial tile. Fetched once per airline from the aggregator's own cache, kept on the microSD card and drawn from there afterwards; an airline with no logo, or a callsign carrying no airline prefix, keeps the initials tile. Guarded so it cannot cost the feed: a logo is only fetched when the largest free internal block is at least 48 KB, the decoded image is staged in PSRAM and never in internal RAM, and the fetch runs on the network task rather than the core driving the panel
+- **The screensaver shows the nearest aircraft** and reconsiders every ten seconds, instead of rotating through everything overhead every six. The aircraft only changes when something genuinely overtakes it, which is a better trigger for a full-screen repaint than a timer
+- **The device's address appears in the top corner of both screensaver frames.** It is the one page with no header, so it was the one place the management address could not be read off the screen
+- **The full model name and the radio callsign** on the screensaver where the aggregator resolved them: "Boeing 737-800" rather than "B738", and the callsign heard on the air, which is rarely the trading name - Jet2 answers to Channex
+- **Unclassified traffic gets an aircraft silhouette** in the browser map rather than the old arrowhead, which read as a different kind of object next to the other eleven shapes. Traffic reporting on the ground with no type and no category now draws the surface-vehicle square, so airport ground stations and service vehicles stop appearing as aircraft on the taxiways
+
+Browser:
+
+- **Clicking an aircraft on the map works.** Tracking could only be set from the table while the map re-asserted it on every refresh, so a marker click was overridden seconds later and closing a popup was undone. Clicking a marker now selects it, clicking it again or closing the popup releases it, and the map recentres only when the selection changes rather than fighting a pan every five seconds
+- **Four-level Wi-Fi signal bands** driven by RSSI rather than a derived percentage, with the level in words beside the reading in the top corner: strong at or above -60 dBm, normal to -70, weak to -80, bad below
+- **A feed indicator in the header** naming the active provider, green when it is returning data and red when it is failing, so feed health is readable from any page
+- **Check for updates lives only on the Firmware page.** It was in the footer of every page and duplicated as an Overview quick action
+- **Radar range presets highlight on press** instead of waiting for the next status poll, which made a press look as though it had not registered
+
+Wi-Fi:
+
+- **Up to six saved networks.** The ESP32 remembers exactly one, so moving the receiver between places meant retyping a password already entered. Every network that works is now kept, newest first, and the Wi-Fi page lists them with a Forget button. Additive by design: the stock connection path at boot is unchanged and tried first, and the saved list is only walked when that fails or a working connection has been down for a minute
+
+Backend:
+
+- **Airline logos cached server-side** and served from `/logo/callsign/<callsign>.png`, so a logo is fetched from logo.dev once for the whole deployment rather than once per viewer, and the account token never reaches a browser. Requires `LOGO_DEV_TOKEN`; without it every logo reports as missing and badges fall back to initials. See [Aggregator backend](#aggregator-backend)
+- **Operator, model, country and livery enrichment** from offline ICAO lists covering 6,008 operators and 2,735 type designators, including the aircraft silhouette resolved from real class and engine data. Retires the firmware's 91 hand-written callsign prefixes for anyone using this provider
+- **Operator names are tidied** rather than passed through as filed: corporate form, trailing registration addresses and the registered company in front of a trading name are all dropped, so "JET2.COM LTD" reads "Jet2.com"
+- **airplanes.live is disabled by default.** It answers 403 to every request from any address, so it sat permanently red in the admin panel implying an outage and kept spending requests to re-learn the same answer
+- **The event loop no longer stalls on the database.** Several hot paths made synchronous SQLite calls straight from coroutines, which stops reading every live feed until the database answers. Those now run in threads, the database runs in WAL mode with an explicit busy timeout, and the upstream poll areas are worked out once per cycle instead of three times
+- **Public share links** for a receiver's live map: an unlisted read-only URL, revocable and replaceable, that needs no account
+- **Two feeder faults fixed.** Attribution was recorded only on the record that won the freshness comparison, so the traffic nearest a customer's own receiver was exactly what vanished from their map; and a feeder's merge loop raised on its first pass and died, leaving the connection up and draining normally while contributing nothing
+
 ### v2.6.0 display, server-side routes, and the aggregator backend
 
 Firmware:
@@ -106,7 +138,19 @@ Backend (`server/`), see [Aggregator backend](#aggregator-backend):
 4. Open that address, sign in with `admin` / `aircraft`, and immediately set a new password in **Device**.
 5. Set the receiver latitude, longitude, radius, and zoom in **Map**, then choose an aircraft feed in **Data API**.
 
-![Boot screen](assets/boot-screen-preview.png)
+![Boot screen](assets/boot-preview-800x480.png)
+
+The boot screen is generated from `assets/boot-source.png` by
+`tools/make_boot_asset.py`, which writes `src/boot_asset.h` and a preview of
+each panel's crop. Replace the source image and re-run it to change the
+splash. Both panels get a full-bleed centre crop, so the source needs enough
+margin around the title to survive losing height for the 800 × 480 boards and
+width for the 480 × 480 one — check the previews it writes before flashing.
+The picture is decoded off-screen and blitted in one go so it appears at
+once, and the buffer is freed immediately afterwards — so the 768 KB is held
+for the decode rather than from boot until the live display starts. Over the
+top go the firmware version (top right), the copyright line, and the network
+status, which carries the receiver's LAN address once Wi-Fi is up.
 
 ## Main features
 
@@ -136,6 +180,9 @@ Backend (`server/`), see [Aggregator backend](#aggregator-backend):
 - Resolved routes cached to SD (or LittleFS) and reloaded at boot, so a receiver that sees the same flights daily never starts cache-cold
 - Selectable pixel clock, bounce-buffer size, and direct-draw rendering for tuning the RGB panel
 - Optional multi-tenant aggregator backend in `server/` with accounts, per-device keys, own-receiver feed ingestion, and public share links
+- Real airline logos on the idle screensaver, cached on the receiver's own card after one fetch
+- Up to six saved Wi-Fi networks, tried in turn when the usual one cannot be reached
+- Operator name, full model name, radio callsign, country and silhouette resolved by the aggregator from offline ICAO lists
 
 ## Supported hardware
 
@@ -161,15 +208,15 @@ Change the management password in **Device** after installation. The replacement
 
 ## Web administration
 
-Each sidebar entry opens a separate page. The footer on every page shows `Firmware (c) 2E0LXY D.Loxley 2026`, the installed version, and the GitHub update control.
+Each sidebar entry opens a separate page. The footer on every page shows `Firmware (c) 2E0LXY D.Loxley 2026` and the installed version. The header carries the device and feed indicators, uptime, and the Wi-Fi signal level. Checking for a firmware update lives on the **Firmware** page only.
 
 | Page | Live information | Main controls | Saved after reboot |
 | --- | --- | --- | --- |
-| Overview | Receiver health, traffic totals, provider, Wi-Fi, uptime, and full aircraft table | Refresh traffic, open Map/Radar, check updates | — |
+| Overview | Receiver health, traffic totals, provider, Wi-Fi, uptime, and full aircraft table | Refresh traffic, open Map/Radar, open Firmware | — |
 | Map | Receiver position, range, zoom, OpenStreetMap tiles, and aircraft | Position, radius, centre, zoom, click-to-track, 5-minute trails | Yes |
 | Aircraft | Every available aircraft field, operator name, source, age, signal, and emergency | Search, source filter, click a row to track it on the map | — |
 | Display | Active LCD page, brightness, alert state, and map-tile rebuild state | Map/Radar/Table, brightness, range presets, zero-mile alert, refresh | Yes |
-| Wi-Fi | SSID, signal quality, IP, gateway, DNS, and scan results | Scan, copy address, connect to a different network | Wi-Fi credentials |
+| Wi-Fi | SSID, four-level signal quality, IP, gateway, DNS, scan results, and up to six saved networks | Scan, copy address, connect to a different network, forget a saved one | Wi-Fi credentials |
 | Data API | Selected provider, request health, aircraft count, latency, and credential state | Select feed, edit/clear credentials, refresh test | Yes |
 | Marine | Live AIS vessel positions, connection state, vessel count | Provider selection, credential, tracking radius, browser vessel map and table | Yes |
 | Firmware | Installed/latest version, update availability, and release status | GitHub OTA, local `.bin` upload, installer/release recovery links | Firmware only |
@@ -197,7 +244,23 @@ Searchable live table containing operator name, ICAO address, callsign, registra
 
 Select the physical Map, Radar, or Table page, set brightness, enable or disable the zero-mile alert, and request an immediate refresh. One-click range presets set 10, 25, 50, or 100 nautical miles. Radar mode uses the saved receiver position and radius, draws a moving sweep, and marks out-of-range aircraft in red at the rim. The page also reports LCD tile-cache rebuild progress after a position, range, or zoom change. The selected page remains active after reboot.
 
-A **Screensaver** toggle and an idle-time field (1-120 minutes, off by default) control the idle screensaver: after the panel goes untouched for that long, it switches to a rotating departure-board style display of whichever aircraft are currently overhead (within about 5 miles of slant range - distance and altitude combined, so a jet at cruise directly above doesn't count as "overhead"), showing its operator badge, callsign, route, type, and a departing/arriving/en-route guess. Any tap, swipe, or the boot button dismisses it back to the page it interrupted.
+A **Screensaver** toggle and an idle-time field (1-120 minutes, off by default) control the idle screensaver: after the panel goes untouched for that long, it switches to a rotating departure-board style display of whichever aircraft are currently overhead (within about 5 miles of slant range - distance and altitude combined, so a jet at cruise directly above doesn't count as "overhead"), showing the airline's real logo where one is available, the callsign, route, full model name, radio callsign, and a departing/arriving/en-route guess. It shows whichever aircraft is nearest and reconsiders every ten seconds. The device's own address sits in the top corner, since this is the only page without a header. Any tap, swipe, or the boot button dismisses it back to the page it interrupted.
+
+Everything on that page, and where it comes from:
+
+| Line | Content | Source |
+| --- | --- | --- |
+| Logo tile | The airline's real logo, or three initials in a tinted square | Fetched once from the aggregator and cached on the microSD card |
+| Photograph | A picture of the aircraft type, top right, opposite the logo | Fetched once per type from the aggregator and cached on the card. Only on the 800 x 480 board: reserving the space on the 480 x 480 one would truncate the route codes, which matter more |
+| Operator | Trading name with corporate form removed, e.g. "Ryanair" not "RYANAIR DAC" | Resolved by the aggregator from the operator list, else the feed, else a compiled-in prefix table |
+| Route | Airport codes as the headline, full names on a later row | adsbdb, resolved by the aggregator and cached |
+| Type line | Full model, registration and callsign, e.g. "Boeing 737 Max 8  EI-IHG  RYR282D" | Model from the ICAO type list; the four-character designator when unresolved |
+| `ALT` / `SPD` / `TRK` / `VR` | Altitude, speed, track and vertical rate | The feed |
+| `RADIO` | Radio telephony callsign | The operator list; shown only when it differs from the operator name |
+| `SQK` and its meaning | Squawk, and what the code signifies | Emergency and conspicuity codes are named; a discrete code is labelled as ATC-assigned |
+| Position row | Hex, source, age, country, coordinates, both altitudes | The feed, with country filled in from the ICAO hex range when absent |
+
+**About the `RADIO` line.** That is the callsign spoken on the air, which is frequently nothing like the airline's name: Jet2 is "Channex", British Airways is "Speedbird", Aer Lingus is "Shamrock", TUI is "Tomjet". Callsigns are assigned by ICAO and tend to outlive rebrands, which is why Jet2 still answers to the name of Channel Express, the cargo airline it grew out of. It is the name you would hear if you were listening to air traffic control alongside the display, so it is shown when it adds something and suppressed when it merely repeats the operator name.
 
 **Panel tuning.** Three further controls exist for the RGB panel itself, because the right values depend on the individual board and on what else is competing for the PSRAM bus. **Pixel clock** (9-21 MHz) sets the panel clock and shows the refresh rate each choice produces. **Bounce buffer** sets how many scanlines of internal DMA RAM the panel driver refills ahead of the scan; larger values are more tolerant of a busy bus but take internal RAM away from the TLS handshake. **Direct draw** renders straight into the panel's own framebuffer instead of composing a frame and copying it. Changing the pixel clock or the bounce buffer reboots the device. See [Known limitations](#known-limitations) for what these are for.
 
@@ -205,7 +268,9 @@ A **Screensaver** toggle and an idle-time field (1-120 minutes, off by default) 
 
 ### Wi-Fi
 
-View the active connection, signal quality, LAN address, gateway, and DNS server; copy the management address; scan nearby networks; and move the receiver to a different 2.4 GHz Wi-Fi network.
+View the active connection, signal quality, LAN address, gateway, and DNS server; copy the management address; scan nearby networks; and move the receiver to a different 2.4 GHz Wi-Fi network. The quality bar and the reading in the header are coloured by RSSI in four bands: green at or above -60 dBm, blue to -70, amber to -80, red below.
+
+**Saved networks.** Every network that connects successfully is remembered, newest first, up to six, and listed with a Forget button. If the usual one cannot be reached at boot the receiver tries the others in turn, so moving it between a house and a club site needs no password retyped. Forgetting the network currently in use does not disconnect it; it stops the receiver rejoining it later.
 
 ![Wi-Fi page](docs/screenshots/wifi.png)
 
@@ -326,6 +391,7 @@ If the board does not enter download mode, hold **BOOT**, tap **RESET**, begin t
 ## Physical display behaviour
 
 - Short BOOT-button press (or a swipe on the WS7 touch panel): cycles the LCD through Overview, Table, Map, Radar, and Marine, and saves the selection
+- Screensaver page: appears on its own after the idle time set on the **Display** page, showing the nearest aircraft overhead as a departure board with the airline's logo, full model name and radio callsign, and the device's address in the top corner
 - Overview page: map on the left with a compact nearest-aircraft strip (callsign, distance, altitude, route) on the right
 - Table page: airport-departure-board style list with operator badge, callsign, distance, source, direction, altitude, and the fullest airport name that fits the panel width
 - Marine page: the same base map with live AIS vessel positions plotted as heading-oriented ship markers; shows vessel count and AIS connection state, or `AIS NOT CONFIGURED` until an API key is saved in the Marine admin page
@@ -362,6 +428,22 @@ Map data is © OpenStreetMap contributors. The browser and LCD show attribution.
 
   The 480 x 480 board is not affected in the same way; it has a smaller frame
   and more headroom.
+
+- **Internal RAM, not PSRAM, is the constraint on this board.** There is 8 MB
+  of PSRAM and the largest free *internal* block settles at about 31,700
+  bytes, which is what a TLS handshake competes for. That single figure
+  explains several design decisions that otherwise look odd: why route
+  lookups moved to the server, why the screensaver's decoded logo is staged
+  in PSRAM and never allowed to fall back to internal RAM, and why a logo is
+  only fetched when at least 28 KB of contiguous internal memory is free.
+
+  That 28 KB threshold is measured rather than cautious. The aircraft fetch
+  completes a handshake at 31,700 every thirty seconds with a 39 KB response
+  body, so a logo at a fifth of that size on the same task faces conditions
+  the feed already survives. An earlier attempt used 48 KB, which is more
+  than this board ever has free, so the guard could never pass and no logo
+  was ever fetched. If you change it, read the number off
+  `heap[fetch-start]` in the serial log rather than guessing.
 
 - **Do not set the RGB panel sdkconfig options via `custom_sdkconfig`.**
   `CONFIG_LCD_RGB_RESTART_IN_VSYNC` is already enabled in the stock prebuilt
@@ -402,9 +484,53 @@ Map data is © OpenStreetMap contributors. The browser and LCD show attribution.
 | Receiver position inference | For a feeder that never states where it is, estimates the position from the radio horizon of the low aircraft it hears |
 | My-feed map | A live map of only what one customer's own receiver is reporting, with track-aligned icons, an altitude colour ramp, and every field the feed carries on click |
 | Public share links | An unlisted read-only URL for that map, for anyone the owner sends it to, with no account needed; revocable and replaceable |
+| Operator and type enrichment | Fills in operator name, telephony, IATA code, aircraft model, country from the ICAO hex range, and special livery from offline lists covering 6,008 operators and 2,735 type designators |
+| Aircraft silhouettes | Resolves each aircraft's shape from its real ICAO class and engine configuration and sends it with the aircraft, so the device is not limited to the 91 callsign prefixes it can carry itself |
+| Aircraft photographs | Finds a licence-free photograph of each aircraft type, crops it to the panel's band, and caches it. CC0 and Public Domain Mark only, so nothing needs crediting |
+| Airline logos | Fetches each operator's logo from logo.dev once for the whole deployment, keeps it on disk beside the database, and serves it from `/logo/callsign/<callsign>.png`, so a viewer never contacts logo.dev and the token never leaves the server |
 | Feeder client | `server/tools/` has a standard-library Python forwarder with a systemd unit, a Windows launcher, and a `--check` mode, for receiver software that cannot push SBS out on its own |
 
 **Public share links.** The owner presses Create link in the feeder table of the account dashboard and gets a URL of the form `/share/<token>`. The token is 24 random bytes and is the entire credential, so the link is unlisted rather than access-controlled: anyone holding it can view the map, which is the point. Pages are served with `X-Robots-Tag: noindex` so a link pasted somewhere public does not become searchable. A link holder sees the station name and its aircraft, and nothing else: no account, no API key, no feeder port, no other device. Revoking clears the token, so the old URL stops resolving; New link mints a different one. Worth knowing before sharing: a map of what one station hears implies roughly where that station is, so this is not a way to publish a feed anonymously.
+
+**Operator, type and country lookups.** `server/reference/` holds offline lists that fill in what the feeds leave out: operator name, radio telephony and IATA code from the callsign prefix, aircraft manufacturer and model from the type designator, country from the ICAO hex address range, and special liveries by registration. The device gets all of it attached to the aircraft it was already fetching.
+
+The most useful part is the silhouette. The firmware can only carry 91 hand-written designator prefixes, so anything outside them drew a generic shape. The server derives the shape from real class and engine data for 2,735 designators and sends it, and the device prefers it over its own guess while keeping that guess as the fallback for anyone using a different provider.
+
+That split is also a licensing decision: the provenance of those lists is not established, so they stay server-side and out of every released binary and the USB installer. `server/reference/README.md` records what each file is, why the work-in-progress type list is deliberately unused, and what needs resolving before commercial launch.
+
+**What the aggregator attaches to each aircraft.** These arrive in the `/v1/aircraft` response the device already fetches, so none of them costs an extra request:
+
+| Field | Content |
+| --- | --- |
+| `shape` | The silhouette, resolved from the type's real ICAO class and engine configuration |
+| `type_name` | Manufacturer and model, e.g. "Boeing 737 Max 8" |
+| `type_class`, `type_engines` | The underlying class and engine string the shape came from |
+| `ownOp` | Operator trading name, only when the feed did not supply one |
+| `telephony` | Radio callsign, e.g. "Channex" for Jet2 |
+| `operator_iata` | Two-letter IATA code where the operator has one |
+| `cou` | Country, from the ICAO hex address range, only when the feed did not supply one |
+| `livery` | Special colour scheme by registration, where one is recorded |
+| `route` | Origin, destination, both airports' full names and cities, and the operating airline |
+
+**If you add a field here, add it to the firmware's filter as well.** The ESP32 parses that response through an ArduinoJson filter listing every field it keeps, to avoid holding a second copy of a 39 KB body in memory. A field absent from that list is discarded during parsing, before any code that reads it runs. This is not hypothetical: `shape`, `type_name` and `telephony` were all sent, read and displayed correctly in code, and silently dropped in transit, for exactly this reason. The list is the `fields[]` array in `fetchAdsbV2Aircraft()` in `src/main.cpp`.
+
+**Aircraft type photographs.** `/aircraft-photo/B738.png` returns a photograph of that type, cropped to the panel's 5:3 band and quantised to a 256-colour palette, or 404 when there is no licence-free one. The caller passes only the designator; the model name the search needs comes from the reference lists here, which is the point of the device not carrying them.
+
+**Restricted to CC0 and Public Domain Mark, and that decides the source.** Wikimedia Commons has better aircraft photography, but its civil aircraft photos are effectively all CC BY-SA - measured across A320, B738, B38M, C172, AT76 and SR22, none of which had an attribution-free option, because only military and government photographs there are public domain. Openverse aggregates Flickr and others and lets the search itself be filtered by licence, and CC0 and PDM waive attribution entirely: no credits page to maintain, no share-alike question, nothing to carry into a commercial product. `AIRCRAFT_PHOTOS=0` turns the feature off.
+
+**Choosing a usable photograph is the substance, not fetching one.** Searching by model name returns engine close-ups, cockpits, cabins, diecast models and museum pieces alongside aircraft. Candidates are rejected on a keyword list, on being smaller than 480 px wide, on any aspect ratio outside 1.2 to 2.4 since aircraft are photographed landscape, and on a title that never mentions the model, because full-text search happily matches an airport article that mentions a 737. Against live results that keeps nine or ten of every ten and rejects exactly the engine and detail shots.
+
+**Nothing here makes the device wait.** A type with no cached photograph is queued and answered "not yet"; the picture appears on a later request. The first version searched, downloaded and cropped while the device held the connection open, which took longer than its fifteen-second read timeout and failed with `HTTPC_ERROR_READ_TIMEOUT` - so no photograph ever arrived and the work was thrown away each time. Same shape as the route resolver, for the same reason.
+
+Licence, creator, title and source URL are recorded beside every cached image and served at `/aircraft-photo/credits`. Neither licence requires it. It exists because being unable to say where a picture came from is its own problem, and a claim of "licence-free" should be checkable rather than asserted.
+
+**Airline logos.** `/logo/callsign/RYR2BH.png` and `/logo/airline/RYR.png` return the operator's logo, or 404 when there is not one, which every caller answers by drawing its own initials badge instead.
+
+Lookup is by airline domain rather than by company name. That is not a style choice: on logo.dev's name path `fallback=404` is ignored and a generated monogram comes back with `200 OK`, so an airline we cannot match is indistinguishable from one we can and the cache fills with monograms we could draw ourselves. On the domain path the 404 is real. The ICAO prefix table is keyed to match the firmware's own operator list so the panel and the browser agree on who is flying, and every domain in it was checked against the live API rather than assumed.
+
+A logo is fetched once per deployment, written atomically so a reader never sees a half-written file, and served from disk thereafter. Concurrent requests for the same logo make one upstream call. A 404 is remembered for a week, so a newly added airline is not re-asked on every page view. A transport error is deliberately not remembered, since a network blip is not the same as "this airline has no logo". Set `LOGO_DEV_TOKEN` to enable it; left unset, every logo reports as missing and the badges fall back to initials.
+
+The free tier requires an attribution link for commercial use, so there is one on every page that shows a logo. Do not remove it without moving to a paid plan.
 
 **Deployment shape.** One Docker container behind a reverse proxy, SQLite in a mounted volume, host networking so the feeder port range needs no per-port NAT rule. Schema changes for nullable columns and missing indexes are applied at boot; anything beyond that needs a hand-written migration.
 

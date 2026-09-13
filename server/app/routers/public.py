@@ -1,8 +1,9 @@
 import asyncio
 import datetime
+import re
 
 from fastapi import APIRouter, Cookie, Depends, Form, Header, Request, status
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
 
@@ -11,6 +12,8 @@ from ..aggregator import Aggregator
 from ..database import get_db
 from ..deps import get_current_account, require_device_api_key
 from ..feed_ingest import allocate_port
+from ..logos import DEFAULT_SIZE, code_for_callsign
+from ..photos import DEFAULT_WIDTH as PHOTO_DEFAULT_WIDTH
 
 router = APIRouter()
 templates = Jinja2Templates(directory="app/templates")
@@ -22,6 +25,23 @@ def _aggregator(request: Request) -> Aggregator:
 
 def _routes(request: Request):
     return request.app.state.routes
+
+
+def _reference(request: Request):
+    return request.app.state.reference
+
+
+# "2E0LXY-ESP32-ADSB/2.6.0 (+https://github.com/2E0LXY/ESP32-ADS-B)". The
+# device has always sent this; nothing ever read it, so the Firmware column
+# on both dashboards rendered "--" for every device forever. Parsed rather
+# than added as a new header so no firmware change is needed and receivers
+# already in the field start reporting on their next poll.
+_AGENT_VERSION = re.compile(r"2E0LXY-ESP32-ADSB/([0-9]+\.[0-9]+\.[0-9]+)")
+
+
+def firmware_from_user_agent(agent: str | None) -> str | None:
+    match = _AGENT_VERSION.search(agent or "")
+    return match.group(1) if match else None
 
 
 @router.get("/", response_class=HTMLResponse)
@@ -48,17 +68,25 @@ async def get_aircraft(
     # lookup() never blocks: an unknown callsign is queued and comes back
     # with a route on a later poll.
     resolver = _routes(request)
+    reference = _reference(request)
     enriched = []
     for entry in aircraft:
+        # Operator, model, country and the silhouette, from the offline
+        # lists. The device cannot carry 450 KB of lookup tables, and the
+        # shape in particular is far better than the 91 callsign prefixes it
+        # falls back to when a provider other than this one is selected.
+        entry = reference.enrich(entry)
         route = resolver.lookup(entry.get("flight"))
         enriched.append({**entry, "route": route} if route else entry)
     aircraft = enriched
     ip = request.client.host if request.client else None
+    firmware = firmware_from_user_agent(request.headers.get("user-agent"))
     # In a thread, not inline: this endpoint is "async def", so a synchronous
     # commit here stops the whole event loop until SQLite lets go - and the
     # feeder listeners live on that same loop, so a device poll that waited
     # on a write lock stopped reading a customer's live SBS stream with it.
-    await asyncio.to_thread(_record_poll, db, device, ip, lat, lon, radius, len(aircraft))
+    await asyncio.to_thread(_record_poll, db, device, ip, firmware,
+                            lat, lon, radius, len(aircraft))
     return {"ac": aircraft, "total": len(aircraft)}
 
 
@@ -66,6 +94,7 @@ def _record_poll(
     db: Session,
     device: models.Device,
     ip: str | None,
+    firmware: str | None,
     lat: float,
     lon: float,
     radius: float,
@@ -73,6 +102,10 @@ def _record_poll(
 ):
     device.last_seen_at = datetime.datetime.now(datetime.timezone.utc)
     device.last_seen_ip = ip
+    # Only when the agent actually carried one, so a device fetching through
+    # something that rewrites the header does not blank a version we knew.
+    if firmware:
+        device.firmware_version = firmware
     # The device already tells us where it is on every request, so record it:
     # that is what lets the aggregator poll upstream for this customer's sky
     # rather than only the operator's. A receiver that moves - a hotel, a
@@ -456,6 +489,7 @@ async def my_feed_aircraft(
     if not device:
         return {"ac": []}
     aircraft = await _aggregator(request).cache.query_by_source(f"feeder:{device.id}")
+    aircraft = [_reference(request).enrich(entry) for entry in aircraft]
     return {"ac": aircraft, "total": len(aircraft)}
 
 
@@ -544,5 +578,107 @@ async def shared_feed_aircraft(token: str, request: Request, db: Session = Depen
     if not device:
         return JSONResponse({"ac": [], "total": 0}, status_code=status.HTTP_404_NOT_FOUND,
                             headers=NO_INDEX)
-    aircraft = await _aggregator(request).cache.query_by_source(f"feeder:{device.id}")
+    aircraft = [_reference(request).enrich(entry)
+                for entry in await _aggregator(request).cache.query_by_source(f"feeder:{device.id}")]
     return JSONResponse({"ac": aircraft, "total": len(aircraft)}, headers=NO_INDEX)
+
+
+# --- Airline logos --------------------------------------------------------
+#
+# Open, unauthenticated and heavily cacheable on purpose: these are public
+# brand images, they are needed by the shared feed links which have no
+# session, and the point of the endpoint is that a logo is fetched from
+# logo.dev once for the whole deployment rather than once per viewer.
+#
+# 404 is a normal answer, not an error. It means "we have no logo for this
+# airline", and every caller answers it the same way: draw its own initials
+# badge. That is why the img tags using this carry an onerror.
+
+LOGO_CACHE_HEADERS = {
+    # A week in the browser, and a stale copy is fine while a fresh one is
+    # fetched: an airline logo changes on the order of never.
+    "Cache-Control": "public, max-age=604800, stale-while-revalidate=86400",
+}
+
+
+@router.get("/logo/callsign/{callsign}.png")
+async def logo_for_callsign(callsign: str, request: Request, size: int = DEFAULT_SIZE):
+    """The operator's logo for a flight callsign, e.g. RYR2BH -> Ryanair."""
+    code = code_for_callsign(callsign)
+    if not code:
+        return Response(status_code=status.HTTP_404_NOT_FOUND, headers=LOGO_CACHE_HEADERS)
+    return await _logo_response(request, code, size)
+
+
+@router.get("/logo/airline/{code}.png")
+async def logo_for_airline(code: str, request: Request, size: int = DEFAULT_SIZE):
+    """The logo for an ICAO airline code directly, e.g. RYR."""
+    return await _logo_response(request, code.strip().upper(), size)
+
+
+async def _logo_response(request: Request, code: str, size: int) -> Response:
+    store = request.app.state.logos
+    # "Not configured" is not "this airline has no logo", and the difference
+    # matters to the ESP32: it writes a marker on its card when told 404 and
+    # then stops asking, permanently. A deployment missing its token would
+    # otherwise poison every receiver's cache with "no logo" for every
+    # airline it happened to see first, and setting the token later would
+    # not undo it. 503 says come back, and the device treats it as such.
+    if not store.configured():
+        return Response(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        headers={"Retry-After": "3600"})
+    data = await store.logo(code, size)
+    if data is None:
+        return Response(status_code=status.HTTP_404_NOT_FOUND, headers=LOGO_CACHE_HEADERS)
+    return Response(content=data, media_type="image/png", headers=LOGO_CACHE_HEADERS)
+
+
+# --- Aircraft type photographs -------------------------------------------
+#
+# Same shape as the logo endpoints and open for the same reasons: public
+# images, needed by share links that have no session, and fetched once for
+# the whole deployment rather than once per viewer.
+#
+# The caller passes only the designator. The model name the search needs
+# comes from the reference lists here, so the device does not have to know
+# that "B738" means "Boeing 737-800" - which is the whole point of it not
+# carrying 450 KB of tables.
+
+
+@router.get("/aircraft-photo/{designator}.png")
+async def aircraft_photo(designator: str, request: Request, size: int = PHOTO_DEFAULT_WIDTH):
+    code = designator.strip().upper()
+    store = request.app.state.photos
+    if not store.configured():
+        # Switched off deployment-wide, which the device must treat as
+        # retry-later rather than "this type has no photograph" - see the
+        # same reasoning on the logo endpoint.
+        return Response(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        headers={"Retry-After": "3600"})
+    type_info = _reference(request).aircraft_type(code)
+    if not type_info or not type_info.get("name"):
+        return Response(status_code=status.HTTP_404_NOT_FOUND, headers=LOGO_CACHE_HEADERS)
+    data = await store.photo(code, type_info["name"], size)
+    if data is None:
+        # Distinguish "no free photograph of this type" from "the search is
+        # not working at all". Both are 404 to the device, which retries
+        # either way, but only one of them is something to go and fix.
+        headers = dict(LOGO_CACHE_HEADERS)
+        headers["X-Photo-Search-Failures"] = str(store.search_failures)
+        return Response(status_code=status.HTTP_404_NOT_FOUND, headers=headers)
+    return Response(content=data, media_type="image/png", headers=LOGO_CACHE_HEADERS)
+
+
+@router.get("/aircraft-photo/credits")
+async def aircraft_photo_credits(request: Request):
+    """Where every cached photograph came from.
+
+    CC0 and the Public Domain Mark require no attribution, so this is not a
+    licence obligation. It exists because being unable to say where a picture
+    came from is its own problem, and because a claim of "licence-free" should
+    be checkable rather than asserted.
+    """
+    store = request.app.state.photos
+    entries = await asyncio.to_thread(store.credits)
+    return JSONResponse({"note": "CC0 and Public Domain Mark only; attribution is not required",
+                         "count": len(entries), "photos": entries})

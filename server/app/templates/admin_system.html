@@ -1,0 +1,126 @@
+{% extends "base.html" %}
+{% block header_title %}System{% endblock %}
+{% block nav %}<a href="/admin">Dashboard</a><a href="/admin/settings">Settings</a><a href="/admin/accounts">Accounts</a><a href="/admin/audit-log">Audit log</a><a href="/admin/devices">Devices</a><a href="/admin/logs">Logs</a><a href="/admin/logout">Log out</a>{% endblock %}
+{% block content %}
+
+<div class="panel">
+<h2>Scaling</h2>
+<table>
+<tbody>
+<tr><td style="width:34%">Aircraft cache</td>
+  <td>{% if shared_cache %}<span class="badge ok">Shared (Redis)</span>{% else %}In this process only{% endif %}</td></tr>
+{% if shared_cache %}
+<tr><td>Redis</td>
+  <td>{% if redis_ok %}<span class="badge ok">Up</span>{% else %}<span class="badge bad">Unreachable</span>{% endif %}
+    <span class="sub">{{ redis_detail }}</span></td></tr>
+<tr><td>This worker</td>
+  <td>{% if polls_upstream %}<span class="badge ok">Holds the polling role</span>{% else %}Serving requests only{% endif %}
+    <span class="sub">{{ leader_identity }}, {{ lease_seconds }}s lease</span></td></tr>
+{% endif %}
+<tr><td>Aircraft cached</td><td>{{ cache_size }}</td></tr>
+</tbody>
+</table>
+
+{% if not shared_cache %}
+<p class="sub">One worker, with the cache in its own memory. That is the right setup
+  for a single vCPU and it is what the measured figures assume - a device poll costs
+  about 7&nbsp;ms, so one thread handles roughly 145 requests a second, and a receiver
+  polls only every 30&nbsp;s.</p>
+<p class="sub" style="margin-bottom:0"><b>This cannot be switched on from here, and
+  deliberately so.</b> <code>REDIS_URL</code> and the worker count are read once when
+  the process starts, so a button here could not do anything a restart would not have
+  to do anyway. To enable it: uncomment <code>REDIS_URL</code> in <code>.env</code>,
+  bring up the <code>redis</code> service, add <code>--workers N</code> to the uvicorn
+  command in <code>docker-compose.yml</code>, then
+  <code>docker compose up -d --build</code>. Only worth doing with more than one vCPU;
+  this page will then say "Shared (Redis)" and show which worker is polling.</p>
+{% endif %}
+</div>
+
+<div class="panel">
+<h2>Storage</h2>
+<table>
+<tbody>
+<tr><td style="width:34%">Database</td><td><code>{{ database }}</code>
+  <span class="sub">{{ (database_bytes / 1048576) | round(1) }} MB</span></td></tr>
+<tr><td>Usage rows</td><td>{{ "{:,}".format(usage_rows) }}
+  <span class="sub">pruned {{ pruner.total_removed }} since restart{% if pruner.last_run_at %},
+    last run {{ pruner.last_run_at.strftime('%Y-%m-%d %H:%M UTC') }}{% endif %}</span></td></tr>
+<tr><td>Stored setting overrides</td><td>{{ settings_rows }}
+  <span class="sub">everything else is at its environment default</span></td></tr>
+<tr><td>Airline logos on disk</td><td>{{ (logo_bytes / 1048576) | round(1) }} MB</td></tr>
+<tr><td>Aircraft photos on disk</td><td>{{ (photo_bytes / 1048576) | round(1) }} MB</td></tr>
+{% if disk %}
+<tr><td>Disk</td>
+  <td>{{ (disk.free / 1073741824) | round(1) }} GB free of
+    {{ (disk.total / 1073741824) | round(1) }} GB
+    {% if disk.percent >= 90 %}<span class="badge bad">{{ disk.percent }}% used</span>
+    {% else %}<span class="sub">{{ disk.percent }}% used</span>{% endif %}</td></tr>
+{% endif %}
+</tbody>
+</table>
+<p class="sub" style="margin-bottom:0">Usage rows are the only table that grows with
+  traffic - about 2,880 per receiver per day. The retention window on
+  <a href="/admin/settings">Settings</a> is what bounds it.</p>
+</div>
+
+<div class="panel">
+<h2>Enrichment</h2>
+<table>
+<tbody>
+<tr><td style="width:34%">Reference data</td>
+  <td>{{ "{:,}".format(reference_stats.airlines) }} airlines,
+      {{ "{:,}".format(reference_stats.types) }} type designators,
+      {{ reference_stats.liveries }} liveries,
+      {{ reference_stats.military_operators }} military operators</td></tr>
+<tr><td>Airline logos</td>
+  <td>{% if logo_stats.configured %}<span class="badge ok">On</span>{% else %}<span class="badge bad">No token</span>{% endif %}
+    <span class="sub">{{ logo_stats.hits }} served, {{ logo_stats.fetches }} fetched,
+      {{ logo_stats.misses }} unknown</span></td></tr>
+<tr><td>Aircraft photos</td>
+  <td>{% if photo_stats.enabled %}<span class="badge ok">On</span>{% else %}Off{% endif %}
+    <span class="sub">{{ photo_stats.hits }} served, {{ photo_stats.fetches }} fetched,
+      {{ photo_stats.queued }} queued, {{ photo_stats.search_failures }} search failures</span></td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="panel">
+<h2>Feeder ingestion</h2>
+<table>
+<tbody>
+<tr><td style="width:34%">Listening for</td><td>{{ feeder_listeners }} device(s)</td></tr>
+<tr><td>Port range</td><td><code>{{ feeder_ports }}</code></td></tr>
+</tbody>
+</table>
+<p class="sub" style="margin-bottom:0">The range is fixed at startup
+  (<code>FEEDER_PORT_RANGE_START</code>/<code>END</code>) because the VPS firewall has to
+  allow the same range - changing it here without changing the firewall would hand
+  customers a port that could never reach us.</p>
+</div>
+
+<div class="panel">
+<h2>Needs a restart to change</h2>
+<table>
+<thead><tr><th>Setting</th><th>Why it cannot be live</th></tr></thead>
+<tbody>
+<tr><td><code>REDIS_URL</code>, worker count</td>
+  <td class="sub">Read once at startup; the cache and the leader lease are built from
+    them before the first request.</td></tr>
+<tr><td><code>FEEDER_PORT_RANGE_START</code>/<code>END</code></td>
+  <td class="sub">Must match the VPS firewall, which this cannot change.</td></tr>
+<tr><td><code>SESSION_SECRET</code></td>
+  <td class="sub">Changing it invalidates every signed-in session, admin and customer.</td></tr>
+<tr><td><code>DATABASE_URL</code></td>
+  <td class="sub">The connection pool is built at import.</td></tr>
+<tr><td><code>LOGO_DEV_TOKEN</code>, <code>HOME_LAT</code>/<code>LON</code></td>
+  <td class="sub">Read at startup. The home position is only a fallback for a
+    deployment with no located devices, so it rarely matters once receivers report.</td></tr>
+</tbody>
+</table>
+<p class="sub" style="margin-bottom:0">Everything on <a href="/admin/settings">Settings</a>
+  is the set that <em>can</em> change while running. Edit <code>.env</code> and
+  <code>docker compose up -d</code> for the rest.</p>
+</div>
+
+{% endblock %}

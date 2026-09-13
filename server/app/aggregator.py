@@ -18,16 +18,24 @@ scales with how many feeders opt in.
 import asyncio
 import itertools
 import logging
-import math
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import httpx
 from sqlalchemy.orm import Session
 
 from . import models
+from .cache import (  # re-exported: all of these lived here before the cache moved out
+    SOURCE_ATTRIBUTION_SECONDS,
+    STALE_AFTER_SECONDS,
+    AircraftCache,
+    CachedAircraft,
+    build_cache,
+)
+from .cache import distance_nm as _distance_nm
 from .models import FeederKey, FeederProvider
+from .runtime_settings import SettingsStore
 
 logger = logging.getLogger("aggregator")
 
@@ -40,117 +48,35 @@ POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "15"))
 # every cycle - an upstream that has started refusing us should not cost a
 # request and a log line every fifteen seconds indefinitely.
 SOURCE_BACKOFF_MAX_SECONDS = 15 * 60
-SOURCE_ATTRIBUTION_SECONDS = 60
-STALE_AFTER_SECONDS = 5 * 60  # matches the ESP32 firmware's own MLAT/route cache staleness window
 # Per-device polling areas. A device asking for a 5 nm radius still needs the
 # cache filled a bit wider than that, or an aircraft is only cached once it
 # is already overhead; and nobody gets to make the aggregator poll the whole
 # hemisphere.
 MIN_POLL_RADIUS_NM = 25.0
+# The starting values for the editable settings of the same name. Once a
+# deployment is running, the admin panel decides these - see
+# app/runtime_settings.py.
 MAX_POLL_RADIUS_NM = 250.0
 # Each region is one request per upstream per cycle. Beyond this many the
 # regions are rotated across cycles instead.
 MAX_POLL_REGIONS = int(os.environ.get("MAX_POLL_REGIONS", "6"))
-
-
-@dataclass
-class CachedAircraft:
-    hex: str
-    data: dict
-    seen_at: float
-    # Every source that has recently reported this aircraft, and when, kept
-    # independently of whose record currently wins the freshness comparison
-    # in merge(). Attribution used to be a single field on the winning
-    # record, which meant an aircraft a customer's own receiver was tracking
-    # vanished from their "my feed" map the moment an upstream API reported
-    # it a fraction of a second fresher - so the aircraft nearest the
-    # receiver, the ones the aggregator also polls for, were exactly the
-    # ones that disappeared.
-    sources: dict = field(default_factory=dict)
-
-
-class AircraftCache:
-    """In-memory, single-process cache - fine for one aggregator instance.
-    If this is ever scaled to multiple processes/instances, this needs to
-    move to something shared (Redis) instead; flagged here rather than
-    silently becoming a bug on the day someone adds a second worker."""
-
-    def __init__(self):
-        self._by_hex: dict[str, CachedAircraft] = {}
-        self._lock = asyncio.Lock()
-
-    async def merge(self, source: str, aircraft: list[dict]):
-        now = time.time()
-        async with self._lock:
-            for ac in aircraft:
-                hex_id = (ac.get("hex") or "").lower()
-                if not hex_id:
-                    continue
-                existing = self._by_hex.get(hex_id)
-                # Prefer the record with the most recent "seen" (seconds-ago
-                # from the upstream API, smaller is fresher) rather than
-                # simply "last source polled wins" - two sources can both
-                # report the same aircraft at different staleness.
-                # Record that this source saw it whatever happens next: who
-                # reported it and whose values are freshest are two different
-                # questions, and conflating them lost aircraft.
-                sources = existing.sources if existing else {}
-                sources[source] = now
-                if existing is None or ac.get("seen", 1e9) <= existing.data.get("seen", 1e9):
-                    ac = dict(ac)
-                    ac["_source"] = source
-                    self._by_hex[hex_id] = CachedAircraft(hex_id, ac, now, sources)
-                else:
-                    existing.sources = sources
-
-    async def prune(self):
-        cutoff = time.time() - STALE_AFTER_SECONDS
-        async with self._lock:
-            stale = [h for h, entry in self._by_hex.items() if entry.seen_at < cutoff]
-            for h in stale:
-                del self._by_hex[h]
-
-    async def query(self, lat: float, lon: float, radius_nm: float) -> list[dict]:
-        async with self._lock:
-            snapshot = list(self._by_hex.values())
-        result = []
-        for entry in snapshot:
-            ac_lat, ac_lon = entry.data.get("lat"), entry.data.get("lon")
-            if ac_lat is None or ac_lon is None:
-                continue
-            if _distance_nm(lat, lon, ac_lat, ac_lon) <= radius_nm:
-                result.append(entry.data)
-        return result
-
-    async def query_by_source(self, source: str) -> list[dict]:
-        """Used by the "my feed" account page - aircraft this source has
-        reported recently, so a feeder sees what its own receiver actually
-        contributed rather than the whole shared cache.
-
-        Asks "has this source reported it lately", not "did this source win
-        the last merge". The latter hid an aircraft from its own feeder
-        whenever an upstream API happened to report it fractionally fresher,
-        which is most likely for the traffic closest to the receiver.
-        """
-        cutoff = time.time() - SOURCE_ATTRIBUTION_SECONDS
-        async with self._lock:
-            return [
-                entry.data
-                for entry in self._by_hex.values()
-                if entry.sources.get(source, 0) >= cutoff
-            ]
-
-    def size(self) -> int:
-        return len(self._by_hex)
-
-
-def _distance_nm(lat1, lon1, lat2, lon2) -> float:
-    r_nm = 3440.065
-    p1, p2 = math.radians(lat1), math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlambda = math.radians(lon2 - lon1)
-    a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlambda / 2) ** 2
-    return 2 * r_nm * math.asin(math.sqrt(a))
+# Sources to leave alone entirely, comma separated, by the names used below.
+#
+# airplanes.live is off by default because it now answers 403 to every
+# request from us, and not because of this deployment's address - the same
+# request is refused from unrelated networks too. A source that cannot
+# succeed should not sit red in the admin panel forever implying an outage
+# somebody could fix, nor keep spending requests at someone else's server
+# to re-learn the same answer. Clear this variable to try it again if their
+# access rules change.
+# Only the default for whether each source is polled; after first boot the
+# admin panel's per-source switches decide, and this is what a fresh
+# database starts from.
+DISABLED_SOURCES = {
+    name.strip()
+    for name in os.environ.get("DISABLED_SOURCES", "airplaneslive").split(",")
+    if name.strip()
+}
 
 
 @dataclass
@@ -164,12 +90,27 @@ class SourceHealth:
 
 
 class Aggregator:
-    def __init__(self, home_lat: float, home_lon: float, home_radius_nm: float, session_factory):
-        self.cache = AircraftCache()
+    def __init__(self, home_lat: float, home_lon: float, home_radius_nm: float, session_factory,
+                 cache=None, leadership=None, settings=None):
+        self.cache = cache if cache is not None else build_cache()
+        # Only the leader polls upstream. Without this, running N workers
+        # would ask each community API for the same sky N times every
+        # cycle. None means "always the leader", which is what a
+        # single-process deployment is - see app/leader.py.
+        self._leadership = leadership
+        # Editable from the admin panel rather than only from .env plus a
+        # restart - see app/runtime_settings.py. A store with no session
+        # factory serves the environment defaults and never reads a
+        # database, which is what a caller passing nothing gets.
+        self.settings = settings if settings is not None else SettingsStore()
         self.home_lat = home_lat
         self.home_lon = home_lon
         self.home_radius_nm = home_radius_nm
         self._session_factory = session_factory
+        # Every source, whether or not it is currently polled: a source
+        # turned back on in the admin panel needs somewhere to record its
+        # first attempt, and the dashboard should show a disabled source as
+        # disabled rather than omitting it and implying it does not exist.
         self._health: dict[str, SourceHealth] = {
             name: SourceHealth(name) for name in ("adsbfi", "airplaneslive", "adsblol")
         }
@@ -190,6 +131,8 @@ class Aggregator:
         receivers is one area to an upstream API, and asking three times for
         the same sky is rude to a free service and no more useful.
         """
+        max_radius = self.settings.get("max_poll_radius_nm")
+        max_regions = self.settings.get("max_poll_regions")
         db = self._session_factory()
         try:
             devices = db.query(models.Device).all()
@@ -201,7 +144,7 @@ class Aggregator:
 
         merged: list[tuple[float, float, float]] = []
         for lat, lon, radius in located:
-            radius = max(MIN_POLL_RADIUS_NM, min(radius, MAX_POLL_RADIUS_NM))
+            radius = max(MIN_POLL_RADIUS_NM, min(radius, max_radius))
             for index, (mlat, mlon, mradius) in enumerate(merged):
                 if _distance_nm(lat, lon, mlat, mlon) <= max(radius, mradius):
                     # Cover both from one point, widened enough to still
@@ -210,25 +153,31 @@ class Aggregator:
                     merged[index] = (
                         (lat + mlat) / 2,
                         (lon + mlon) / 2,
-                        min(MAX_POLL_RADIUS_NM, max(radius, mradius) + separation / 2),
+                        min(max_radius, max(radius, mradius) + separation / 2),
                     )
                     break
             else:
                 merged.append((lat, lon, radius))
 
-        if len(merged) > MAX_POLL_REGIONS:
+        if len(merged) > max_regions:
             # Every region costs a request to each upstream on every cycle.
             # Past this many, rotate through them across cycles rather than
             # multiplying the load on free APIs without limit; a device's
             # area is then refreshed less often, not dropped.
             start = self._region_cursor % len(merged)
-            self._region_cursor += MAX_POLL_REGIONS
+            self._region_cursor += max_regions
             rotated = merged[start:] + merged[:start]
-            return rotated[:MAX_POLL_REGIONS]
+            return rotated[:max_regions]
         return merged
 
     def health(self) -> dict[str, SourceHealth]:
         return self._health
+
+    def polls_upstream(self) -> bool:
+        """Whether this process is the one polling. A follower's source
+        health is its own last attempt, which may be from before it lost
+        the role, so the admin panel needs to say which it is looking at."""
+        return self._leadership is None or self._leadership.is_leader
 
     def start(self):
         self._task = asyncio.create_task(self._loop())
@@ -241,8 +190,18 @@ class Aggregator:
         async with httpx.AsyncClient(timeout=10.0, headers={"User-Agent": USER_AGENT}) as client:
             while True:
                 try:
-                    await self._poll_all(client)
-                    await self.cache.prune()
+                    if self._leadership is None or self._leadership.is_leader:
+                        await self._poll_all(client)
+                        await self.cache.prune()
+                    # Every worker keeps its own copy of the count the admin
+                    # dashboard reads, leader or not; it is one cheap read
+                    # and a follower's dashboard should not show zero.
+                    await self.cache.refresh_size()
+                    # Pick up admin-panel changes. The worker that made the
+                    # change applied it immediately; this is how the others
+                    # find out, within one cycle. In a thread because every
+                    # statement in reload() is blocking SQLAlchemy.
+                    await asyncio.to_thread(self.settings.reload)
                 except asyncio.CancelledError:
                     raise
                 except Exception:  # noqa: BLE001
@@ -251,7 +210,7 @@ class Aggregator:
                     # the process, and the only symptom was a service that
                     # quietly returned fewer and fewer aircraft.
                     logger.exception("poll cycle failed")
-                await asyncio.sleep(POLL_INTERVAL_SECONDS)
+                await asyncio.sleep(self.settings.get("poll_interval_seconds"))
 
     def _next_feeder_credential(self, provider: FeederProvider) -> str | None:
         """Round-robins across enabled donated keys for this provider.
@@ -297,6 +256,9 @@ class Aggregator:
             logger.warning("could not read device locations (%s) - polling the home area only", exc)
             return [(self.home_lat, self.home_lon, self.home_radius_nm)]
 
+    def source_enabled(self, name: str) -> bool:
+        return self.settings.source_enabled(name)
+
     def _source_is_backed_off(self, name: str) -> bool:
         """True while a repeatedly failing source is being left alone.
 
@@ -312,11 +274,14 @@ class Aggregator:
             return False
         delay = min(
             SOURCE_BACKOFF_MAX_SECONDS,
-            POLL_INTERVAL_SECONDS * (2 ** min(health.consecutive_errors, 12)),
+            self.settings.get("poll_interval_seconds") * (2 ** min(health.consecutive_errors, 12)),
         )
         return time.time() - (health.last_attempt or 0) < delay
 
     async def _record(self, name: str, coro):
+        if not self.source_enabled(name):
+            coro.close()  # never awaited, so close it rather than leak a warning
+            return
         health = self._health[name]
         if self._source_is_backed_off(name):
             coro.close()  # never awaited, so close it rather than leak a warning
@@ -344,6 +309,8 @@ class Aggregator:
                 )
 
     async def _poll_adsbfi(self, client: httpx.AsyncClient, regions):
+        if not self.source_enabled("adsbfi"):
+            return
         for lat, lon, radius in regions:
             url = (
                 f"https://opendata.adsb.fi/api/v3/lat/{lat}/lon/{lon}"
@@ -352,6 +319,8 @@ class Aggregator:
             await self._record("adsbfi", self._fetch(client, url, "ac"))
 
     async def _poll_airplaneslive(self, client: httpx.AsyncClient, regions):
+        if not self.source_enabled("airplaneslive"):
+            return
         # No feeder-key pooling here yet: airplanes.live's own API doesn't
         # take a bearer/query-param key today (access is IP/account based on
         # their end) - the hook is here so it's a one-line change once/if
@@ -361,6 +330,8 @@ class Aggregator:
             await self._record("airplaneslive", self._fetch(client, url, "ac"))
 
     async def _poll_adsblol(self, client: httpx.AsyncClient, regions):
+        if not self.source_enabled("adsblol"):
+            return
         for lat, lon, radius in regions:
             url = f"https://api.adsb.lol/v2/point/{lat}/{lon}/{radius:.0f}"
             await self._record("adsblol", self._fetch(client, url, "ac"))
