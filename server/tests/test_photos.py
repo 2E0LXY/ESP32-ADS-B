@@ -37,11 +37,15 @@ class _FakeOpenverse:
         self.image = image if image is not None else _jpeg()
         self.searches = 0
         self.downloads = []
+        # What was actually asked for, so a test can tell an operator search
+        # from a plain type search.
+        self.queries = []
 
     async def get(self, url, params=None, timeout=None):
         request = httpx.Request("GET", url)
         if "openverse" in url:
             self.searches += 1
+            self.queries.append((params or {}).get("q"))
             return httpx.Response(200, json={"results": self.results}, request=request)
         self.downloads.append(url)
         return httpx.Response(200, content=self.image, request=request)
@@ -322,8 +326,10 @@ def _photo_client(client, monkeypatch, state):
     """Points the running app's photo store at a canned resolve()."""
     from app.main import app
 
-    async def resolve(designator, model, width=240):
-        return (b"\x89PNG fake", "ready") if state == "ready" else (None, state)
+    async def resolve(designator, model, width=240, airline=None, airline_name=None):
+        if state != "ready":
+            return None, state, "type"
+        return b"\x89PNG fake", "ready", "airline" if airline else "type"
 
     monkeypatch.setattr(app.state.photos, "resolve", resolve)
     monkeypatch.setattr(app.state.photos, "configured", lambda: True)
@@ -379,17 +385,150 @@ async def test_resolve_names_each_case(tmp_path):
     store = PhotoStore(cache_dir=str(tmp_path), enabled=True)
     store._client = object()  # not None, so queueing is reachable
 
-    data, state = await store.resolve("B738", "Boeing 737-800", 240)
-    assert (data, state) == (None, "pending"), "first ask must be pending, not missing"
+    data, state, match = await store.resolve("B738", "Boeing 737-800", 240)
+    assert (data, state, match) == (None, "pending", "type"), \
+        "first ask must be pending, not missing"
 
     image_path, _meta, miss_path = store._paths("B738", 240)
     pathlib.Path(miss_path).write_text("")
-    assert await store.resolve("B738", "Boeing 737-800", 240) == (None, "missing")
+    assert await store.resolve("B738", "Boeing 737-800", 240) == (None, "missing", "type")
 
     pathlib.Path(miss_path).unlink()
     pathlib.Path(image_path).write_bytes(b"\x89PNG cached")
-    data, state = await store.resolve("B738", "Boeing 737-800", 240)
-    assert state == "ready" and data == b"\x89PNG cached"
+    data, state, match = await store.resolve("B738", "Boeing 737-800", 240)
+    assert (state, match) == ("ready", "type") and data == b"\x89PNG cached"
 
     disabled = PhotoStore(cache_dir=str(tmp_path), enabled=False)
-    assert await disabled.resolve("B738", "Boeing 737-800", 240) == (None, "off")
+    assert await disabled.resolve("B738", "Boeing 737-800", 240) == (None, "off", "type")
+
+
+# --- the operator's own aircraft, not just the right type ----------------
+#
+# One photograph per type meant a Jet2 737-800 and a Ryanair 737-800 shared
+# a picture, so a Jet2 flight was shown a Ryanair aeroplane. These cover the
+# operator search, the fallback, and the title check that stops the search
+# handing back the very fault it exists to fix.
+
+def test_an_airline_name_becomes_useful_search_words():
+    from app.photos import operator_terms
+
+    assert operator_terms("Jet2.com") == ["jet2"]
+    assert operator_terms("easyJet UK") == ["easyjet"]
+    # Not trimmed harder than that: "Air France" must not become "France",
+    # nor "British Airways" become "british", or the search matches the
+    # wrong carrier's aeroplane.
+    assert operator_terms("British Airways") == ["british", "airways"]
+    assert operator_terms("Air France") == ["air", "france"]
+    assert operator_terms("Ryanair (Malta Air)") == ["ryanair"]
+    assert operator_terms(None) == []
+
+
+def test_the_airline_must_be_named_in_the_title():
+    """Searching "Jet2 Boeing 737-800" happily returns a Ryanair 737 -
+    Openverse full-text search is generous - and caching that as Jet2's
+    picture would reproduce the original fault having asked for the right
+    thing."""
+    from app.photos import _is_plausible_photo
+
+    ryanair = _result("Boeing 737-800")  # title mentions the model only
+    ok, reason = _is_plausible_photo(ryanair, "Boeing 737-800", ("jet2",))
+    assert not ok and "jet2" in reason
+
+    jet2 = _result("Jet2 Boeing 737-800 at Leeds Bradford")
+    ok, _reason = _is_plausible_photo(jet2, "Boeing 737-800", ("jet2",))
+    assert ok
+
+
+async def test_the_operators_own_photograph_wins(tmp_path):
+    store = _store(tmp_path, _FakeOpenverse([]))
+    operator_image, _meta, _miss = store._paths("B738", 240, "EXS")
+    pathlib.Path(operator_image).write_bytes(b"\x89PNG jet2")
+    generic_image, _m, _s = store._paths("B738", 240)
+    pathlib.Path(generic_image).write_bytes(b"\x89PNG someone else")
+
+    data, state, match = await store.resolve(
+        "B738", "Boeing 737-800", 240, "EXS", "Jet2.com")
+
+    assert (state, match) == ("ready", "airline")
+    assert data == b"\x89PNG jet2"
+    assert store.operator_hits == 1
+
+
+async def test_the_type_photograph_is_served_while_the_operators_is_queued(tmp_path):
+    """A picture of the right type now beats no picture at all, and the
+    caller is told it is only a type match so it can say so."""
+    store = _store(tmp_path, _FakeOpenverse([]))
+    await _queue_without_workers(store)
+    try:
+        generic_image, _m, _s = store._paths("B738", 240)
+        pathlib.Path(generic_image).write_bytes(b"\x89PNG generic")
+
+        data, state, match = await store.resolve(
+            "B738", "Boeing 737-800", 240, "EXS", "Jet2.com")
+
+        assert (state, match) == ("ready", "type")
+        assert data == b"\x89PNG generic"
+        assert store._queue.qsize() == 1, "the operator's own was not queued"
+    finally:
+        await store.stop()
+
+
+async def test_an_operator_with_no_photograph_is_not_searched_again(tmp_path):
+    """Most airline-and-type pairs have no attribution-free photograph, so
+    re-searching every poll would spend the whole budget on answers that
+    never change."""
+    store = _store(tmp_path, _FakeOpenverse([]))
+    await _queue_without_workers(store)
+    try:
+        _img, _meta, operator_miss = store._paths("B738", 240, "EXS")
+        pathlib.Path(operator_miss).write_text("")
+        generic_image, _m, _s = store._paths("B738", 240)
+        pathlib.Path(generic_image).write_bytes(b"\x89PNG generic")
+
+        data, state, match = await store.resolve(
+            "B738", "Boeing 737-800", 240, "EXS", "Jet2.com")
+
+        assert (data, state, match) == (b"\x89PNG generic", "ready", "type")
+        assert store._queue.qsize() == 0, "a known-empty operator search was repeated"
+    finally:
+        await store.stop()
+
+
+async def test_an_operator_search_asks_for_the_airline_and_checks_the_title(tmp_path):
+    upstream = _FakeOpenverse([_result("Jet2 Boeing 737-800 at Leeds Bradford")])
+    store = _store(tmp_path, upstream)
+
+    data = await store._fetch("B738", "Boeing 737-800", 240, "EXS", "Jet2.com")
+
+    assert data is not None and data.startswith(b"\x89PNG")
+    assert upstream.queries[-1] == "jet2 Boeing 737-800"
+    # Cached as the operator's, leaving the generic entry alone.
+    operator_image, _meta, _miss = store._paths("B738", 240, "EXS")
+    assert pathlib.Path(operator_image).exists()
+    generic_image, _m, _s = store._paths("B738", 240)
+    assert not pathlib.Path(generic_image).exists()
+
+
+async def test_a_generic_result_is_rejected_for_an_operator_search(tmp_path):
+    """The failure mode that matters: the search comes back with someone
+    else's 737 and it must not be cached as this operator's."""
+    upstream = _FakeOpenverse([_result("Boeing 737-800 on approach")])
+    store = _store(tmp_path, upstream)
+
+    data = await store._fetch("B738", "Boeing 737-800", 240, "EXS", "Jet2.com")
+
+    assert data is None
+    _img, _meta, operator_miss = store._paths("B738", 240, "EXS")
+    assert pathlib.Path(operator_miss).exists(), "the empty search was not remembered"
+    # And the request for the type itself still works, unaffected.
+    assert await store._fetch("B738", "Boeing 737-800", 240) is not None
+
+
+def test_the_endpoint_says_which_photograph_it_served(client, monkeypatch):
+    _photo_client(client, monkeypatch, "ready")
+
+    generic = client.get("/aircraft-photo/B738.png")
+    operators = client.get("/aircraft-photo/B738.png?airline=EXS")
+
+    assert generic.headers["X-Photo-Match"] == "type"
+    assert operators.headers["X-Photo-Match"] == "airline"

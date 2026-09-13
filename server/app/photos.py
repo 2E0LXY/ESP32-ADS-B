@@ -82,7 +82,8 @@ REJECT_WORDS = (
 )
 
 
-def _is_plausible_photo(result: dict, model: str) -> tuple[bool, str]:
+def _is_plausible_photo(result: dict, model: str,
+                        operator_required: tuple[str, ...] = ()) -> tuple[bool, str]:
     """Whether a search result looks like a photograph of the whole aircraft.
 
     Returns the reason on rejection so a poor choice can be explained rather
@@ -113,7 +114,40 @@ def _is_plausible_photo(result: dict, model: str) -> tuple[bool, str]:
     significant = [w for w in re.split(r"[\s\-]+", model.lower()) if len(w) > 2]
     if significant and not any(w in title for w in significant):
         return False, "title does not mention the model"
+    # For an operator-specific photograph the airline has to be named in the
+    # title, and every word of it. Searching "Jet2 Boeing 737-800" happily
+    # returns a Ryanair 737 - the search is full-text and generous - and
+    # caching that as Jet2's picture would reproduce the fault this is meant
+    # to fix, with the extra insult of having asked for the right thing.
+    for term in operator_required:
+        if term not in title:
+            return False, f"title does not mention {term!r}"
     return True, ""
+
+
+# Words in an airline's registered name that are no help in a photo search
+# and would wrongly reject a good picture if required in its title. "Jet2.com"
+# is titled "Jet2" on a photograph, and "easyJet UK" is just "easyJet".
+OPERATOR_NOISE = {"ltd", "limited", "inc", "plc", "llc", "uk", "com", "the"}
+OPERATOR_PATTERN = re.compile(r"^[A-Z0-9]{2,4}$")
+
+
+def operator_terms(airline_name: str | None) -> list[str]:
+    """The words of an airline name worth searching and matching on.
+
+    Conservative on purpose: it drops a trailing ".com", anything in
+    brackets, and the qualifiers above, and keeps everything else. Trimming
+    harder would turn "Air France" into "France" and "British Airways" into
+    "British", and match the wrong carrier's aeroplane - which is the exact
+    fault this whole path exists to fix.
+    """
+    name = (airline_name or "").strip()
+    if not name:
+        return []
+    name = re.sub(r"\(.*?\)", " ", name)
+    name = re.sub(r"\.com\b", " ", name, flags=re.IGNORECASE)
+    words = [w for w in re.split(r"[\s/,]+", name.lower()) if len(w) > 2]
+    return [w for w in words if w not in OPERATOR_NOISE]
 
 
 class PhotoStore:
@@ -135,7 +169,11 @@ class PhotoStore:
         self.misses = 0
         self.rejected = 0
         self.queued_now = 0
-        self._queue: asyncio.Queue[tuple[str, str, int]] | None = None
+        # Photographs served that are of the right operator, not just the
+        # right type. The whole point of the operator search, so worth
+        # being able to see it working rather than inferring it.
+        self.operator_hits = 0
+        self._queue: asyncio.Queue[tuple[str, str, int, str, str]] | None = None
         self._queued: set[str] = set()
         self._workers: list[asyncio.Task] = []
 
@@ -169,24 +207,25 @@ class PhotoStore:
 
     async def _worker(self):
         while True:
-            code, model, width = await self._queue.get()
+            code, model, width, operator, airline_name = await self._queue.get()
             try:
-                await self._fetch(code, model, width)
+                await self._fetch(code, model, width, operator, airline_name)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.exception("photo fetch failed for %s", code)
             finally:
-                self._queued.discard(f"{code}-{width}")
+                self._queued.discard(f"{code}@{operator}-{width}")
                 self.queued_now = len(self._queued)
                 self._queue.task_done()
 
-    def _enqueue(self, code: str, model: str, width: int):
-        key = f"{code}-{width}"
+    def _enqueue(self, code: str, model: str, width: int,
+                 operator: str = "", airline_name: str = ""):
+        key = f"{code}@{operator}-{width}"
         if self._queue is None or key in self._queued:
             return
         try:
-            self._queue.put_nowait((code, model, width))
+            self._queue.put_nowait((code, model, width, operator, airline_name))
         except asyncio.QueueFull:
             return
         self._queued.add(key)
@@ -197,18 +236,25 @@ class PhotoStore:
             return bool(self._settings.get("aircraft_photos"))
         return self._enabled
 
-    def _paths(self, designator: str, width: int) -> tuple[str, str, str]:
-        base = os.path.join(self._dir, f"{designator}-{width}")
+    def _paths(self, designator: str, width: int,
+               operator: str = "") -> tuple[str, str, str]:
+        # An operator's own photograph is a separate cache entry, so the
+        # generic one stays available as the fallback and neither overwrites
+        # the other.
+        name = f"{designator}@{operator}-{width}" if operator else f"{designator}-{width}"
+        base = os.path.join(self._dir, name)
         return base + ".png", base + ".json", base + ".miss"
 
     async def photo(self, designator: str, model: str, width: int = DEFAULT_WIDTH) -> bytes | None:
         """The cached photo for a type, or None. See resolve() for why None
         is not one answer but three."""
-        data, _state = await self.resolve(designator, model, width)
+        data, _state, _match = await self.resolve(designator, model, width)
         return data
 
     async def resolve(self, designator: str, model: str,
-                      width: int = DEFAULT_WIDTH) -> tuple[bytes | None, str]:
+                      width: int = DEFAULT_WIDTH, airline: str | None = None,
+                      airline_name: str | None = None
+                      ) -> tuple[bytes | None, str, str]:
         """The photo and, when there is not one, WHY there is not one.
 
         None used to mean any of three different things, and the endpoint
@@ -227,37 +273,71 @@ class PhotoStore:
                    case a caller may remember
           pending  queued; ask again shortly
           off      switched off deployment-wide, or not a designator
+
+        Also says WHICH photograph it is, because one photograph per type
+        means a Jet2 737-800 and a Ryanair 737-800 share a picture, and
+        whichever livery the search found is the one every operator of that
+        type gets shown. So when an airline is named, its own photograph is
+        looked for first and the generic one is the fallback - and the third
+        return value is "airline" or "type" so the caller can say which,
+        rather than presenting someone else's livery as this aircraft.
         """
         code = (designator or "").strip().upper()
         if not self.configured() or not DESIGNATOR_PATTERN.match(code) or not model:
-            return None, "off"
+            return None, "off", "type"
         if width not in ALLOWED_WIDTHS:
             width = DEFAULT_WIDTH
-        image_path, _meta_path, miss_path = self._paths(code, width)
 
+        operator = (airline or "").strip().upper()
+        terms = operator_terms(airline_name)
+        if operator and terms and OPERATOR_PATTERN.match(operator):
+            operator_image, _meta, operator_miss = self._paths(code, width, operator)
+            operator_cached = await asyncio.to_thread(_read_if_present, operator_image)
+            if operator_cached is not None:
+                self.hits += 1
+                self.operator_hits += 1
+                return operator_cached, "ready", "airline"
+            # Nothing yet. Queue the operator search, then fall through and
+            # serve the generic photograph if there is one: a picture of the
+            # right type now beats no picture at all, and the operator's own
+            # replaces it on a later poll once it arrives. A search that
+            # already came back empty is not repeated - most airline-and-type
+            # pairs simply have no attribution-free photograph.
+            if self._client is not None and not await asyncio.to_thread(
+                    _miss_is_fresh, operator_miss, MISS_TTL_SECONDS):
+                self._enqueue(code, model, width, operator, airline_name or "")
+
+        image_path, _meta_path, miss_path = self._paths(code, width)
         cached = await asyncio.to_thread(_read_if_present, image_path)
         if cached is not None:
             self.hits += 1
-            return cached, "ready"
+            return cached, "ready", "type"
         if await asyncio.to_thread(_miss_is_fresh, miss_path, MISS_TTL_SECONDS):
             self.misses += 1
-            return None, "missing"
+            return None, "missing", "type"
         if self._client is None:
-            return None, "off"
+            return None, "off", "type"
 
         # Queued, not fetched here: a caller must never wait on a search and
         # a download. The device asks again on its next rotation and gets the
         # picture then, which is exactly how route lookups behave.
         self._enqueue(code, model, width)
-        return None, "pending"
+        return None, "pending", "type"
 
-    async def _fetch(self, code: str, model: str, width: int) -> bytes | None:
-        image_path, meta_path, miss_path = self._paths(code, width)
+    async def _fetch(self, code: str, model: str, width: int,
+                     operator: str = "", airline_name: str = "") -> bytes | None:
+        image_path, meta_path, miss_path = self._paths(code, width, operator)
+        terms = tuple(operator_terms(airline_name)) if operator else ()
+        # "Jet2 Boeing 737-800" rather than "Boeing 737-800". The airline
+        # words also become a requirement on the title - see the note in
+        # _is_plausible_photo - so a generic 737 coming back from this
+        # search is rejected rather than cached as Jet2's.
+        query = f"{' '.join(terms)} {model}" if terms else model
         self.fetches += 1
         try:
             response = await self._client.get(
                 OPENVERSE_URL,
-                params={"q": model, "license": FREE_LICENCES,
+                params={"q": query, "license": FREE_LICENCES,
                         "page_size": CANDIDATES, "mature": "false"},
                 timeout=SEARCH_TIMEOUT_SECONDS,
             )
@@ -272,11 +352,11 @@ class PhotoStore:
             self.search_failures += 1
             if self.search_failures <= 3 or self.search_failures % 25 == 0:
                 logger.warning("photo search failed for %s (%s) [%d so far]: %s: %s",
-                               code, model, self.search_failures, type(exc).__name__, exc)
+                               code, query, self.search_failures, type(exc).__name__, exc)
             return None
 
         for result in results:
-            ok, reason = _is_plausible_photo(result, model)
+            ok, reason = _is_plausible_photo(result, model, terms)
             if not ok:
                 self.rejected += 1
                 logger.debug("photo %s rejected %r: %s", code, result.get("title"), reason)
@@ -293,6 +373,7 @@ class PhotoStore:
                 # able to say where an image came from is its own problem.
                 "designator": code,
                 "model": model,
+                "airline": operator or None,
                 "title": result.get("title"),
                 "licence": result.get("license"),
                 "licence_version": result.get("license_version"),
@@ -300,12 +381,22 @@ class PhotoStore:
                 "source_url": result.get("foreign_landing_url") or url,
                 "creator": result.get("creator"),
             })
-            logger.info("photo %s cached from %s (%s, %d bytes)",
-                        code, result.get("source"), result.get("license"), len(data))
+            logger.info("photo %s%s cached from %s (%s, %d bytes)",
+                        code, f" for {operator}" if operator else "",
+                        result.get("source"), result.get("license"), len(data))
             return data
 
         await asyncio.to_thread(_write_miss, miss_path)
-        logger.info("photo %s: no attribution-free photograph found for %r", code, model)
+        # An operator miss is the common case, not a fault: most
+        # airline-and-type pairs have no CC0 photograph, and the generic one
+        # is still served. Logged at a lower level so a busy sky does not
+        # fill the log with something entirely expected.
+        if operator:
+            logger.debug("photo %s for %s: nothing attribution-free, "
+                         "the type photograph stands", code, operator)
+        else:
+            logger.info("photo %s: no attribution-free photograph found for %r",
+                        code, query)
         return None
 
     async def _download_and_crop(self, url: str, width: int) -> bytes | None:
@@ -344,6 +435,7 @@ class PhotoStore:
         return {
             "enabled": self.configured(),
             "hits": self.hits,
+            "operator_hits": self.operator_hits,
             "fetches": self.fetches,
             "misses": self.misses,
             "rejected_candidates": self.rejected,

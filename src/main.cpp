@@ -2069,6 +2069,9 @@ char logoFetchCode[4] = {0};
 // vice versa.
 volatile bool photoFetchPending = false;
 char photoFetchCode[8] = {0};
+// The operator to ask for alongside it, so the aggregator can look for this
+// airline's own aircraft. Empty when the callsign carries no usable prefix.
+char photoFetchAirline[4] = {0};
 constexpr int MAX_PHOTOS_UNAVAILABLE = 24;
 char photoUnavailable[MAX_PHOTOS_UNAVAILABLE][8] = {};
 int photoUnavailableCount = 0;
@@ -2125,7 +2128,11 @@ struct ImageStage {
   uint16_t *pixels = nullptr;
   int width = 0;
   int height = 0;
-  char key[8] = {0};
+  // Wide enough for "B738@EXS": a photograph is cached per type AND, where
+  // one exists, per operator of that type, and the two must not share a
+  // decoded stage or a Jet2 aircraft would show whatever was decoded for
+  // the previous operator of the same type.
+  char key[12] = {0};
 };
 
 ImageStage logoStage;
@@ -2363,12 +2370,24 @@ bool drawCachedOperatorLogo(int x, int y, int size, const char *code) {
 constexpr int PHOTO_WIDTH = 160;  // must be one of the server's allowed widths
 constexpr int PHOTO_HEIGHT = 96;  // the server crops to 5:3
 
-String typePhotoPath(const char *designator) {
-  return (sdMounted ? "/adsb/photo_" : "/photo_") + String(designator) + ".png";
+// A photograph of this type flown by this operator, or of the type alone
+// when the airline is empty. Two entries rather than one: the generic
+// picture stays as the fallback for every other operator of the type, and
+// neither overwrites the other.
+String typePhotoKey(const char *designator, const char *airline) {
+  String key(designator);
+  if (airline && airline[0]) { key += '@'; key += airline; }
+  return key;
 }
 
-String typePhotoMissPath(const char *designator) {
-  return (sdMounted ? "/adsb/photo_" : "/photo_") + String(designator) + ".none";
+String typePhotoPath(const char *designator, const char *airline = nullptr) {
+  return (sdMounted ? "/adsb/photo_" : "/photo_") +
+         typePhotoKey(designator, airline) + ".png";
+}
+
+String typePhotoMissPath(const char *designator, const char *airline = nullptr) {
+  return (sdMounted ? "/adsb/photo_" : "/photo_") +
+         typePhotoKey(designator, airline) + ".none";
 }
 
 // Designators are up to four characters and are used in a filename, so
@@ -2390,16 +2409,52 @@ bool typePhotoCode(const char *designator, char *out) {
 // Whether a photograph could be drawn right now, without decoding one.
 // The board reserves horizontal space for it before laying out its text, so
 // this has to be answerable before the draw.
-bool typePhotoAvailable(const char *designator) {
-  if (!strcmp(photoStage.key, designator)) return true;  // already decoded
+// Which cached photograph is available for this aircraft, if any: this
+// operator's own, or one of the type in somebody else's livery.
+enum class PhotoMatch : uint8_t { None, Operator, Type };
+
+PhotoMatch typePhotoMatch(const char *designator, const char *airline) {
   fs::FS &cache = sdMounted ? static_cast<fs::FS &>(SDCARD) : static_cast<fs::FS &>(LittleFS);
-  return cache.exists(typePhotoPath(designator));
+  if (airline && airline[0]) {
+    const String key = typePhotoKey(designator, airline);
+    if (!strcmp(photoStage.key, key.c_str())) return PhotoMatch::Operator;
+    if (cache.exists(typePhotoPath(designator, airline))) return PhotoMatch::Operator;
+  }
+  if (!strcmp(photoStage.key, designator)) return PhotoMatch::Type;  // already decoded
+  if (cache.exists(typePhotoPath(designator))) return PhotoMatch::Type;
+  return PhotoMatch::None;
 }
 
-bool drawCachedTypePhoto(int left, int top, const char *designator) {
+bool typePhotoAvailable(const char *designator, const char *airline = nullptr) {
+  return typePhotoMatch(designator, airline) != PhotoMatch::None;
+}
+
+// Whether asking the aggregator for THIS operator's aircraft could still
+// change anything. Without this the screensaver would ask on every frame:
+// cacheTypePhoto() would answer "already cached" straight away, that answer
+// sets screensaverNeedsRedraw, the redraw asks again - a loop that never
+// touches the network but never stops either.
+//
+// One request per operator and type is enough. The miss marker written when
+// the aggregator answers with the type photograph instead is what makes this
+// false from then on.
+bool operatorPhotoWorthAsking(const char *designator, const char *airline) {
+  if (!airline || !airline[0]) return false;
+  fs::FS &cache = sdMounted ? static_cast<fs::FS &>(SDCARD) : static_cast<fs::FS &>(LittleFS);
+  if (cache.exists(typePhotoPath(designator, airline))) return false;  // already have it
+  return !missMarkerIsCurrent(cache, typePhotoMissPath(designator, airline));
+}
+
+bool drawCachedTypePhoto(int left, int top, const char *designator,
+                         PhotoMatch match, const char *airline) {
   if (!framebuffer || !ensureStage(photoStage, PHOTO_WIDTH, PHOTO_HEIGHT)) return false;
-  if (strcmp(photoStage.key, designator) &&
-      !decodeCachedImage(photoStage, typePhotoPath(designator), designator)) return false;
+  const bool operators = match == PhotoMatch::Operator;
+  const String key = operators ? typePhotoKey(designator, airline) : String(designator);
+  if (strcmp(photoStage.key, key.c_str()) &&
+      !decodeCachedImage(photoStage,
+                         operators ? typePhotoPath(designator, airline)
+                                   : typePhotoPath(designator),
+                         key.c_str())) return false;
   blitStage(photoStage, left, top);
   return true;
 }
@@ -2590,12 +2645,29 @@ constexpr char PHOTO_ENDPOINT[] = "https://adsb.2e0lxy.uk/aircraft-photo/";
 
 // Same guards as the logo, for the same reason: the handshake competes for
 // contiguous internal RAM, which is the scarce resource on this board.
-LogoFetch cacheTypePhoto(const char *designator) {
+LogoFetch cacheTypePhoto(const char *designator, const char *airline = nullptr) {
   fs::FS &cache = sdMounted ? static_cast<fs::FS &>(SDCARD) : static_cast<fs::FS &>(LittleFS);
+  // The operator is only a hint to the aggregator: it looks for that
+  // airline's own aircraft first and falls back to any of the type, and the
+  // X-Photo-Match header on the reply says which it sent. So the local
+  // filename cannot be decided until the answer arrives - asking for Jet2
+  // and caching a Ryanair aeroplane under "B738@EXS" would make the very
+  // mistake this is fixing permanent on the card.
+  const bool wantOperator = airline && airline[0];
+  const String operatorPath = wantOperator ? typePhotoPath(designator, airline) : String();
+  const String operatorMissPath =
+      wantOperator ? typePhotoMissPath(designator, airline) : String();
   const String path = typePhotoPath(designator);
   const String missPath = typePhotoMissPath(designator);
+  if (wantOperator && cache.exists(operatorPath)) return LogoFetch::Cached;
+  // A type with no photograph at all is the end of it. An operator with
+  // none is not: the generic picture is still worth having, so that marker
+  // only suppresses re-asking for the operator's own.
   if (missMarkerIsCurrent(cache, missPath)) return LogoFetch::Unavailable;
-  if (cache.exists(path)) return LogoFetch::Cached;
+  const bool operatorKnownEmpty =
+      wantOperator && missMarkerIsCurrent(cache, operatorMissPath);
+  if (cache.exists(path) && (!wantOperator || operatorKnownEmpty))
+    return LogoFetch::Cached;
   if (WiFi.status() != WL_CONNECTED) return LogoFetch::Retry;
   if (tileCacheFreeBytes() < MIN_TILE_CACHE_FREE_BYTES) return LogoFetch::Retry;
   const size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
@@ -2609,13 +2681,15 @@ LogoFetch cacheTypePhoto(const char *designator) {
   applyTlsPolicy(client);
   HTTPClient http;
   http.setTimeout(15000); http.setConnectTimeout(15000);
-  const String url = String(PHOTO_ENDPOINT) + designator + ".png?size=" + String(PHOTO_WIDTH);
+  String url = String(PHOTO_ENDPOINT) + designator + ".png?size=" + String(PHOTO_WIDTH);
+  if (wantOperator && !operatorKnownEmpty) { url += "&airline="; url += airline; }
   if (!http.begin(client, url)) return LogoFetch::Retry;
   http.addHeader("User-Agent", userAgent());
-  // Needed before GET() or the header is discarded. It is the only thing
-  // that tells the two 503s apart - see the note where they are handled.
-  static const char *PHOTO_HEADERS[] = {"Retry-After"};
-  http.collectHeaders(PHOTO_HEADERS, 1);
+  // Needed before GET() or the headers are discarded. Retry-After is the
+  // only thing that tells the two 503s apart, and X-Photo-Match the only
+  // thing that says whose aircraft arrived.
+  static const char *PHOTO_HEADERS[] = {"Retry-After", "X-Photo-Match"};
+  http.collectHeaders(PHOTO_HEADERS, 2);
   const int status = http.GET();
   if (status == HTTP_CODE_NOT_FOUND) {
     // A real answer: no attribution-free photograph exists for this type.
@@ -2656,16 +2730,28 @@ LogoFetch cacheTypePhoto(const char *designator) {
     return LogoFetch::Retry;
   }
   const int expected = http.getSize();
-  File file = cache.open(path, FILE_WRITE);
+  // Whose aircraft this is decides where it is stored. Anything other than
+  // an explicit "airline" is treated as the type photograph, so an older
+  // aggregator that does not send the header at all still works and simply
+  // never produces an operator match.
+  const bool gotOperator = wantOperator && http.header("X-Photo-Match") == "airline";
+  const String target = gotOperator ? operatorPath : path;
+  File file = cache.open(target, FILE_WRITE);
   const int written = file ? http.writeToStream(&file) : -1;
   if (file) file.close();
   http.end();
   if (written <= 0 || (expected > 0 && written != expected)) {
     Serial.printf("Photo %s write failed: %d of %d bytes\n", designator, written, expected);
-    cache.remove(path);
+    cache.remove(target);
     return LogoFetch::Retry;
   }
-  Serial.printf("Photo %s cached (%d bytes)\n", designator, written);
+  // Asked for an operator and got the type back: the aggregator has no
+  // photograph of that airline's aircraft. Remember it, or every screensaver
+  // rotation asks again for something that will not change, and the generic
+  // photograph now on the card would never be recognised as the answer.
+  if (wantOperator && !gotOperator) writeMissMarker(cache, operatorMissPath);
+  Serial.printf("Photo %s cached (%d bytes)%s\n", designator, written,
+                gotOperator ? " - this operator's own aircraft" : "");
   return LogoFetch::Cached;
 }
 
@@ -4445,15 +4531,43 @@ void renderScreensaverPage() {
   // reserving 160 px there leaves 116, and "BRS-FAO" needs 126.
   const int widestScale = W >= 800 ? 5 : 3;  // routeScale, declared below
   const bool roomForPhoto = photoLeft - 8 - textX >= 8 * 6 * widestScale;
-  const bool showPhoto = hasDesignator && roomForPhoto && typePhotoAvailable(designator);
-  if (showPhoto) drawCachedTypePhoto(photoLeft, tileY, designator);
-  else if (hasDesignator && roomForPhoto && !photoFetchPending &&
-           !photoKnownUnavailable(designator)) {
+  // The operator, so the aggregator can look for this airline's own
+  // aircraft rather than any of the type. Without it a Jet2 737-800 is
+  // shown whichever 737-800 the search found first, which was a Ryanair
+  // one - the right aeroplane in the wrong livery, next to the name of the
+  // airline it is not.
+  char photoAirline[4] = {0};
+  if (!operatorLogoCode(a.flight, photoAirline)) photoAirline[0] = 0;
+  const PhotoMatch photoMatch =
+      hasDesignator ? typePhotoMatch(designator, photoAirline) : PhotoMatch::None;
+  const bool showPhoto = hasDesignator && roomForPhoto && photoMatch != PhotoMatch::None;
+  if (showPhoto)
+    drawCachedTypePhoto(photoLeft, tileY, designator, photoMatch, photoAirline);
+  // Asked for when there is nothing to show, and once more when all there
+  // is to show is somebody else's livery and this operator's own has not
+  // been ruled out yet.
+  const bool wantAnyPhoto = photoMatch == PhotoMatch::None;
+  const bool wantBetterPhoto = photoMatch == PhotoMatch::Type &&
+                               operatorPhotoWorthAsking(designator, photoAirline);
+  if (hasDesignator && roomForPhoto && !photoFetchPending &&
+      (wantAnyPhoto || wantBetterPhoto) &&
+      !photoKnownUnavailable(designator)) {
     // Asked for here because this is the only place that knows a type is
     // being shown to someone, so the device only fetches photographs it is
     // about to display.
     memcpy(photoFetchCode, designator, sizeof(designator));
+    memcpy(photoFetchAirline, photoAirline, sizeof(photoAirline));
     photoFetchPending = true;
+  }
+  // A photograph of the type in somebody else's colours is worth showing -
+  // it is the right aeroplane - but not worth passing off as this flight.
+  // The caption goes inside the picture's own bottom edge so it cannot
+  // collide with the telemetry rows laid out below.
+  if (showPhoto && photoMatch == PhotoMatch::Type) {
+    const int bandHeight = 10;
+    const int bandTop = tileY + PHOTO_HEIGHT - bandHeight;
+    filledRect(photoLeft, bandTop, PHOTO_WIDTH, bandHeight, rgb(0, 0, 0));
+    text5(photoLeft + 3, bandTop + 2, "LIVERY MAY DIFFER", rgb(190, 205, 218));
   }
   const int identityRight = showPhoto ? photoLeft - 8 : W - 6;
 
@@ -6883,8 +6997,13 @@ void networkTask(void *) {
     // more identifying picture.
     if (photoFetchPending && !logoFetchPending) {
       char code[8];
-      { MutexGuard guard(dataMutex); memcpy(code, photoFetchCode, sizeof(code)); }
-      const LogoFetch outcome = cacheTypePhoto(code);
+      char airline[4];
+      {
+        MutexGuard guard(dataMutex);
+        memcpy(code, photoFetchCode, sizeof(code));
+        memcpy(airline, photoFetchAirline, sizeof(airline));
+      }
+      const LogoFetch outcome = cacheTypePhoto(code, airline);
       MutexGuard guard(dataMutex);
       if (outcome == LogoFetch::Cached) screensaverNeedsRedraw = true;
       else if (outcome == LogoFetch::Unavailable) rememberPhotoUnavailable(code);

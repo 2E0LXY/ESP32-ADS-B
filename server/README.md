@@ -285,6 +285,18 @@ are queued and never block a device request: an unresolved callsign simply
 comes back without a route and picks one up on a later poll. See
 `app/routes.py`.
 
+Aircraft photographs are looked up per type, and per operator of that type
+where one exists. One photograph per type meant a Jet2 737-800 and a Ryanair
+737-800 shared a picture, so a Jet2 flight was shown a Ryanair aeroplane -
+the right aircraft in the wrong livery, beside the name of the airline it is
+not. A receiver can pass `?airline=<ICAO>` and the aggregator searches for
+that airline's own aircraft first, requiring the airline to be named in the
+photograph's title, and falls back to the generic one. `X-Photo-Match` on
+the response says which was served, so the panel labels a stand-in livery
+rather than presenting it as the flight. Most airline-and-type pairs have no
+attribution-free photograph; that answer is cached so the search is not
+repeated.
+
 Schedules follow the same pattern as routes: `app/schedules.py` queues an
 AirLabs lookup and attaches the answer as `sched` on a later poll, so a
 device never waits on it. The firmware does not display these fields yet -

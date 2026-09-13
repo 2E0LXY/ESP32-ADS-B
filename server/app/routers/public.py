@@ -688,7 +688,19 @@ async def _logo_response(request: Request, code: str, size: int) -> Response:
 
 
 @router.get("/aircraft-photo/{designator}.png")
-async def aircraft_photo(designator: str, request: Request, size: int = PHOTO_DEFAULT_WIDTH):
+async def aircraft_photo(designator: str, request: Request, size: int = PHOTO_DEFAULT_WIDTH,
+                         airline: str | None = None):
+    """A photograph of this type, of this operator's aircraft where possible.
+
+    The optional airline is the operator's ICAO code, which is what a
+    receiver already has for the logo. Its trading name comes from the
+    reference lists here, the same division of labour as the type name: the
+    device does not carry 450 KB of tables to know that EXS is Jet2.
+
+    X-Photo-Match on the response says whether the picture is of this
+    operator ("airline") or just of the type ("type"), so a receiver can
+    label a stand-in livery instead of presenting it as this aircraft.
+    """
     code = designator.strip().upper()
     store = request.app.state.photos
     if not store.configured():
@@ -697,12 +709,19 @@ async def aircraft_photo(designator: str, request: Request, size: int = PHOTO_DE
         # same reasoning on the logo endpoint.
         return Response(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                         headers={"Retry-After": "3600"})
-    type_info = _reference(request).aircraft_type(code)
+    reference = _reference(request)
+    type_info = reference.aircraft_type(code)
     if not type_info or not type_info.get("name"):
         return Response(status_code=status.HTTP_404_NOT_FOUND, headers=LOGO_CACHE_HEADERS)
-    data, state = await store.resolve(code, type_info["name"], size)
+    operator = (airline or "").strip().upper()
+    airline_record = reference.airlines.get(operator) if operator else None
+    data, state, match = await store.resolve(
+        code, type_info["name"], size, operator,
+        (airline_record or {}).get("name"))
     if state == "ready":
-        return Response(content=data, media_type="image/png", headers=LOGO_CACHE_HEADERS)
+        headers = dict(LOGO_CACHE_HEADERS)
+        headers["X-Photo-Match"] = match
+        return Response(content=data, media_type="image/png", headers=headers)
     if state == "pending":
         # Queued, not absent. This used to be a 404 like a genuine miss, and
         # the firmware treats a 404 as final - it writes a marker file and
