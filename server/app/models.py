@@ -112,6 +112,22 @@ class Device(Base):
             return (self.inferred_lat, self.inferred_lon, 50.0)
         return None
 
+    def independent_location(self) -> tuple[float, float] | None:
+        """Position we know without asking this device's own feed.
+
+        Only what the receiver reports on its API polls, or what the owner
+        typed in the dashboard. Deliberately excludes the position inferred
+        from its feed (see app/site_estimate.py), because the plausibility
+        checks in app/feed_guard.py use this to decide whether that feed is
+        believable - and a garbage feed would otherwise move the estimate
+        until the garbage looked fine.
+        """
+        if self.reported_lat is not None and self.reported_lon is not None:
+            return (self.reported_lat, self.reported_lon)
+        if self.manual_lat is not None and self.manual_lon is not None:
+            return (self.manual_lat, self.manual_lon)
+        return None
+
     def location_source(self) -> str:
         if self.reported_lat is not None and self.reported_lon is not None:
             return "reported by the receiver"
@@ -198,10 +214,29 @@ class AuditLog(Base):
     detail = Column(Text, nullable=True)
 
 
+class Setting(Base):
+    """An operator-editable setting, overriding the environment default.
+
+    Only settings that can take effect while the service runs live here -
+    see app/runtime_settings.py for why the worker count and REDIS_URL
+    deliberately do not."""
+
+    __tablename__ = "settings"
+
+    key = Column(String(64), primary_key=True)
+    value = Column(String(255), nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+    updated_by = Column(String(255), nullable=True)
+
+
 class UsageLog(Base):
     """One row per /v1/aircraft request, for quotas, abuse detection, and
-    per-device activity in the admin panel. Pruned periodically - see
-    prune_usage_log() - so this table doesn't grow without bound."""
+    per-device activity in the admin panel.
+
+    Pruned periodically by app/retention.py, which keeps
+    USAGE_LOG_RETENTION_DAYS of history plus each device's most recent row.
+    Without that this table grows by 2,880 rows per device per day and
+    never shrinks."""
 
     __tablename__ = "usage_log"
 

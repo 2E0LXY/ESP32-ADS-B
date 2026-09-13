@@ -1,0 +1,98 @@
+ICAO,IATA,Airline Name,Callsign,Country,Status
+AAL,AA,American Airlines,AMERICAN,United States,Active
+AAR,OZ,Asiana Airlines,ASIANA,South Korea,Active
+ABR,AG,ASL Airlines Ireland,CONTRACT,Ireland,Active
+ABW,RU,AirBridgeCargo,AIRBRIDGE CARGO,Russia,Active
+ACA,AC,Air Canada,AIR CANADA,Canada,Active
+ACI,SB,Aircalin,AIRCALIN,New Caledonia,Active
+AEA,UX,Air Europa,EUROPA,Spain,Active
+AFL,SU,Aeroflot,AEROFLOT,Russia,Active
+AFR,AF,Air France,AIRFRANS,France,Active
+AHY,J2,Azerbaijan Airlines,AZAL,Azerbaijan,Active
+AIC,AI,Air India,AIRINDIA,India,Active
+ALK,UL,SriLankan Airlines,SRILANKAN,Sri Lanka,Active
+AMX,AM,Aeroméxico,AEROMEXICO,Mexico,Active
+ANA,NH,All Nippon Airways,ALL NIPPON,Japan,Active
+ANZ,NZ,Air New Zealand,NEW ZEALAND,New Zealand,Active
+APG,2P,PAL Express / Air Philippines,AIRPHIL,Philippines,Active
+ASA,AS,Alaska Airlines,ALASKA,United States,Active
+AUA,OS,Austrian Airlines,AUSTRIAN,Austria,Active
+AVA,AV,Avianca,AVIANCA,Colombia,Active
+AXM,AK,AirAsia,ASIAN EXPRESS,Malaysia,Active
+BAW,BA,British Airways,SPEEDBIRD,United Kingdom,Active
+BCH,W2,FlexFlight,FLEXFLIGHT,Denmark,Active
+BED,E7,FlyErbil,FLY ERBIL,Iraq,Active
+BER,AB,Air Berlin,AIR BERLIN,Germany,Defunct
+BHA,U4,Buddha Air,BUDDHA AIR,Nepal,Active
+BKP,PG,Bangkok Airways,BANGKOK AIR,Thailand,Active
+BLX,6B,TUI fly Nordic,BLUESCAN,Sweden,Active
+BMA,BD,BMI British Midland,MIDLAND,United Kingdom,Defunct
+BNX,N2,Bonza,BONZA,Australia,Defunct
+BOT,BP,Air Botswana,BOTSWANA,Botswana,Active
+BPA,BV,Blue Panorama Airlines,BLUE PANORAMA,Italy,Defunct
+BTI,BT,airBaltic,AIRBALTIC,Latvia,Active
+BTT,4B,Boutique Air,BOUTIQUE,United States,Active
+CAL,CI,China Airlines,DYNASTY,Taiwan,Active
+CAI,XC,Corendon Airlines,CORENDON,Turkey,Active
+CCA,CA,Air China,AIR CHINA,China,Active
+CES,MU,China Eastern Airlines,CHINA EASTERN,China,Active
+CFG,DE,Condor,CONDOR,Germany,Active
+CLH,CL,Lufthansa CityLine,CITYLINE,Germany,Active
+CPA,CX,Cathay Pacific,CATHAY,Hong Kong,Active
+CSA,OK,Czech Airlines,CSA-LINES,Czech Republic,Active
+CSN,CZ,China Southern Airlines,CHINA SOUTHERN,China,Active
+CTN,OU,Croatia Airlines,CROATIA,Croatia,Active
+DAL,DL,Delta Air Lines,DELTA,United States,Active
+DLH,LH,Lufthansa,LUFTHANSA,Germany,Active
+EIN,EI,Aer Lingus,SHAMROCK,Ireland,Active
+EJU,EC,easyJet Europe,ALPINE,Austria,Active
+ETD,EY,Etihad Airways,ETIHAD,United Arab Emirates,Active
+ETH,ET,Ethiopian Airlines,ETHIOPIAN,Ethiopia,Active
+EWG,EW,Eurowings,EUROWINGS,Germany,Active
+EZY,U2,easyJet UK,EASY,United Kingdom,Active
+EZS,DS,easyJet Switzerland,TOPJET,Switzerland,Active
+FDX,FX,FedEx Express,FEDEX,United States,Active
+FIN,AY,Finnair,FINNAIR,Finland,Active
+FJI,FJ,Fiji Airways,FIJI,Fiji,Active
+GIA,GA,Garuda Indonesia,INDONESIA,Indonesia,Active
+GFA,GF,Gulf Air,GULF AIR,Bahrain,Active
+HAL,HA,Hawaiian Airlines,HAWAIIAN,United States,Active
+IBE,IB,Iberia,IBERIA,Spain,Active
+ICE,FI,Icelandair,ICEAIR,Iceland,Active
+IGO,6E,IndiGo,IFLY,India,Active
+JAL,JL,Japan Airlines,JAPANAIR,Japan,Active
+JBU,B6,JetBlue Airways,JETBLUE,United States,Active
+JZA,QK,Jazz Aviation,JAZZ,Canada,Active
+KAL,KE,Korean Air,KOREANAIR,South Korea,Active
+KLM,KL,KLM Royal Dutch Airlines,KLM,Netherlands,Active
+KQA,KQ,Kenya Airways,KENYA,Kenya,Active
+LDA,LW,Lauda Europe,LAUDA MOTION,Malta,Active
+LOT,LO,LOT Polish Airlines,POLLOT,Poland,Active
+MAY,MW,Malta Air,BLUE MED,Malta,Active
+MAS,MH,Malaysia Airlines,MALAYSIAN,Malaysia,Active
+MSR,MS,EgyptAir,EGYPTAIR,Egypt,Active
+OAL,OA,Olympic Air,OLYMPIC,Greece,Active
+OMA,WY,Oman Air,OMAN AIR,Oman,Active
+PIA,PK,Pakistan International Airlines,PAKISTAN,Pakistan,Active
+QFA,QF,Qantas,QANTAS,Australia,Active
+QTR,QR,Qatar Airways,QATARI,Qatar,Active
+RAM,AT,Royal Air Maroc,ROYALAIR MOC,Morocco,Active
+RCH,---,USAF Air Mobility Command,REACH,United States,Military
+RJA,RJ,Royal Jordanian,JORDANIAN,Jordan,Active
+RRR,---,Royal Air Force,ASCOT,United Kingdom,Military
+RSN,RR,Buzz / Ryanair Sun,MAGIC SUN,Poland,Active
+RUK,RK,Ryanair UK,BLUE MAX,United Kingdom,Active
+RYR,FR,Ryanair DAC,RYANAIR,Ireland,Active
+SAS,SK,Scandinavian Airlines (SAS),SCANDINAVIAN,Multi-National,Active
+SIA,SQ,Singapore Airlines,SINGAPORE,Singapore,Active
+SWA,WN,Southwest Airlines,SOUTHWEST,United States,Active
+SWR,LX,Swiss International Air Lines,SWISS,Switzerland,Active
+TAP,TP,TAP Air Portugal,AIR PORTUGAL,Portugal,Active
+THY,TK,Turkish Airlines,TURKISH,Turkey,Active
+UAE,EK,Emirates,EMIRATES,United Arab Emirates,Active
+UAL,UA,United Airlines,UNITED,United States,Active
+UPS,5X,UPS Airlines,UPS,United States,Active
+VIR,VS,Virgin Atlantic,VIRGIN,United Kingdom,Active
+VOZ,VA,Virgin Australia,VIRGIN,Australia,Active
+VLG,VY,Vueling,VUELING,Spain,Active
+WZZ,W6,Wizz Air,WIZZAIR,Hungary,Active

@@ -1,0 +1,11 @@
+# Test-only dependencies. Not installed in the container image.
+-r requirements.txt
+pytest
+pytest-asyncio
+# The Redis-backed cache and the single-instance lease are tested against an
+# in-process Redis rather than a real server, so the suite needs nothing
+# running. lupa is what lets fakeredis execute the Lua scripts both of them
+# rely on for their atomic read-compare-write; without it those tests skip
+# and the parity they assert goes unchecked.
+fakeredis
+lupa

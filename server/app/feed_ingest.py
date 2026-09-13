@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 
 from . import models
 from .aggregator import Aggregator
+from .feed_guard import FeedGuard
 from .sbs import StreamDecoder
 from .site_estimate import SiteSampler
 
@@ -46,8 +47,21 @@ class FeedIngestManager:
         self._servers: dict[int, asyncio.base_events.Server] = {}
         # Receiver-position samples, per device, surviving reconnects.
         self._samplers: dict[int, SiteSampler] = {}
+        # Plausibility checks, per device. Also survive reconnects: the
+        # teleport check remembers where each aircraft was last seen, and a
+        # feeder reconnects whenever its link hiccups.
+        self._guards: dict[int, FeedGuard] = {}
 
     async def sync_from_db(self):
+        """Brings the running listeners into line with the database.
+
+        This only ever started listeners. Nothing closed one whose device
+        had stopped being feeder-enabled, so a feed disabled anywhere other
+        than by the request that owns the listener kept being accepted
+        until the service restarted - which matters now that the listeners
+        follow the single-instance lease rather than startup, and that an
+        operator can disable a feed from the admin panel.
+        """
         db = self._session_factory()
         try:
             devices = (
@@ -55,10 +69,15 @@ class FeedIngestManager:
                 .filter(models.Device.feeder_enabled.is_(True), models.Device.feeder_port.isnot(None))
                 .all()
             )
-            for device in devices:
-                await self.start_for_device(device.id, device.feeder_port)
+            wanted = {device.feeder_port: device.id for device in devices}
         finally:
             db.close()
+        # Closed first, so a port reassigned from one device to another is
+        # free by the time the new listener asks for it.
+        for port in [port for port in self._servers if port not in wanted]:
+            await self.stop_for_device(port)
+        for port, device_id in wanted.items():
+            await self.start_for_device(device_id, port)
 
     async def start_for_device(self, device_id: int, port: int):
         if port in self._servers:
@@ -78,6 +97,13 @@ class FeedIngestManager:
             # sighting each time, so on a flaky link it would never reach the
             # twelve airframes it needs and the estimate would never appear.
             sampler = self._samplers.setdefault(device_id, SiteSampler())
+            # Nothing used to check what arrived here. An aircraft at 0,0 at
+            # 900,000 feet, or one teleporting across the Atlantic between
+            # messages, was merged and served to every customer exactly like
+            # a real sighting. See app/feed_guard.py.
+            guard = self._guards.setdefault(device_id, FeedGuard(device_id))
+            guard.max_range_nm = self.aggregator.settings.get("feeder_max_range_nm")
+            await self._in_thread(self._refresh_trusted_centre, guard, device_id)
 
             async def read_loop():
                 while True:
@@ -109,10 +135,19 @@ class FeedIngestManager:
                 while True:
                     await asyncio.sleep(MERGE_INTERVAL_SECONDS)
                     positioned = [s.to_dict() for s in decoder.aircraft.values() if s.has_position()]
+                    if self.aggregator.settings.get("feeder_position_checks"):
+                        # Filter before merging and before sampling: a
+                        # rejected position must not reach the shared cache,
+                        # and must not drag this receiver's own estimated
+                        # location towards wherever it claimed to be.
+                        positioned = guard.filter(positioned)
+                        allowed = {entry["hex"] for entry in positioned}
+                    else:
+                        allowed = None
                     if positioned:
                         await self.aggregator.cache.merge(source, positioned)
                     for state in decoder.aircraft.values():
-                        if state.has_position():
+                        if state.has_position() and (allowed is None or state.hex in allowed):
                             sampler.add(state.hex, state.lat, state.lon, state.alt_baro, state.updated_at)
                     decoder.prune_older_than(300)
                     now = loop.time()
@@ -188,6 +223,25 @@ class FeedIngestManager:
             db.commit()
         finally:
             db.close()
+
+    def _refresh_trusted_centre(self, guard: FeedGuard, device_id: int):
+        """Re-reads the device's independently known position.
+
+        Per connection rather than once at startup: an owner who sets their
+        device's location, or a receiver that starts reporting one, should
+        see the range check start working on the next reconnect rather than
+        after a service restart.
+        """
+        db = self._session_factory()
+        try:
+            device = db.query(models.Device).filter(models.Device.id == device_id).first()
+            guard.set_trusted_centre(device.independent_location() if device else None)
+        finally:
+            db.close()
+
+    def guard_stats(self) -> dict[int, dict]:
+        """Per-device rejection counts, for the admin panel."""
+        return {device_id: guard.stats() for device_id, guard in self._guards.items()}
 
     def _store_site_estimate(self, device_id: int, estimate, samples: int):
         lat, lon, spread = estimate

@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <strings.h>  // strncasecmp, used by the icon type-designator table
+#include <cstdarg>  // logLine() formats its own varargs into the ring buffer
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/semphr.h>
@@ -77,18 +78,27 @@ Arduino_DataBus *bus = new Arduino_SWSPI(
     GFX_NOT_DEFINED);
 #endif
 
-// The pixel clock is settable from the web UI rather than fixed at
-// PANEL_PCLK_HZ, because it is the one lever on the frame roll and the
-// flickering scanlines that can be tested without a rebuild each time. Both
-// faults are the RGB bounce-buffer refill missing its deadline while the CPU
-// saturates the same PSRAM bus; a slower pixel clock asks for fewer bytes per
-// line and gives the refill more slack, at the cost of refresh rate. Which
-// value is enough is an empirical question about this panel and this
-// workload, so it belongs in a dropdown, not a #define.
+// The three panel settings below were a dropdown and two switches in the web
+// UI while the frame roll and the flickering scanlines were being chased:
+// all three are the same fault - the RGB bounce-buffer refill missing its
+// deadline while the CPU saturates the same PSRAM bus - and which values are
+// enough was an empirical question about this panel that needed answering on
+// the hardware rather than in a comment.
 //
-// esp_lcd captures the clock when the panel is initialised, so this is
-// applied at boot and a change reboots the device. The board's own
-// PANEL_PCLK_HZ remains the default and the value NVS is seeded with.
+// It has been answered, so they are no longer adjustable. The combination
+// below is the one that produced a clean picture on the 7 inch panel, and
+// every other combination reachable from that UI was worse in a way a user
+// would have no way to diagnose: the compiled-in defaults alone would give
+// 16 MHz, a 40 line bounce buffer and the shadow-buffer copy, which is the
+// configuration that both rolled the picture AND starved mbedTLS until
+// HTTPS failed outright (largest free internal block 17,960 bytes).
+//
+// Keeping them in NVS instead would be no safer: a stored value survives a
+// reflash, so a device that had once been set to 40 lines would stay there
+// with nothing in the UI left to change it back. Pinned here, every device
+// gets the good configuration on its next flash whatever its history.
+// /api/status still reports all three, so what a panel is actually running
+// can be read without a serial cable.
 uint32_t panelPclkHz = PANEL_PCLK_HZ;
 
 // Selectable values, coarse enough to tell apart on a panel and bounded so a
@@ -125,13 +135,14 @@ uint16_t panelBounceLines = 0;
 // once, which on mostly-static pages is invisible and on a full repaint
 // looks like a fast wipe. Runtime-selectable because that trade has to be
 // judged on the hardware.
-bool panelDirectDraw = false;
-constexpr uint16_t PANEL_BOUNCE_CHOICES[] = {0, 10, 20, 30, 40};
-
-constexpr uint32_t PANEL_PCLK_CHOICES[] = {
-    9000000L, 10000000L, 11000000L, 12000000L, 13000000L,
-    14000000L, 15000000L, 16000000L, 16500000L, 18000000L, 21000000L,
-};
+// Direct draw: every pixel lands in the panel's own framebuffer, so there is
+// no 768 KB copy per frame competing with the display's own DMA reads. This
+// is what stopped the tearing and the flickering lines.
+bool panelDirectDraw = true;
+// Two buffers of this many lines, from internal RAM. 20 is the value that
+// holds the refill deadline while leaving mbedTLS the ~32 KB contiguous it
+// needs for a TLS handshake; the library's own default of 40 does not.
+constexpr uint16_t PANEL_BOUNCE_LINES = 20;
 
 // Constructed in setup() once the stored clock has been read, not at static
 // init - hence pointers assigned later rather than initialisers here.
@@ -177,7 +188,9 @@ extern const uint8_t rootca_crt_bundle_end[] asm("_binary_x509_crt_bundle_end");
 #endif
 
 namespace {
-// boot_asset.h and map_asset.h are generated at 480x480.
+// map_asset.h is a raw RGB565 array generated at 480x480. The boot screen
+// is no longer one of these - it is a PNG decoded at boot, sized per panel,
+// so it carries its own BOOT_IMAGE_W/H from boot_asset.h.
 constexpr int ASSET_W = 480;
 constexpr int ASSET_H = 480;
 constexpr int W = layout::W;
@@ -726,7 +739,26 @@ const char *planeShapeName(PlaneShape shape) {
   return "generic";
 }
 
-PlaneShape shapeForAircraft(const char *typeDesignator, const char *category) {
+// The aggregator resolves the silhouette from real ICAO class and engine
+// data for thousands of designators - far more than the prefix table below
+// can cover - and sends it with the aircraft. Accepted when present, which
+// is why the names here must match planeShapeName() exactly.
+PlaneShape shapeFromName(const char *name) {
+  if (!name || !name[0]) return PlaneShape::Generic;
+  if (!strcmp(name, "light")) return PlaneShape::LightProp;
+  if (!strcmp(name, "twin")) return PlaneShape::Twin;
+  if (!strcmp(name, "airliner")) return PlaneShape::Airliner;
+  if (!strcmp(name, "heavy")) return PlaneShape::HeavyJet;
+  if (!strcmp(name, "fighter")) return PlaneShape::Fighter;
+  if (!strcmp(name, "helicopter")) return PlaneShape::Helicopter;
+  if (!strcmp(name, "glider")) return PlaneShape::Glider;
+  if (!strcmp(name, "balloon")) return PlaneShape::Balloon;
+  if (!strcmp(name, "drone")) return PlaneShape::Drone;
+  if (!strcmp(name, "ground")) return PlaneShape::Ground;
+  return PlaneShape::Generic;
+}
+
+PlaneShape shapeForAircraft(const char *typeDesignator, const char *category, bool onGround) {
   PlaneShape shape = PlaneShape::Generic;
   size_t bestPrefix = 0;
   if (typeDesignator && typeDesignator[0]) {
@@ -740,7 +772,16 @@ PlaneShape shapeForAircraft(const char *typeDesignator, const char *category) {
     }
   }
   if (bestPrefix) return shape;
-  return shapeForCategory(category);
+  shape = shapeForCategory(category);
+  // Nothing in the type table, nothing in the category, but it says it is on
+  // the ground: that is surface traffic, not an aircraft whose class we
+  // happen not to know. Airport ground stations and service vehicles report
+  // exactly this - no type, no category, zero speed, no altitude - and drawing
+  // them as something airborne put aircraft on the taxiways and the tower.
+  // Narrow on purpose: an airliner at the gate is also on the ground, but it
+  // has a type designator and never reaches here.
+  if (shape == PlaneShape::Generic && onGround) return PlaneShape::Ground;
+  return shape;
 }
 
 struct AircraftDisplay {
@@ -768,6 +809,12 @@ struct AircraftDisplay {
   char operatorName[36];
   char country[28];
   char emergency[16];
+  // Sent by the aggregator from the offline ICAO lists: the full model name
+  // rather than the four-character designator, and the radio callsign ATC
+  // actually says. Neither can be derived on the device - the lists are
+  // 450 KB - so they arrive already resolved or not at all.
+  char typeName[40];
+  char telephony[24];
   // Resolved once per fetch rather than per frame - the type table is a
   // linear scan and icons are redrawn several times a second.
   PlaneShape iconShape = PlaneShape::Generic;
@@ -791,6 +838,82 @@ struct VesselDisplay {
 
 uint16_t *framebuffer = nullptr;
 uint16_t *baseMap = nullptr;
+
+// Which part of each row has been written, so a render moves kilobytes
+// instead of megabytes.
+//
+// Every page render was restoreMap() - 768 KB of baseMap copied into the
+// shadow buffer - then drawing, then present() - 768 KB of the shadow copied
+// into the panel's own framebuffer. 1.5 MB per render, on the same PSRAM bus
+// the panel's DMA refills its bounce buffers from. Missing one of those
+// refills is what leaves the scan permanently offset, so the top of the
+// picture appears part-way down the screen, and what tears text into stray
+// lines part-way through a copy.
+//
+// Almost none of those 1.5 MB change between renders: the map underneath is
+// identical and what moves is a few markers and a few lines of text. So each
+// row carries the span of it that has been written, and both copies work
+// from those spans.
+//
+// Two trackers rather than one, because they answer different questions.
+// restoreMap() needs what the last frame drew over the map, which is history
+// present() would have cleared; present() needs what differs from the panel,
+// which includes the pixels restoreMap() has just repainted. One tracker
+// serving both either loses that history or accumulates every span ever
+// drawn until it covers the screen.
+//
+// In PSRAM rather than internal DRAM: 3,840 bytes is more than a tenth of
+// the largest free internal block this board has at runtime (31,732 bytes
+// measured), and the logo decoder already defers below 28 KB of it. They are
+// touched a row at a time while drawing, so the row in hand stays in cache
+// wherever the array lives.
+int16_t *paintedLeft = nullptr;   // inclusive
+int16_t *paintedRight = nullptr;  // exclusive; right <= left means clean
+int16_t *pendingLeft = nullptr;
+int16_t *pendingRight = nullptr;
+// Set whenever the whole panel has to be rewritten: before the first render
+// after boot (the boot screen drew straight to the panel, so the shadow
+// buffer and the panel agree on nothing), and whenever baseMap itself
+// changes under everything.
+bool fullFrameNeeded = true;
+// What the last render actually moved, for /api/status - the numbers to
+// watch when judging whether this is working. Both copies are counted
+// separately because direct-draw mode has no present() copy at all, so
+// presentPixels stays zero there and the restore figure is the only one
+// that means anything.
+uint16_t lastPresentRows = 0;
+uint32_t lastPresentPixels = 0;
+uint16_t lastRestoreRows = 0;
+uint32_t lastRestorePixels = 0;
+
+inline bool spansReady() {
+  return paintedLeft && paintedRight && pendingLeft && pendingRight;
+}
+
+inline void spanReset(int16_t *left, int16_t *right) {
+  for (int y = 0; y < H; ++y) {
+    left[y] = static_cast<int16_t>(W);
+    right[y] = 0;
+  }
+}
+
+// Records that [x0, x1) of row y now differs from both the map and the panel.
+inline void markRow(int y, int x0, int x1) {
+  if (!spansReady() || (unsigned)y >= (unsigned)H) return;
+  if (x0 < 0) x0 = 0;
+  if (x1 > W) x1 = W;
+  if (x1 <= x0) return;
+  if (x0 < paintedLeft[y]) paintedLeft[y] = static_cast<int16_t>(x0);
+  if (x1 > paintedRight[y]) paintedRight[y] = static_cast<int16_t>(x1);
+  if (x0 < pendingLeft[y]) pendingLeft[y] = static_cast<int16_t>(x0);
+  if (x1 > pendingRight[y]) pendingRight[y] = static_cast<int16_t>(x1);
+}
+
+// The map under everything has changed, or the panel holds something the
+// shadow buffer knows nothing about. Either way the next render has to be a
+// whole frame.
+inline void invalidateWholeFrame() { fullFrameNeeded = true; }
+
 // PNGdec's decoder object carries its own line and Huffman buffers and is
 // 44.5 KB. As a plain global it sits in internal DRAM, which is the scarcest
 // memory on this board - the same pool the RGB bounce buffers and every
@@ -911,6 +1034,18 @@ constexpr int TABLE_VISIBLE_ROWS = 10;
 volatile bool bootButtonPending = false;
 WebServer webServer(80);
 Preferences settingsStore;
+
+// Preferences::getString() logs an ERROR line for a key that was never set,
+// which is not an error - an unconfigured API key or an unchanged password
+// is the normal state. The boot log opened with four of them:
+//
+//   [E][Preferences.cpp:506] getString(): nvs_get_str len fail: password NOT_FOUND
+//
+// which reads like something is wrong on a board where nothing is, and
+// buries the lines that matter. Asking first is silent.
+String storedString(const char *key, const char *fallback = "") {
+  return settingsStore.isKey(key) ? settingsStore.getString(key, fallback) : String(fallback);
+}
 String managementPassword;
 String firmwareUploadError;
 bool firmwareUploadStarted = false;
@@ -922,7 +1057,6 @@ String openSkyClientSecret;
 String rapidApiKey;
 String aggregatorApiKey;
 String flyItalyApiKey;
-bool soundAlerts = true;
 // Screensaver: after screensaverIdleMinutes with no touch/button/web-UI
 // interaction, the panel switches to a rotating single-aircraft
 // departure-board style display (renderScreensaverPage()) instead of
@@ -935,8 +1069,11 @@ bool screensaverEnabled = false;
 uint16_t screensaverIdleMinutes = 5;
 bool screensaverActive = false;
 uint32_t lastInteractionAt = 0;
-uint32_t screensaverRotateAt = 0;
-int screensaverAircraftIndex = 0;
+// How often the screensaver reconsiders what it is showing. Slow on purpose:
+// each repaint is a full-screen clear, and the signature check inside
+// renderScreensaverPage() means a tick on an unchanged sky costs nothing.
+constexpr uint32_t SCREENSAVER_REFRESH_MS = 10000UL;
+uint32_t screensaverRefreshAt = 0;
 uint8_t brightnessPercent = 100;
 bool webServerReady = false;
 bool restartPending = false;
@@ -1052,6 +1189,121 @@ String previousWifiSsid;
 String previousWifiPassword;
 uint32_t wifiRollbackAt = 0;
 
+// Saved Wi-Fi networks, most recently connected first.
+//
+// The ESP32 remembers exactly one network, so moving the receiver between
+// two places - a house and a club site, a bench and a shed - meant retyping
+// a password every time even though it had been entered before. These are
+// kept alongside that, as a fallback: the stock autoConnect() path is tried
+// first and unchanged, and this list is only walked when it fails or when a
+// working connection is lost for long enough to look permanent.
+//
+// Stored as one JSON string rather than numbered key pairs so adding,
+// removing and reordering is a single NVS write and cannot leave a
+// half-updated set of slots behind.
+constexpr int MAX_SAVED_NETWORKS = 6;
+constexpr uint32_t WIFI_RETRY_AFTER_MS = 60000UL;   // how long disconnected before walking the list
+constexpr uint32_t WIFI_JOIN_TIMEOUT_MS = 12000UL;  // per network, while walking it
+uint32_t wifiDisconnectedSince = 0;
+
+String savedNetworksJson() {
+  return storedString("wifi-nets", "[]");
+}
+
+// SSIDs only. A password that has been stored is never sent back out, the
+// same rule the provider credentials follow.
+void savedNetworkNames(JsonArray out) {
+  JsonDocument doc;
+  if (deserializeJson(doc, savedNetworksJson()) != DeserializationError::Ok) return;
+  for (JsonObjectConst entry : doc.as<JsonArrayConst>()) {
+    const char *ssid = entry["s"];
+    // String, not the const char*: that pointer is into this function's own
+    // document, which dies on return, and ArduinoJson would have kept the
+    // pointer rather than the text.
+    if (ssid && *ssid) out.add(String(ssid));
+  }
+}
+
+void rememberWifiNetwork(const String &ssid, const String &password) {
+  if (!ssid.length()) return;
+  JsonDocument stored;
+  if (deserializeJson(stored, savedNetworksJson()) != DeserializationError::Ok)
+    stored.to<JsonArray>();
+
+  JsonDocument updated;
+  JsonArray list = updated.to<JsonArray>();
+  // This network goes to the front: the most recently working credentials
+  // are the ones worth trying first next time.
+  JsonObject first = list.add<JsonObject>();
+  first["s"] = ssid;
+  first["p"] = password;
+  for (JsonObjectConst entry : stored.as<JsonArrayConst>()) {
+    if (list.size() >= MAX_SAVED_NETWORKS) break;
+    const char *existing = entry["s"];
+    if (!existing || !*existing || ssid == existing) continue;  // no duplicates
+    JsonObject copy = list.add<JsonObject>();
+    copy["s"] = existing;
+    copy["p"] = entry["p"] | "";
+  }
+  String payload;
+  serializeJson(list, payload);
+  settingsStore.putString("wifi-nets", payload);
+}
+
+bool forgetWifiNetwork(const String &ssid) {
+  JsonDocument stored;
+  if (deserializeJson(stored, savedNetworksJson()) != DeserializationError::Ok) return false;
+  JsonDocument updated;
+  JsonArray list = updated.to<JsonArray>();
+  bool removed = false;
+  for (JsonObjectConst entry : stored.as<JsonArrayConst>()) {
+    const char *existing = entry["s"];
+    if (!existing || !*existing) continue;
+    if (ssid == existing) { removed = true; continue; }
+    JsonObject copy = list.add<JsonObject>();
+    copy["s"] = existing;
+    copy["p"] = entry["p"] | "";
+  }
+  if (!removed) return false;
+  String payload;
+  serializeJson(list, payload);
+  settingsStore.putString("wifi-nets", payload);
+  return true;
+}
+
+// Tries each saved network in turn. Blocking, by design: it only ever runs
+// when there is no connection, so there is nothing else for this core to
+// usefully do, and a non-blocking state machine here would be a lot of
+// machinery for a path taken once per outage.
+bool connectSavedWifiNetwork() {
+  JsonDocument doc;
+  if (deserializeJson(doc, savedNetworksJson()) != DeserializationError::Ok) return false;
+  for (JsonObjectConst entry : doc.as<JsonArrayConst>()) {
+    // The station can come back on its own part way through - the router
+    // rebooted, the link recovered. Stop rather than spend the rest of the
+    // list tearing down a connection that just succeeded. This also bounds
+    // the common case well below the whole list's worth of timeouts, which
+    // matters because this task also services the web server.
+    if (WiFi.status() == WL_CONNECTED) return true;
+    const char *ssid = entry["s"];
+    if (!ssid || !*ssid) continue;
+    const char *password = entry["p"] | "";
+    Serial.printf("Wi-Fi: trying saved network %s\n", ssid);
+    WiFi.begin(ssid, password);
+    const uint32_t deadline = millis() + WIFI_JOIN_TIMEOUT_MS;
+    while (static_cast<int32_t>(millis() - deadline) < 0) {
+      if (WiFi.status() == WL_CONNECTED) {
+        Serial.printf("Wi-Fi: connected to saved network %s\n", ssid);
+        // Re-save so a network that actually works moves to the front.
+        rememberWifiNetwork(ssid, password);
+        return true;
+      }
+      delay(250);
+    }
+  }
+  return false;
+}
+
 // Certificate validation for every outbound HTTPS request. The OTA image is
 // separately RSA-signed, but the RapidAPI key and the OpenSky client secret
 // were previously sent over an unauthenticated channel. Build with
@@ -1074,10 +1326,77 @@ void applyTlsPolicy(WiFiClientSecure &client) {
 // shrinking cycle over cycle (a leak somewhere) or is already pinned at a
 // low ceiling from the very first cycle (something else holding it, e.g.
 // the web server's own connections or WiFiManager's leftover state).
+// The last few diagnostic lines, readable from a browser.
+//
+// This board already prints the one line that identifies a stall - the
+// "fetch blocked" line that names which phase of a fetch ate the time -
+// but only over USB. A receiver on a shelf with a frozen panel and an
+// unresponsive web UI is exactly the one nobody has a serial cable plugged
+// into, and power-cycling it to attach one throws the evidence away.
+//
+// So the lines that matter also go into a ring buffer in PSRAM and out of
+// /api/log as plain text. Deliberately not everything Serial prints:
+// hooking that would mean rewriting every call site, and most of them are
+// routine. logLine() marks the ones worth keeping.
+constexpr int LOG_RING_LINES = 60;
+constexpr int LOG_RING_WIDTH = 192;
+// The message is formatted into this before the uptime prefix is added, and
+// is deliberately smaller than the slot so the prefix can never push the
+// tail of a line off the end. The longest line kept here - the slow-fetch
+// breakdown, which is the whole reason this exists - runs to about 135
+// characters. 24 is what the prefix can reach at its widest - millis()
+// runs to ten digits before it wraps, so "[4294967.295s] " is the worst
+// case, not the five-digit field the format string suggests.
+constexpr int LOG_LINE_MAX = LOG_RING_WIDTH - 24;
+char *logRing = nullptr;
+uint16_t logRingNext = 0;
+uint16_t logRingHeld = 0;
+uint32_t logRingDropped = 0;
+
+void initLogRing() {
+  logRing = static_cast<char *>(heap_caps_calloc(
+      LOG_RING_LINES, LOG_RING_WIDTH, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  // No internal-RAM fallback: 9.6 KB of the scarcest memory on the board,
+  // for a convenience, is the wrong trade. Without it the lines still go to
+  // Serial and /api/log says so.
+}
+
+// Prints to Serial as before, and keeps a copy.
+void logLine(const char *format, ...) {
+  char line[LOG_LINE_MAX];
+  va_list args;
+  va_start(args, format);
+  const int written = vsnprintf(line, sizeof(line), format, args);
+  va_end(args);
+  if (written < 0) return;
+  Serial.println(line);
+  if (!logRing) {
+    ++logRingDropped;
+    return;
+  }
+  // Timestamped by uptime rather than wall clock: this board only learns the
+  // time from the aircraft feed, which is the thing most likely to be broken
+  // when somebody is reading this.
+  const uint32_t seconds = millis() / 1000;
+  char *slot = logRing + static_cast<size_t>(logRingNext) * LOG_RING_WIDTH;
+  snprintf(slot, LOG_RING_WIDTH, "[%5lu.%03lus] %s",
+           static_cast<unsigned long>(seconds),
+           static_cast<unsigned long>(millis() % 1000), line);
+  logRingNext = (logRingNext + 1) % LOG_RING_LINES;
+  if (logRingHeld < LOG_RING_LINES) ++logRingHeld;
+}
+
 void logHeapDiagnostics(const char *tag) {
-  Serial.printf("heap[%s]: free=%u largestInternal=%u\n", tag,
-                static_cast<unsigned>(ESP.getFreeHeap()),
-                static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)));
+  const size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  // Only the tight ones are worth a ring slot; at 32 KB a TLS handshake is
+  // already failing, which is what turns a fetch into a two-minute stall.
+  if (largest < 40000) {
+    logLine("heap[%s]: free=%u largestInternal=%u - TLS needs about 32 KB contiguous",
+            tag, static_cast<unsigned>(ESP.getFreeHeap()), static_cast<unsigned>(largest));
+  } else {
+    Serial.printf("heap[%s]: free=%u largestInternal=%u\n", tag,
+                  static_cast<unsigned>(ESP.getFreeHeap()), static_cast<unsigned>(largest));
+  }
 }
 
 // Where a fetch cycle's wall-clock time actually goes. The networkTask
@@ -1103,9 +1422,12 @@ struct FetchPhaseTimings {
 };
 FetchPhaseTimings fetchPhases;
 
-// Anything past this and the breakdown is worth the serial bandwidth. A
-// healthy cycle on a working feed completes in well under a second.
-constexpr uint32_t FETCH_PHASE_REPORT_MS = 5000;
+// Anything past this and the breakdown is worth the bandwidth. It was
+// 5,000 ms, which a healthy cycle never reaches - so the one thing that
+// would have explained a 1.5-second cycle never printed. A working feed on
+// this board blocks for about 1.4 s, nearly all of it outside the body
+// read, and that is worth knowing about rather than hiding.
+constexpr uint32_t FETCH_PHASE_REPORT_MS = 900;
 
 // One User-Agent for every outbound request, always matching the running
 // build. OpenStreetMap's tile policy requires an identifying, accurate UA.
@@ -1228,8 +1550,8 @@ bool mountSdCard() {
   sdUsedBytes = SDCARD.usedBytes();
   // Restore the staging metadata so a firmware staged before a reboot can
   // still be validated and installed; discard the file if it cannot be.
-  stagedUpdateVersion = settingsStore.getString("staged-ver", "");
-  stagedUpdateSha256 = settingsStore.getString("staged-sha", "");
+  stagedUpdateVersion = storedString("staged-ver", "");
+  stagedUpdateSha256 = storedString("staged-sha", "");
   stagedUpdateSize = settingsStore.getULong("staged-size", 0);
   stagedUpdateReady = SDCARD.exists(SD_UPDATE_FILE);
   if (stagedUpdateReady && (!stagedUpdateSize || stagedUpdateSha256.length() != 64)) {
@@ -1496,7 +1818,10 @@ uint16_t rgb(uint8_t r, uint8_t g, uint8_t b) {
 }
 
 void pixel(int x, int y, uint16_t c) {
-  if ((unsigned)x < W && (unsigned)y < H) framebuffer[y * W + x] = c;
+  if ((unsigned)x < W && (unsigned)y < H) {
+    framebuffer[y * W + x] = c;
+    markRow(y, x, x + 1);
+  }
 }
 
 void line(int x0, int y0, int x1, int y1, uint16_t c) {
@@ -1609,13 +1934,49 @@ void text5(int x, int y, const char *s, uint16_t c, int scale=1) {
 }
 
 void restoreMap() {
-  if (physicalMapReady && baseMap) memcpy(framebuffer, baseMap, W * H * sizeof(uint16_t));
+  const bool haveMap = physicalMapReady && baseMap;
+  if (haveMap && spansReady() && !fullFrameNeeded) {
+    // Only the spans the last frame drew over the map need putting back.
+    uint16_t rows = 0;
+    uint32_t pixels = 0;
+    for (int y = 0; y < H; ++y) {
+      const int x0 = paintedLeft[y];
+      const int x1 = paintedRight[y];
+      if (x1 <= x0) continue;
+      memcpy(framebuffer + y * W + x0, baseMap + y * W + x0,
+             static_cast<size_t>(x1 - x0) * sizeof(uint16_t));
+      // Repainted pixels differ from what the panel is showing, so they
+      // still have to be pushed even though nothing has drawn on them yet.
+      if (x0 < pendingLeft[y]) pendingLeft[y] = static_cast<int16_t>(x0);
+      if (x1 > pendingRight[y]) pendingRight[y] = static_cast<int16_t>(x1);
+      paintedLeft[y] = static_cast<int16_t>(W);
+      paintedRight[y] = 0;
+      ++rows;
+      pixels += static_cast<uint32_t>(x1 - x0);
+    }
+    lastRestoreRows = rows;
+    lastRestorePixels = pixels;
+    return;
+  }
+  if (haveMap) memcpy(framebuffer, baseMap, W * H * sizeof(uint16_t));
   else if (W == ASSET_W && H == ASSET_H)
     memcpy_P(framebuffer, MAP_IMAGE, W * H * sizeof(uint16_t));
   else
     // The baked map is 480x480 and does not fit this panel. Clear instead of
     // overrunning the array; OSM tiles replace it once cached anyway.
     memset(framebuffer, 0, W * H * sizeof(uint16_t));
+  if (spansReady()) {
+    // The whole frame was just rewritten: nothing is drawn over the map yet,
+    // and every row has to reach the panel.
+    spanReset(paintedLeft, paintedRight);
+    for (int y = 0; y < H; ++y) {
+      pendingLeft[y] = 0;
+      pendingRight[y] = static_cast<int16_t>(W);
+    }
+  }
+  lastRestoreRows = H;
+  lastRestorePixels = static_cast<uint32_t>(W) * H;
+  fullFrameNeeded = false;
 }
 
 double osmWorldX(double longitude, uint8_t zoom) {
@@ -1673,9 +2034,428 @@ int drawPngLine(PNGDRAW *draw) {
   const int sourceX = max(0, -pngTileScreenX);
   const int destinationX = max(0, pngTileScreenX);
   const int count = min(draw->iWidth - sourceX, W - destinationX);
-  if (count > 0) memcpy(framebuffer + destinationY * W + destinationX,
-                        pixels + sourceX, count * sizeof(uint16_t));
+  if (count > 0) {
+    memcpy(framebuffer + destinationY * W + destinationX,
+           pixels + sourceX, count * sizeof(uint16_t));
+    markRow(destinationY, destinationX, destinationX + count);
+  }
   return 1;
+}
+
+// Operator logos.
+//
+// The screensaver drew three initials in a tinted square because that is all
+// the device could produce on its own. The aggregator now caches each
+// airline's real logo (see server/app/logos.py), so the panel can fetch one
+// once, keep it on the card, and draw it for ever after.
+//
+// Same machinery as the map tiles deliberately: an HTTPS GET written
+// straight to a file, then read back into PSRAM and handed to PNGdec, whose
+// line callback writes into the framebuffer. That path is already proven on
+// this board. The logos are 128x128 8-bit RGB, non-interlaced and without an
+// alpha channel - checked against the live API, not assumed - which is the
+// same shape as a map tile, so nothing new has to handle transparency.
+constexpr int LOGO_PIXELS = 128;  // must be one of the server's allowed sizes
+// One outstanding request at a time, set by the render path and consumed by
+// the network task. Deliberately not a queue: the screensaver shows one
+// airline at a time, so the next rotation asks for the next logo, and a
+// backlog would only mean fetching logos for aircraft that have since left.
+volatile bool logoFetchPending = false;
+char logoFetchCode[4] = {0};
+
+// The same one-at-a-time arrangement for the type photograph. Separate from
+// the logo so a type with no photo does not block that airline's logo, and
+// vice versa.
+volatile bool photoFetchPending = false;
+char photoFetchCode[8] = {0};
+// The operator to ask for alongside it, so the aggregator can look for this
+// airline's own aircraft. Empty when the callsign carries no usable prefix.
+char photoFetchAirline[4] = {0};
+constexpr int MAX_PHOTOS_UNAVAILABLE = 24;
+char photoUnavailable[MAX_PHOTOS_UNAVAILABLE][8] = {};
+int photoUnavailableCount = 0;
+
+bool photoKnownUnavailable(const char *code) {
+  for (int i = 0; i < photoUnavailableCount; ++i)
+    if (!strcmp(photoUnavailable[i], code)) return true;
+  return false;
+}
+
+void rememberPhotoUnavailable(const char *code) {
+  if (photoKnownUnavailable(code)) return;
+  if (photoUnavailableCount >= MAX_PHOTOS_UNAVAILABLE) return;  // the card still remembers
+  strncpy(photoUnavailable[photoUnavailableCount], code, 7);
+  photoUnavailable[photoUnavailableCount++][7] = 0;
+}
+
+// What a fetch attempt actually achieved. The distinction matters: only a
+// newly written image justifies a repaint. Treating "already know there is
+// no logo" as success repainted the whole screen, which set the tile asking
+// again, which repainted again - a spin of full-frame repaints, and a
+// full-frame repaint is the exact burst that makes this panel slip.
+enum class LogoFetch { Cached, Unavailable, Retry };
+
+// Airlines the aggregator has no logo for, remembered in RAM as well as on
+// the card so the render path stops asking at all rather than asking and
+// being told no from disk on every rotation.
+constexpr int MAX_LOGOS_UNAVAILABLE = 24;
+char logoUnavailable[MAX_LOGOS_UNAVAILABLE][4] = {};
+int logoUnavailableCount = 0;
+
+bool logoKnownUnavailable(const char *code) {
+  for (int i = 0; i < logoUnavailableCount; ++i)
+    if (!strcmp(logoUnavailable[i], code)) return true;
+  return false;
+}
+
+void rememberLogoUnavailable(const char *code) {
+  if (logoKnownUnavailable(code)) return;
+  if (logoUnavailableCount >= MAX_LOGOS_UNAVAILABLE) return;  // the card still remembers
+  memcpy(logoUnavailable[logoUnavailableCount++], code, 4);
+}
+// A decoded image held in PSRAM, and which key it belongs to.
+//
+// Decoded once per subject rather than once per repaint. Reading the card and
+// running PNGdec on every screensaver repaint - on the bus the panel refills
+// its bounce buffer from - is exactly the kind of load this display cannot
+// absorb. A staging buffer turns each repaint into a memcpy.
+//
+// Two of these: the airline logo and the aircraft type photograph. They share
+// one decode callback rather than having a near-identical one each, because
+// two copies of this drift apart.
+struct ImageStage {
+  uint16_t *pixels = nullptr;
+  int width = 0;
+  int height = 0;
+  // Wide enough for "B738@EXS": a photograph is cached per type AND, where
+  // one exists, per operator of that type, and the two must not share a
+  // decoded stage or a Jet2 aircraft would show whatever was decoded for
+  // the previous operator of the same type.
+  char key[12] = {0};
+};
+
+ImageStage logoStage;
+ImageStage photoStage;
+ImageStage *decodeStageTarget = nullptr;
+
+int decodeStagePngLine(PNGDRAW *draw) {
+  ImageStage *stage = decodeStageTarget;
+  // A wider row than the stage would run past the end of the line it is
+  // writing into. A cache file written by an older build, or a server that
+  // starts answering differently, must not be able to corrupt memory here.
+  if (!stage || !stage->pixels || draw->iWidth > stage->width) return 0;
+  if (draw->y < 0 || draw->y >= stage->height) return 1;  // taller than asked: ignore the rest
+  pngDecoder.getLineAsRGB565(draw, stage->pixels + draw->y * stage->width,
+                             PNG_RGB565_LITTLE_ENDIAN, 0xffffffff);
+  return 1;
+}
+
+// Allocates the staging buffer on first use. PSRAM only: internal RAM is the
+// scarce resource the TLS handshake needs, and taking it from there to draw a
+// picture would trade a working feed for a prettier panel.
+bool ensureStage(ImageStage &stage, int width, int height) {
+  if (stage.pixels) return true;
+  stage.pixels = static_cast<uint16_t *>(heap_caps_malloc(
+      static_cast<size_t>(width) * height * sizeof(uint16_t),
+      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (!stage.pixels) return false;
+  stage.width = width;
+  stage.height = height;
+  return true;
+}
+
+// Reads a cached PNG from the card into the stage. Shared by both images.
+bool decodeCachedImage(ImageStage &stage, const String &path, const char *key) {
+  if (!pngDecoderPtr || !stage.pixels) return false;
+  fs::FS &cache = sdMounted ? static_cast<fs::FS &>(SDCARD) : static_cast<fs::FS &>(LittleFS);
+  File file = cache.open(path, FILE_READ);
+  if (!file) return false;
+  const size_t bytes = file.size();
+  if (!bytes || bytes > 160UL * 1024UL) { file.close(); cache.remove(path); return false; }
+  uint8_t *data = static_cast<uint8_t *>(heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (!data) data = static_cast<uint8_t *>(malloc(bytes));
+  if (!data) { file.close(); return false; }
+  const size_t read = file.read(data, bytes);
+  file.close();
+  if (read != bytes) {
+    heap_caps_free(data);
+    cache.remove(path);
+    return false;
+  }
+
+  // Cleared first: an image smaller than the stage would otherwise leave the
+  // previous subject's pixels showing around the edges of this one.
+  memset(stage.pixels, 0, static_cast<size_t>(stage.width) * stage.height * sizeof(uint16_t));
+  stage.key[0] = 0;
+  decodeStageTarget = &stage;
+  const int opened = pngDecoder.openRAM(data, bytes, decodeStagePngLine);
+  const bool success = opened == PNG_SUCCESS && pngDecoder.decode(nullptr, 0) == PNG_SUCCESS;
+  if (opened == PNG_SUCCESS) pngDecoder.close();
+  decodeStageTarget = nullptr;
+  heap_caps_free(data);
+  if (!success) {
+    // Same reasoning as the map tiles: a corrupt file would otherwise sit
+    // there failing to draw for ever.
+    cache.remove(path);
+    Serial.printf("Removed undecodable cached image %s\n", path.c_str());
+    return false;
+  }
+  strncpy(stage.key, key, sizeof(stage.key) - 1);
+  stage.key[sizeof(stage.key) - 1] = 0;
+  return true;
+}
+
+// Copies a stage to the panel, clipped to the screen. The stage may be
+// smaller than the box it is centred in.
+void blitStage(const ImageStage &stage, int left, int top) {
+  if (!framebuffer || !stage.pixels) return;
+  for (int row = 0; row < stage.height; ++row) {
+    const int destinationY = top + row;
+    if (destinationY < 0 || destinationY >= H) continue;
+    const int destinationX = max(0, left);
+    const int sourceX = max(0, -left);
+    const int count = min(stage.width - sourceX, W - destinationX);
+    if (count > 0) {
+      memcpy(framebuffer + destinationY * W + destinationX,
+             stage.pixels + row * stage.width + sourceX,
+             count * sizeof(uint16_t));
+      markRow(destinationY, destinationX, destinationX + count);
+    }
+  }
+}
+
+// One decoded copy of the boot screen, on its way from the PNG in flash to
+// the panel. Allocated for the decode and freed the moment it has been
+// drawn.
+//
+// Decoding straight to the panel a line at a time needs only 1.6 KB, but it
+// paints visibly from the top down over a couple of hundred milliseconds.
+// The picture should appear at once, so it is assembled off-screen and
+// blitted in one go - and then handed straight back, so the 768 KB is held
+// for the decode rather than from boot until the live display starts. Map
+// tiles, airline logos and aircraft photographs all want that PSRAM for the
+// rest of the run.
+uint16_t *bootPixels = nullptr;
+
+int decodeBootPngLine(PNGDRAW *draw) {
+  // A row wider than the buffer would run past the end of the line it is
+  // writing into. The asset is generated to BOOT_IMAGE_W, but a header from
+  // another build must not be able to corrupt memory here.
+  if (!bootPixels || draw->iWidth > BOOT_IMAGE_W) return 0;
+  if (draw->y < 0 || draw->y >= BOOT_IMAGE_H) return 1;
+  pngDecoder.getLineAsRGB565(draw, bootPixels + draw->y * BOOT_IMAGE_W,
+                             PNG_RGB565_LITTLE_ENDIAN, 0xffffffff);
+  return 1;
+}
+
+// Draws the boot screen from the PNG in flash. PROGMEM on the ESP32-S3 is
+// memory-mapped, so PNGdec reads the array in place - nothing is copied out
+// of flash first.
+bool paintBootImage() {
+  if (!pngDecoderPtr) return false;
+  const size_t bytes = static_cast<size_t>(BOOT_IMAGE_W) * BOOT_IMAGE_H * sizeof(uint16_t);
+  // PSRAM only, with no fallback: 768 KB is not something the internal pool
+  // could give up even if it had it, and the caller draws a plain title
+  // instead rather than failing to boot.
+  bootPixels = static_cast<uint16_t *>(heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (!bootPixels) {
+    logLine("Boot image: no PSRAM for the decode buffer");
+    return false;
+  }
+  const int opened = pngDecoder.openRAM(const_cast<uint8_t *>(BOOT_IMAGE_PNG),
+                                        BOOT_IMAGE_PNG_LEN, decodeBootPngLine);
+  const bool success = opened == PNG_SUCCESS && pngDecoder.decode(nullptr, 0) == PNG_SUCCESS;
+  if (opened == PNG_SUCCESS) pngDecoder.close();
+  // Only on success: half a picture is worse than the fallback title, and a
+  // partial decode would otherwise show whatever the rest of the buffer
+  // happened to contain.
+  if (success) {
+    gfx->draw16bitRGBBitmap((W - BOOT_IMAGE_W) / 2, (H - BOOT_IMAGE_H) / 2,
+                            bootPixels, BOOT_IMAGE_W, BOOT_IMAGE_H);
+  } else {
+    logLine("Boot image decode failed (open=%d)", opened);
+  }
+  heap_caps_free(bootPixels);
+  bootPixels = nullptr;
+  return success;
+}
+
+// "Nothing available for this one" markers, and how they are retired.
+//
+// A logo or photo the aggregator says it has none of is recorded so the
+// device stops asking - most of the 2,700 type designators are things
+// nobody photographs, and re-asking for all of them every rotation is
+// pointless traffic.
+//
+// The marker was an empty file and therefore permanent, which turned a
+// server-side bug into a lasting one: the photo endpoint answered "queued,
+// not fetched yet" with a 404, the device read that as "none exists", and
+// every type got blacklisted on the FIRST request - before the queue had
+// fetched anything. Receivers ran for hours reporting "none available" for
+// everything while the server held the pictures.
+//
+// The server side is fixed (that case is a 503 now), but the markers those
+// 404s wrote are still on every card. So a marker carries a generation
+// number and one from an older generation is deleted and retried. Bumping
+// the constant invalidates every miss on every receiver at the next
+// update, with no card surgery and no timestamps - which matters because
+// this board has no clock until it has a feed, and a card written with no
+// time source dates its files to 1980.
+constexpr char MISS_MARKER_GENERATION[] = "2";
+
+bool missMarkerIsCurrent(fs::FS &cache, const String &path) {
+  File marker = cache.open(path, FILE_READ);
+  if (!marker) return false;
+  char stored[8] = {0};
+  const size_t read = marker.readBytes(stored, sizeof(stored) - 1);
+  marker.close();
+  stored[read] = 0;
+  if (strcmp(stored, MISS_MARKER_GENERATION) == 0) return true;
+  // Older generation, or the empty file the permanent markers used to be.
+  cache.remove(path);
+  return false;
+}
+
+void writeMissMarker(fs::FS &cache, const String &path) {
+  File marker = cache.open(path, FILE_WRITE);
+  if (!marker) return;
+  marker.print(MISS_MARKER_GENERATION);
+  marker.close();
+}
+
+// The ICAO operator prefix of a callsign: RYR2BH is Ryanair. Empty when the
+// callsign cannot carry one, which is most GA traffic - those keep the
+// initials tile.
+bool operatorLogoCode(const char *flight, char *out) {
+  out[0] = 0;
+  if (!flight) return false;
+  // Four characters minimum: three letters and at least one of the flight
+  // number. A bare three-letter callsign is not an airline flight.
+  if (strlen(flight) < 4) return false;
+  for (int i = 0; i < 3; ++i) {
+    const char c = static_cast<char>(toupper(static_cast<unsigned char>(flight[i])));
+    if (c < 'A' || c > 'Z') return false;
+    out[i] = c;
+  }
+  out[3] = 0;
+  return true;
+}
+
+String operatorLogoPath(const char *code) {
+  return (sdMounted ? "/adsb/logo_" : "/logo_") + String(code) + ".png";
+}
+
+// A logo the aggregator has none of. Recorded so the device stops asking;
+// without it every screensaver rotation past a cargo or charter operator
+// would spend another request for the same 404.
+String operatorLogoMissPath(const char *code) {
+  return (sdMounted ? "/adsb/logo_" : "/logo_") + String(code) + ".none";
+}
+
+bool drawCachedOperatorLogo(int x, int y, int size, const char *code) {
+  if (!framebuffer || !ensureStage(logoStage, LOGO_PIXELS, LOGO_PIXELS)) return false;
+  if (strcmp(logoStage.key, code) &&
+      !decodeCachedImage(logoStage, operatorLogoPath(code), code)) return false;
+  // Centred in the tile rather than scaled to it: 128 into 160 leaves an even
+  // margin, and a scaler here would be a lot of code for sixteen pixels.
+  blitStage(logoStage, x + (size - logoStage.width) / 2, y + (size - logoStage.height) / 2);
+  return true;
+}
+
+// The aircraft type photograph: a landscape band, drawn in the space the
+// departure board leaves below its last row. Same lifecycle as the logo -
+// fetched once per type from the aggregator, kept on the card, decoded once
+// per type into PSRAM.
+constexpr int PHOTO_WIDTH = 160;  // must be one of the server's allowed widths
+constexpr int PHOTO_HEIGHT = 96;  // the server crops to 5:3
+
+// A photograph of this type flown by this operator, or of the type alone
+// when the airline is empty. Two entries rather than one: the generic
+// picture stays as the fallback for every other operator of the type, and
+// neither overwrites the other.
+String typePhotoKey(const char *designator, const char *airline) {
+  String key(designator);
+  if (airline && airline[0]) { key += '@'; key += airline; }
+  return key;
+}
+
+String typePhotoPath(const char *designator, const char *airline = nullptr) {
+  return (sdMounted ? "/adsb/photo_" : "/photo_") +
+         typePhotoKey(designator, airline) + ".png";
+}
+
+String typePhotoMissPath(const char *designator, const char *airline = nullptr) {
+  return (sdMounted ? "/adsb/photo_" : "/photo_") +
+         typePhotoKey(designator, airline) + ".none";
+}
+
+// Designators are up to four characters and are used in a filename, so
+// anything else is refused rather than sanitised.
+bool typePhotoCode(const char *designator, char *out) {
+  out[0] = 0;
+  if (!designator) return false;
+  const size_t length = strlen(designator);
+  if (length < 2 || length > 4) return false;
+  for (size_t i = 0; i < length; ++i) {
+    const char c = static_cast<char>(toupper(static_cast<unsigned char>(designator[i])));
+    if (!isalnum(static_cast<unsigned char>(c))) return false;
+    out[i] = c;
+  }
+  out[length] = 0;
+  return true;
+}
+
+// Whether a photograph could be drawn right now, without decoding one.
+// The board reserves horizontal space for it before laying out its text, so
+// this has to be answerable before the draw.
+// Which cached photograph is available for this aircraft, if any: this
+// operator's own, or one of the type in somebody else's livery.
+enum class PhotoMatch : uint8_t { None, Operator, Type };
+
+PhotoMatch typePhotoMatch(const char *designator, const char *airline) {
+  fs::FS &cache = sdMounted ? static_cast<fs::FS &>(SDCARD) : static_cast<fs::FS &>(LittleFS);
+  if (airline && airline[0]) {
+    const String key = typePhotoKey(designator, airline);
+    if (!strcmp(photoStage.key, key.c_str())) return PhotoMatch::Operator;
+    if (cache.exists(typePhotoPath(designator, airline))) return PhotoMatch::Operator;
+  }
+  if (!strcmp(photoStage.key, designator)) return PhotoMatch::Type;  // already decoded
+  if (cache.exists(typePhotoPath(designator))) return PhotoMatch::Type;
+  return PhotoMatch::None;
+}
+
+bool typePhotoAvailable(const char *designator, const char *airline = nullptr) {
+  return typePhotoMatch(designator, airline) != PhotoMatch::None;
+}
+
+// Whether asking the aggregator for THIS operator's aircraft could still
+// change anything. Without this the screensaver would ask on every frame:
+// cacheTypePhoto() would answer "already cached" straight away, that answer
+// sets screensaverNeedsRedraw, the redraw asks again - a loop that never
+// touches the network but never stops either.
+//
+// One request per operator and type is enough. The miss marker written when
+// the aggregator answers with the type photograph instead is what makes this
+// false from then on.
+bool operatorPhotoWorthAsking(const char *designator, const char *airline) {
+  if (!airline || !airline[0]) return false;
+  fs::FS &cache = sdMounted ? static_cast<fs::FS &>(SDCARD) : static_cast<fs::FS &>(LittleFS);
+  if (cache.exists(typePhotoPath(designator, airline))) return false;  // already have it
+  return !missMarkerIsCurrent(cache, typePhotoMissPath(designator, airline));
+}
+
+bool drawCachedTypePhoto(int left, int top, const char *designator,
+                         PhotoMatch match, const char *airline) {
+  if (!framebuffer || !ensureStage(photoStage, PHOTO_WIDTH, PHOTO_HEIGHT)) return false;
+  const bool operators = match == PhotoMatch::Operator;
+  const String key = operators ? typePhotoKey(designator, airline) : String(designator);
+  if (strcmp(photoStage.key, key.c_str()) &&
+      !decodeCachedImage(photoStage,
+                         operators ? typePhotoPath(designator, airline)
+                                   : typePhotoPath(designator),
+                         key.c_str())) return false;
+  blitStage(photoStage, left, top);
+  return true;
 }
 
 String osmTilePath(uint8_t zoom, int tileX, int tileY) {
@@ -1772,6 +2552,206 @@ bool cacheOsmTile(uint8_t zoom, int tileX, int tileY, const String &path) {
     return false;
   }
   return true;
+}
+
+// Fetched from our own aggregator rather than logo.dev directly: the logo is
+// already cached there for every customer, so this costs the provider
+// nothing, needs no token on the device, and works whichever aircraft feed
+// the user has selected - the endpoint is deliberately unauthenticated.
+constexpr char LOGO_ENDPOINT[] = "https://adsb.2e0lxy.uk/logo/airline/";
+// The TLS handshake for this needs a contiguous internal block, and that is
+// exactly what the device has least of - it is why the route lookups had to
+// move to the server. So a logo is only ever fetched when there is headroom;
+// otherwise it waits for a later rotation. Worst case the initials tile
+// stays, which is what was there before.
+//
+// 28 KB from measurement, not from caution. On this board the largest free
+// internal block settles at 31,732 bytes, and the aircraft fetch completes a
+// TLS handshake at exactly that level every thirty seconds with a 39 KB
+// response body. A logo is a fifth of that size and runs on the same task
+// between those fetches, so it faces the same conditions the feed already
+// survives. The first attempt at this was 48 KB, which is more than this
+// board ever has free - the guard could never pass and no logo was ever
+// fetched.
+constexpr size_t LOGO_MIN_INTERNAL_BLOCK = 28u * 1024u;
+
+LogoFetch cacheOperatorLogo(const char *code) {
+  fs::FS &cache = sdMounted ? static_cast<fs::FS &>(SDCARD) : static_cast<fs::FS &>(LittleFS);
+  const String path = operatorLogoPath(code);
+  const String missPath = operatorLogoMissPath(code);
+  if (missMarkerIsCurrent(cache, missPath)) return LogoFetch::Unavailable;
+  // Present already means the draw that asked for this failed to decode it
+  // and removed it, or another pass just fetched it. Either way it is worth
+  // one repaint to find out.
+  if (cache.exists(path)) return LogoFetch::Cached;
+  if (WiFi.status() != WL_CONNECTED) return LogoFetch::Retry;
+  if (tileCacheFreeBytes() < MIN_TILE_CACHE_FREE_BYTES) return LogoFetch::Retry;
+  const size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (largest < LOGO_MIN_INTERNAL_BLOCK) {
+    Serial.printf("Logo %s deferred: largestInternal=%u\n", code, static_cast<unsigned>(largest));
+    return LogoFetch::Retry;
+  }
+
+  WiFiClientSecure client;
+  applyTlsPolicy(client);
+  HTTPClient http;
+  http.setTimeout(12000); http.setConnectTimeout(12000);
+  // No theme parameter: the aggregator already requests the dark-background
+  // variant for every consumer, which is why these arrive as plain RGB with
+  // no alpha channel for this device to composite.
+  const String url = String(LOGO_ENDPOINT) + code + ".png?size=" + String(LOGO_PIXELS);
+  if (!http.begin(client, url)) return LogoFetch::Retry;
+  http.addHeader("User-Agent", userAgent());
+  const int status = http.GET();
+  if (status == HTTP_CODE_NOT_FOUND) {
+    // A real answer, not a failure: the aggregator has no logo for this
+    // airline. Remember it so we stop asking.
+    http.end();
+    writeMissMarker(cache, missPath);
+    Serial.printf("Logo %s: none available\n", code);
+    return LogoFetch::Unavailable;
+  }
+  if (status == 503) {
+    // The aggregator is reachable but has no logo token configured. Worth
+    // saying plainly rather than as a bare status code, because the fix is
+    // on the server and nothing on the device will change until it is made.
+    Serial.printf("Logo %s: aggregator has no logo token configured\n", code);
+    http.end();
+    return LogoFetch::Retry;
+  }
+  if (status != HTTP_CODE_OK) {
+    Serial.printf("Logo %s HTTP %d\n", code, status);
+    http.end();
+    return LogoFetch::Retry;
+  }
+  const int expected = http.getSize();
+  File file = cache.open(path, FILE_WRITE);
+  const int written = file ? http.writeToStream(&file) : -1;
+  if (file) file.close();
+  http.end();
+  // Same short-write check as the map tiles: a truncated PNG committed to
+  // the cache would fail to decode for ever after.
+  if (written <= 0 || (expected > 0 && written != expected)) {
+    Serial.printf("Logo %s write failed: %d of %d bytes\n", code, written, expected);
+    cache.remove(path);
+    return LogoFetch::Retry;
+  }
+  Serial.printf("Logo %s cached (%d bytes)\n", code, written);
+  return LogoFetch::Cached;
+}
+
+constexpr char PHOTO_ENDPOINT[] = "https://adsb.2e0lxy.uk/aircraft-photo/";
+
+// Same guards as the logo, for the same reason: the handshake competes for
+// contiguous internal RAM, which is the scarce resource on this board.
+LogoFetch cacheTypePhoto(const char *designator, const char *airline = nullptr) {
+  fs::FS &cache = sdMounted ? static_cast<fs::FS &>(SDCARD) : static_cast<fs::FS &>(LittleFS);
+  // The operator is only a hint to the aggregator: it looks for that
+  // airline's own aircraft first and falls back to any of the type, and the
+  // X-Photo-Match header on the reply says which it sent. So the local
+  // filename cannot be decided until the answer arrives - asking for Jet2
+  // and caching a Ryanair aeroplane under "B738@EXS" would make the very
+  // mistake this is fixing permanent on the card.
+  const bool wantOperator = airline && airline[0];
+  const String operatorPath = wantOperator ? typePhotoPath(designator, airline) : String();
+  const String operatorMissPath =
+      wantOperator ? typePhotoMissPath(designator, airline) : String();
+  const String path = typePhotoPath(designator);
+  const String missPath = typePhotoMissPath(designator);
+  if (wantOperator && cache.exists(operatorPath)) return LogoFetch::Cached;
+  // A type with no photograph at all is the end of it. An operator with
+  // none is not: the generic picture is still worth having, so that marker
+  // only suppresses re-asking for the operator's own.
+  if (missMarkerIsCurrent(cache, missPath)) return LogoFetch::Unavailable;
+  const bool operatorKnownEmpty =
+      wantOperator && missMarkerIsCurrent(cache, operatorMissPath);
+  if (cache.exists(path) && (!wantOperator || operatorKnownEmpty))
+    return LogoFetch::Cached;
+  if (WiFi.status() != WL_CONNECTED) return LogoFetch::Retry;
+  if (tileCacheFreeBytes() < MIN_TILE_CACHE_FREE_BYTES) return LogoFetch::Retry;
+  const size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (largest < LOGO_MIN_INTERNAL_BLOCK) {
+    Serial.printf("Photo %s deferred: largestInternal=%u\n", designator,
+                  static_cast<unsigned>(largest));
+    return LogoFetch::Retry;
+  }
+
+  WiFiClientSecure client;
+  applyTlsPolicy(client);
+  HTTPClient http;
+  http.setTimeout(15000); http.setConnectTimeout(15000);
+  String url = String(PHOTO_ENDPOINT) + designator + ".png?size=" + String(PHOTO_WIDTH);
+  if (wantOperator && !operatorKnownEmpty) { url += "&airline="; url += airline; }
+  if (!http.begin(client, url)) return LogoFetch::Retry;
+  http.addHeader("User-Agent", userAgent());
+  // Needed before GET() or the headers are discarded. Retry-After is the
+  // only thing that tells the two 503s apart, and X-Photo-Match the only
+  // thing that says whose aircraft arrived.
+  static const char *PHOTO_HEADERS[] = {"Retry-After", "X-Photo-Match"};
+  http.collectHeaders(PHOTO_HEADERS, 2);
+  const int status = http.GET();
+  if (status == HTTP_CODE_NOT_FOUND) {
+    // A real answer: no attribution-free photograph exists for this type.
+    // Recorded so we stop asking, which matters more here than for logos -
+    // most of the 2,700 designators are types nobody photographs.
+    http.end();
+    writeMissMarker(cache, missPath);
+    Serial.printf("Photo %s: none available\n", designator);
+    return LogoFetch::Unavailable;
+  }
+  if (status == 503) {
+    // Two different answers share this status, and the retry delay is what
+    // separates them: the aggregator queues a photograph it has not fetched
+    // yet and says to come back in 30 seconds, or it says the type has no
+    // photograph to fetch - switched off, or no model name to search on -
+    // and asks for an hour. Reporting both as "photographs disabled" was
+    // wrong and actively misleading: it printed that line for types that
+    // were merely queued and arrived seconds later, which is what "Photo
+    // EC45: aggregator has photographs disabled" followed by a cached
+    // B733 in the same run actually was.
+    //
+    // Behaviour is unchanged - Retry either way, and no miss marker, so a
+    // queued photograph is never recorded as absent. This is the log line
+    // telling the truth about which of the two happened.
+    const long retryAfter = http.header("Retry-After").toInt();
+    if (retryAfter > 300)
+      Serial.printf("Photo %s: aggregator has none to give (retry in %lds)\n",
+                    designator, retryAfter);
+    else
+      Serial.printf("Photo %s: queued on the aggregator, asking again shortly\n",
+                    designator);
+    http.end();
+    return LogoFetch::Retry;
+  }
+  if (status != HTTP_CODE_OK) {
+    Serial.printf("Photo %s HTTP %d\n", designator, status);
+    http.end();
+    return LogoFetch::Retry;
+  }
+  const int expected = http.getSize();
+  // Whose aircraft this is decides where it is stored. Anything other than
+  // an explicit "airline" is treated as the type photograph, so an older
+  // aggregator that does not send the header at all still works and simply
+  // never produces an operator match.
+  const bool gotOperator = wantOperator && http.header("X-Photo-Match") == "airline";
+  const String target = gotOperator ? operatorPath : path;
+  File file = cache.open(target, FILE_WRITE);
+  const int written = file ? http.writeToStream(&file) : -1;
+  if (file) file.close();
+  http.end();
+  if (written <= 0 || (expected > 0 && written != expected)) {
+    Serial.printf("Photo %s write failed: %d of %d bytes\n", designator, written, expected);
+    cache.remove(target);
+    return LogoFetch::Retry;
+  }
+  // Asked for an operator and got the type back: the aggregator has no
+  // photograph of that airline's aircraft. Remember it, or every screensaver
+  // rotation asks again for something that will not change, and the generic
+  // photograph now on the card would never be recognised as the answer.
+  if (wantOperator && !gotOperator) writeMissMarker(cache, operatorMissPath);
+  Serial.printf("Photo %s cached (%d bytes)%s\n", designator, written,
+                gotOperator ? " - this operator's own aircraft" : "");
+  return LogoFetch::Cached;
 }
 
 bool drawCachedOsmTile(const String &path, int screenX, int screenY) {
@@ -1926,6 +2906,9 @@ bool refreshPhysicalBaseMap() {
   rgbpanel->restartAtNextVsync();
   memcpy(baseMap, framebuffer, W * H * sizeof(uint16_t));
   physicalMapReady = true;
+  // Every pixel of the map underneath has just changed, so the next render
+  // cannot work from spans - see the note above restoreMap().
+  invalidateWholeFrame();
   mapRebuildActive = false;
   mapRebuildMissingTiles = mapRebuildTotal - tilesDrawn;
   Serial.printf("Physical map %d/%d tiles at %.5f, %.5f radius %u nm zoom %u\n",
@@ -1964,17 +2947,6 @@ bool applyBrightness(uint8_t percent) {
   // level so the caller can tell the user the duty was not honoured.
   return WS_CH422G::setPwm(Wire, duty);
 #endif
-}
-
-void beepAlert() {
-#if BOARD_EXPANDER_CH32
-  if (!soundAlerts) return;
-  WS_CH32_IO::writeRegister(Wire, WS_CH32_IO::REG_OUTPUT,
-                            WS_CH32_IO::OUT_DISPLAY_ON | WS_CH32_IO::PIN_BEE_EN);
-  delay(200);
-  WS_CH32_IO::writeRegister(Wire, WS_CH32_IO::REG_OUTPUT,
-                            WS_CH32_IO::OUT_DISPLAY_ON);
-#endif  // no buzzer is wired on the CH422G boards
 }
 
 const char *compassDirection(float track) {
@@ -2464,6 +3436,19 @@ void drawMlatPlane(int x, int y, float heading) {
 // airline's colour with its ICAO prefix reversed out of it, which reads at a
 // glance from across a room in the same way the logo does.
 void drawOperatorTile(int x, int y, int size, const char *flight, const char *hex) {
+  // The real logo when we have one, initials when we do not. Asking for the
+  // logo here rather than anywhere else is on purpose: this is the only
+  // place that knows an airline is actually being shown to someone, so the
+  // device only ever fetches logos it is about to display.
+  char airline[4];
+  if (size >= LOGO_PIXELS && operatorLogoCode(flight, airline)) {
+    if (drawCachedOperatorLogo(x, y, size, airline)) return;
+    if (!logoFetchPending && !logoKnownUnavailable(airline)) {
+      memcpy(logoFetchCode, airline, 4);
+      logoFetchPending = true;
+    }
+  }
+
   char code[4] = {'?', '?', '?', 0};
   const char *src = (flight && strlen(flight) >= 3) ? flight : hex;
   for (int i = 0; i < 3 && src && src[i]; ++i) code[i] = toupper(static_cast<unsigned char>(src[i]));
@@ -2864,6 +3849,34 @@ void status(const char *label, uint16_t colour) {
   text5(layout::centreX-width/2,32,label,rgb(255,255,255));
 }
 
+// Walks the rows that differ from the panel: copies each span across when
+// asked to, records how much there was either way, and clears them.
+void pushPendingSpans(bool copyToPanel) {
+  if (!spansReady()) {
+    if (copyToPanel) gfx->draw16bitRGBBitmap(0, 0, framebuffer, W, H);
+    lastPresentRows = H;
+    lastPresentPixels = static_cast<uint32_t>(W) * H;
+    return;
+  }
+  uint16_t rows = 0;
+  uint32_t pixels = 0;
+  for (int y = 0; y < H; ++y) {
+    const int x0 = pendingLeft[y];
+    const int x1 = pendingRight[y];
+    if (x1 <= x0) continue;
+    // One row per call: the library's bitmap copy takes no source stride,
+    // so a taller block would have to be contiguous, which a span of the
+    // shadow buffer is not.
+    if (copyToPanel) gfx->draw16bitRGBBitmap(x0, y, framebuffer + y * W + x0, x1 - x0, 1);
+    pendingLeft[y] = static_cast<int16_t>(W);
+    pendingRight[y] = 0;
+    ++rows;
+    pixels += static_cast<uint32_t>(x1 - x0);
+  }
+  lastPresentRows = rows;
+  lastPresentPixels = pixels;
+}
+
 void present() {
   // Start the copy at the top of the vertical blanking interval. There is
   // exactly one framebuffer and the panel scans it out continuously, so
@@ -2885,16 +3898,39 @@ void present() {
     // cache so the LCD DMA reads what was drawn. No vsync wait either -
     // there is no bulk copy to keep ahead of the scan.
     gfx->flush(true);
-  } else {
-    rgbpanel->waitForVsync(50);
-    gfx->draw16bitRGBBitmap(0, 0, framebuffer, W, H);
+    // Nothing to copy, but the spans still have to be read and cleared.
+    // They say how much of the frame was drawn, which in this mode IS the
+    // PSRAM traffic - every pixel went straight into the panel's own
+    // buffer. Left unread they would also saturate to full rows, since
+    // nothing else clears them, and the figures would stop meaning
+    // anything.
+    pushPendingSpans(false);
+    // Realign the scan here too. Removing this was wrong: the reasoning was
+    // that the realign only exists to recover from the present() copy
+    // starving the bounce-buffer refill, and this mode has no copy - but a
+    // copy is not the only thing that can starve it. Drawing a full frame
+    // straight into the live framebuffer is itself 750 KB of PSRAM traffic
+    // competing with the panel's own DMA reads, and a slip is permanent:
+    // the scan position never recovers on its own, so one starved frame
+    // leaves the picture offset until something realigns it. With the
+    // realign gone from this path there was nothing left that would.
+    //
+    // Observed on the panel: the radar page with its title drawn at y=9
+    // showing that title at the bottom of the screen instead, the whole
+    // frame offset by about thirty rows. The route loop already calls this
+    // for the same reason mid-fetch (see the note by the adsbdb lookups),
+    // so it is the established recovery here rather than a new idea.
+    rgbpanel->restartAtNextVsync();
+    return;
   }
-  // esp_lcd_rgb_panel_restart() returns ESP_ERR_INVALID_STATE unless
-  // CONFIG_LCD_RGB_RESTART_IN_VSYNC is set in the sdkconfig, which cannot be
-  // changed from platformio.ini with the prebuilt Arduino libraries. The
-  // return value used to be discarded, so a permanent no-op was invisible.
-  // Log it once at boot; if it reports 0 this call does nothing and the
-  // corrected panel timings above are the real fix.
+  rgbpanel->waitForVsync(50);
+  pushPendingSpans(true);
+  // Realign the scan after the copy. esp_lcd_rgb_panel_restart() needs
+  // CONFIG_LCD_RGB_RESTART_IN_VSYNC, which cannot be set from
+  // platformio.ini with the prebuilt Arduino libraries - but it is already
+  // enabled there, so this reports yes and does work. See the long note in
+  // platformio.ini: the restart is not what is missing, and the roll
+  // happens in spite of it firing.
   const bool restarted = rgbpanel->restartAtNextVsync();
   static bool logged = false;
   if (!logged) {
@@ -2904,17 +3940,29 @@ void present() {
 }
 
 void renderBootScreen(const String &networkLine = "", uint16_t networkColour = RGB565_CYAN) {
-  if (W == ASSET_W && H == ASSET_H) {
-    gfx->draw16bitRGBBitmap(0, 0, const_cast<uint16_t *>(BOOT_IMAGE), W, H);
-  } else {
-    // Centre the 480x480 splash rather than overrunning the array.
+  // The asset is generated per panel shape, so it normally fills the screen
+  // exactly; clearing first covers a header built for the other board.
+  if (BOOT_IMAGE_W != W || BOOT_IMAGE_H != H) gfx->fillScreen(rgb(4, 10, 16));
+  if (!paintBootImage()) {
+    // No decoder, no PSRAM for the decode buffer, or an asset that will
+    // not decode. A plain title beats a blank panel, and the version,
+    // credit and status lines below are drawn either way.
     gfx->fillScreen(rgb(4, 10, 16));
-    gfx->draw16bitRGBBitmap((W - ASSET_W) / 2, (H - ASSET_H) / 2,
-                            const_cast<uint16_t *>(BOOT_IMAGE), ASSET_W, ASSET_H);
+    gfx->setTextSize(3);
+    gfx->setTextColor(RGB565_CYAN);
+    const String title = "ADS-B / MLAT";
+    gfx->setCursor(max(4, (W - static_cast<int>(title.length()) * 18) / 2), H / 2 - 40);
+    gfx->print(title);
   }
   gfx->setTextWrap(false);
   gfx->setTextSize(2);
+  // Top right rather than down with the credit: both crops are dark sky
+  // there (measured at mean 14 of 255), the title occupies the middle, and
+  // it matches where the screensaver puts the device address.
   gfx->setTextColor(RGB565_WHITE);
+  const String version = String("v") + FIRMWARE_VERSION;
+  gfx->setCursor(W - static_cast<int>(version.length()) * 12 - 10, 10);
+  gfx->print(version);
   const String credit = "Firmware (c) 2E0LXY D.Loxley 2026";
   gfx->setCursor(max(4, (W - static_cast<int>(credit.length()) * 12) / 2), 414);
   gfx->print(credit);
@@ -3303,9 +4351,14 @@ void renderAircraftDetailCard(int aircraftIndex) {
 // Truncates in place to what will actually fit, so a long operator name or
 // airport pair clips cleanly instead of running off the panel. text5()
 // advances 6*scale pixels per character.
-void fitText(char *text, int xLeft, int scale) {
-  const int maxChars = (W - xLeft - 6) / (6 * scale);
+void fitTextTo(char *text, int xLeft, int scale, int xRight) {
+  const int maxChars = (xRight - xLeft) / (6 * scale);
   if (maxChars > 0 && static_cast<int>(strlen(text)) > maxChars) text[maxChars] = 0;
+  else if (maxChars <= 0) text[0] = 0;
+}
+
+void fitText(char *text, int xLeft, int scale) {
+  fitTextTo(text, xLeft, scale, W - 6);
 }
 
 // Overhead only: something you could plausibly see or hear from the
@@ -3317,22 +4370,28 @@ void fitText(char *text, int xLeft, int scale) {
 // Split out of renderScreensaverPage() so the rotate timer can ask how many
 // there are without repainting the screen to find out.
 int collectOverheadAircraft(int *matches, int capacity) {
-  constexpr float OVERHEAD_MAX_SLANT_MILES = 5.0f;
+  // Ground distance, not slant range.
+  //
+  // This measured sqrt(ground^2 + altitude^2) against 5 miles, which makes
+  // altitude DISQUALIFYING: 5 miles is 26,400 ft, so an aircraft directly
+  // above the receiver at cruise scored 6.8 miles and was excluded, however
+  // exactly overhead it was. Nothing above 26,400 ft could ever qualify. A
+  // 787 passing at 3.1 miles and 35,900 ft - plotted on the web map, plainly
+  // overhead - scored 7.5 and the screensaver said NO OVERHEAD AIRCRAFT
+  // while showing a light aircraft at 1,725 ft instead.
+  //
+  // "Overhead" means in the sky above here, and altitude is what makes an
+  // aircraft overhead rather than on final approach somewhere else. The only
+  // thing that should exclude one is being on the ground, which onGround
+  // already covers.
+  constexpr float OVERHEAD_MAX_GROUND_MILES = 5.0f;
   int count = 0;
   for (int i = 0; i < lastCount && count < capacity; ++i) {
     const AircraftDisplay &candidate = latestAircraft[i];
     if (candidate.onGround) continue;
-    const float altitudeMiles = candidate.altitudeFt > 0 ? candidate.altitudeFt / 5280.0f : 0.0f;
-    const float slantMiles =
-        sqrtf(candidate.distanceMiles * candidate.distanceMiles + altitudeMiles * altitudeMiles);
-    if (slantMiles <= OVERHEAD_MAX_SLANT_MILES) matches[count++] = i;
+    if (candidate.distanceMiles <= OVERHEAD_MAX_GROUND_MILES) matches[count++] = i;
   }
   return count;
-}
-
-int overheadAircraftCount() {
-  int matches[32];
-  return collectOverheadAircraft(matches, 32);
 }
 
 // Set when the screensaver is entered, so the first frame after it appears
@@ -3352,6 +4411,23 @@ void renderScreensaverPage() {
   //
   // The signature covers everything this page actually draws for the
   // selected aircraft; anything not in it cannot change the picture.
+
+  // The screensaver is the one page with no header, so it is also the one
+  // place the admin address cannot be read off the screen. It goes in the
+  // top corner of both frames: the empty one, where there is nothing else to
+  // read, and the departure board, where the top band above the operator
+  // tile is unused anyway.
+  //
+  // Worked out before the signature below and mixed into it, so a reconnect
+  // or a new DHCP lease repaints. Without that this page skips its repaint
+  // whenever the frame would be identical and a stale address would sit
+  // there indefinitely.
+  char address[40];
+  if (WiFi.status() == WL_CONNECTED)
+    snprintf(address, sizeof(address), "%s", WiFi.localIP().toString().c_str());
+  else
+    snprintf(address, sizeof(address), "NO WIFI");
+
   uint32_t signature = 2166136261u;
   auto mix = [&signature](uint32_t value) {
     signature = (signature ^ value) * 16777619u;
@@ -3360,8 +4436,9 @@ void renderScreensaverPage() {
     for (const char *c = text; *c; ++c) mix(static_cast<uint8_t>(*c));
   };
   mix(static_cast<uint32_t>(overheadCount));
+  mixText(address);
   if (overheadCount > 0) {
-    const AircraftDisplay &shown = latestAircraft[overheadMatches[screensaverAircraftIndex % overheadCount]];
+    const AircraftDisplay &shown = latestAircraft[overheadMatches[0]];
     mixText(shown.hex);
     mixText(shown.flight);
     mixText(shown.squawk);
@@ -3385,13 +4462,32 @@ void renderScreensaverPage() {
   screensaverNeedsRedraw = false;
 
   filledRect(0, 0, W, H, rgb(0, 0, 0));
+
+  // Right-aligned in the top corner. Each glyph advances 6*scale with the
+  // last column of that advance being the gap to the next character, so the
+  // drawn width is one scale unit narrower than the advance total.
+  //
+  // Sits above the operator tile, which starts at margin + H/24, so it
+  // clears the board's own first line on either panel size.
+  {
+    const int addressScale = W >= 800 ? 2 : 1;
+    const int addressWidth = static_cast<int>(strlen(address)) * 6 * addressScale - addressScale;
+    const int edge = W / 40;
+    text5(W - edge - addressWidth, edge, address, rgb(120, 140, 160), addressScale);
+  }
+
   if (overheadCount == 0) {
     text5(20, H / 2 - 6, "NO OVERHEAD AIRCRAFT", rgb(120, 140, 160), 2);
     text5(20, H / 2 + 24, "TAP OR SWIPE TO RETURN", rgb(70, 90, 110));
     present();
     return;
   }
-  AircraftDisplay &a = latestAircraft[overheadMatches[screensaverAircraftIndex % overheadCount]];
+  // The closest thing overhead, not a rotation through all of them.
+  // latestAircraft is sorted by distance (sortAircraftByDistance), so the
+  // first match is the nearest, and it changes only when something actually
+  // overtakes it - which is a far better trigger for a full-screen repaint
+  // than a timer that cycles whether or not the picture would differ.
+  AircraftDisplay &a = latestAircraft[overheadMatches[0]];
   RouteCacheEntry *route = cachedRoute(a.flight);
   const bool hasRoute = route && route->hasRoute;
 
@@ -3409,6 +4505,60 @@ void renderScreensaverPage() {
 
   drawOperatorTile(margin, tileY, tile, a.flight, a.hex);
 
+  // The type photograph sits opposite the logo, at the top right, so the two
+  // pictures frame the identity lines between them. Decided before those
+  // lines are laid out because they have to be truncated to make room -
+  // which is why availability is answered without decoding anything.
+  char designator[8];
+  const bool hasDesignator = typePhotoCode(a.aircraftType, designator);
+  const int photoLeft = W - margin - PHOTO_WIDTH;
+  // Only where there is genuinely room. The route codes are the widest thing
+  // on this page and matter more than a photograph, so require space for at
+  // least eight of them at their own scale. On the 480x480 board that fails,
+  // and it keeps its full text and goes without - checked, not assumed:
+  // reserving 160 px there leaves 116, and "BRS-FAO" needs 126.
+  const int widestScale = W >= 800 ? 5 : 3;  // routeScale, declared below
+  const bool roomForPhoto = photoLeft - 8 - textX >= 8 * 6 * widestScale;
+  // The operator, so the aggregator can look for this airline's own
+  // aircraft rather than any of the type. Without it a Jet2 737-800 is
+  // shown whichever 737-800 the search found first, which was a Ryanair
+  // one - the right aeroplane in the wrong livery, next to the name of the
+  // airline it is not.
+  char photoAirline[4] = {0};
+  if (!operatorLogoCode(a.flight, photoAirline)) photoAirline[0] = 0;
+  const PhotoMatch photoMatch =
+      hasDesignator ? typePhotoMatch(designator, photoAirline) : PhotoMatch::None;
+  const bool showPhoto = hasDesignator && roomForPhoto && photoMatch != PhotoMatch::None;
+  if (showPhoto)
+    drawCachedTypePhoto(photoLeft, tileY, designator, photoMatch, photoAirline);
+  // Asked for when there is nothing to show, and once more when all there
+  // is to show is somebody else's livery and this operator's own has not
+  // been ruled out yet.
+  const bool wantAnyPhoto = photoMatch == PhotoMatch::None;
+  const bool wantBetterPhoto = photoMatch == PhotoMatch::Type &&
+                               operatorPhotoWorthAsking(designator, photoAirline);
+  if (hasDesignator && roomForPhoto && !photoFetchPending &&
+      (wantAnyPhoto || wantBetterPhoto) &&
+      !photoKnownUnavailable(designator)) {
+    // Asked for here because this is the only place that knows a type is
+    // being shown to someone, so the device only fetches photographs it is
+    // about to display.
+    memcpy(photoFetchCode, designator, sizeof(designator));
+    memcpy(photoFetchAirline, photoAirline, sizeof(photoAirline));
+    photoFetchPending = true;
+  }
+  // A photograph of the type in somebody else's colours is worth showing -
+  // it is the right aeroplane - but not worth passing off as this flight.
+  // The caption goes inside the picture's own bottom edge so it cannot
+  // collide with the telemetry rows laid out below.
+  if (showPhoto && photoMatch == PhotoMatch::Type) {
+    const int bandHeight = 10;
+    const int bandTop = tileY + PHOTO_HEIGHT - bandHeight;
+    filledRect(photoLeft, bandTop, PHOTO_WIDTH, bandHeight, rgb(0, 0, 0));
+    text5(photoLeft + 3, bandTop + 2, "LIVERY MAY DIFFER", rgb(190, 205, 218));
+  }
+  const int identityRight = showPhoto ? photoLeft - 8 : W - 6;
+
   // Line 1 - who. The operator name when the feed carries one, otherwise the
   // callsign, which is the most identifying thing left.
   char line[64];
@@ -3423,7 +4573,7 @@ void renderScreensaverPage() {
   if (!operatorLabel) operatorLabel = a.flight[0] ? a.flight : a.hex;
   snprintf(line, sizeof(line), "%s", operatorLabel);
   const int nameScale = W >= 800 ? 3 : 2;
-  fitText(line, textX, nameScale);
+  fitTextTo(line, textX, nameScale, identityRight);
   text5(textX, tileY, line, white, nameScale);
 
   // Line 2 - where. Airport codes are the headline; the full names go in a
@@ -3431,16 +4581,18 @@ void renderScreensaverPage() {
   if (hasRoute) snprintf(line, sizeof(line), "%s-%s", route->origin, route->destination);
   else snprintf(line, sizeof(line), "%s", a.flight[0] ? a.flight : a.hex);
   const int routeScale = W >= 800 ? 5 : 3;
-  fitText(line, textX, routeScale);
+  fitTextTo(line, textX, routeScale, identityRight);
   text5(textX, tileY + 10 * nameScale, line, cyan, routeScale);
 
-  // Line 3 - what. Type, registration and callsign together, since the
-  // callsign is no longer the headline when a route resolved.
+  // Line 3 - what. The full model where the aggregator resolved one, since
+  // "Boeing 737-800" tells a viewer something and "B738" does not; the bare
+  // designator otherwise. Registration and callsign alongside, as the
+  // callsign is no longer the headline once a route has resolved.
   snprintf(line, sizeof(line), "%s  %s  %s",
-           a.aircraftType[0] ? a.aircraftType : "UNKNOWN",
+           a.typeName[0] ? a.typeName : (a.aircraftType[0] ? a.aircraftType : "UNKNOWN"),
            a.registration[0] ? a.registration : a.hex,
            a.flight[0] ? a.flight : "");
-  fitText(line, textX, 2);
+  fitTextTo(line, textX, 2, identityRight);
   text5(textX, tileY + 10 * nameScale + 11 * routeScale, line, dim, 2);
 
   int y = tileY + tile + H / 16;
@@ -3462,6 +4614,17 @@ void renderScreensaverPage() {
   fitText(line, margin, rowScale);
   text5(margin, y, line, white, rowScale);
   y += rowStep;
+
+  // The radio callsign, which is what would be heard on the air and is
+  // rarely the operator's trading name: Jet2 answers to "Channex" and
+  // British Airways to "Speedbird". Only when the aggregator resolved one,
+  // and only when it differs from the operator name already above.
+  if (a.telephony[0] && strcasecmp(a.telephony, a.operatorName)) {
+    snprintf(line, sizeof(line), "RADIO:%s", a.telephony);
+    fitText(line, margin, rowScale);
+    text5(margin, y, line, cyan, rowScale);
+    y += rowStep;
+  }
 
   // Everything else the feed gives us for this airframe. Squawk is shown in
   // red when it is one of the three emergency codes, which is the one value
@@ -3526,8 +4689,10 @@ void renderScreensaverPage() {
 
   // Which of the overhead aircraft this is, and the way out.
   char footer[48];
-  snprintf(footer, sizeof(footer), "%d/%d OVERHEAD - TAP OR SWIPE TO RETURN",
-           (screensaverAircraftIndex % overheadCount) + 1, overheadCount);
+  if (overheadCount > 1)
+    snprintf(footer, sizeof(footer), "NEAREST OF %d OVERHEAD - TAP OR SWIPE TO RETURN", overheadCount);
+  else
+    snprintf(footer, sizeof(footer), "OVERHEAD - TAP OR SWIPE TO RETURN");
   text5(margin, H - 14, footer, rgb(70, 90, 110));
   present();
 }
@@ -3541,6 +4706,14 @@ const char *displayPageName() {
 }
 
 void renderCurrentPage() {
+  // Zeroed per frame, not left to whichever function last ran. Only the
+  // map-backed pages call restoreMap(); the table and the screensaver paint
+  // their own opaque background instead. Without this reset those pages
+  // reported the restore figure from whenever a map page last drew, and
+  // /api/status added that stale number to this frame's real one - which
+  // read as a 1,500 KB render on a page that had done 750.
+  lastRestoreRows = 0;
+  lastRestorePixels = 0;
   if (screensaverActive) { renderScreensaverPage(); return; }
   if (displayPage == DisplayPage::Overview) renderOverviewPage();
   else if (displayPage == DisplayPage::Table) renderTablePage();
@@ -3582,7 +4755,9 @@ void sortAircraftByDistance() {
 }
 
 void fetchAdsbV2Aircraft() {
-  logHeapDiagnostics("fetch-start");
+  // No heap line here: fetchAircraft() has just logged one, and two
+  // identical "fetch-start" readings per cycle is half the serial output
+  // saying the same thing twice.
   // Provider terms, checked directly against each provider's own published
   // docs (also summarised for the user in web_ui.h's providerNotes):
   // - adsb.fi (github.com/adsbfi/opendata): personal, non-commercial use
@@ -3658,7 +4833,6 @@ void fetchAdsbV2Aircraft() {
     return;
   }
 
-  bool aircraftAtZeroMiles = false;
   int responseCode = 0;
   // Keep the large provider response scoped so its String and JSON allocations
   // are released before the optional TLS route-enrichment requests.
@@ -3668,7 +4842,14 @@ void fetchAdsbV2Aircraft() {
   const char *fields[] = {"lat", "lon", "track", "true_heading", "mag_heading",
                           "alt_baro", "alt_geom", "gs", "baro_rate", "geom_rate",
                           "seen", "rssi", "messages", "flight", "hex", "r", "t",
-                          "squawk", "category", "ownOp", "cou", "emergency", "mlat"};
+                          "squawk", "category", "ownOp", "cou", "emergency", "mlat",
+                          // Resolved by the aggregator from the offline ICAO
+                          // lists. Reading them elsewhere is not enough: a
+                          // filter drops anything not named here, so these
+                          // arrived and were silently discarded during
+                          // parsing, which is why the panel kept showing
+                          // "B38M" and no radio callsign.
+                          "shape", "type_name", "telephony"};
   for (const char *field : fields) aircraftFilter[field] = true;
   // The aggregator resolves callsign->route server-side and attaches it
   // here, so this device never opens its own connection to adsbdb. A
@@ -3817,7 +4998,6 @@ void fetchAdsbV2Aircraft() {
     else if (!aircraft["true_heading"].isNull()) display.track = aircraft["true_heading"].as<float>();
     else display.track = aircraft["mag_heading"] | 0.0f;
     display.distanceMiles = distanceMilesFromHome(latitude, longitude);
-    if (lroundf(display.distanceMiles) == 0) aircraftAtZeroMiles = true;
     JsonVariant altitude = aircraft["alt_baro"];
     if (altitude.is<int>() || altitude.is<float>() || altitude.is<double>()) display.altitudeFt = lroundf(altitude.as<float>());
     else if (!aircraft["alt_geom"].isNull()) display.altitudeFt = lroundf(aircraft["alt_geom"].as<float>());
@@ -3839,12 +5019,22 @@ void fetchAdsbV2Aircraft() {
     strncpy(display.squawk, aircraft["squawk"] | "", sizeof(display.squawk) - 1);
     strncpy(display.category, aircraft["category"] | "", sizeof(display.category) - 1);
     strncpy(display.operatorName, aircraft["ownOp"] | "", sizeof(display.operatorName) - 1);
+    strncpy(display.typeName, aircraft["type_name"] | "", sizeof(display.typeName) - 1);
+    strncpy(display.telephony, aircraft["telephony"] | "", sizeof(display.telephony) - 1);
     strncpy(display.country, aircraft["cou"] | "", sizeof(display.country) - 1);
     strncpy(display.emergency, aircraft["emergency"] | "none", sizeof(display.emergency) - 1);
     // Resolve the silhouette once, here, rather than on every redraw: the
     // type table is a linear scan and these icons are drawn several times a
     // second.
-    display.iconShape = shapeForAircraft(display.aircraftType, display.category);
+    // The server's silhouette when it sent one, our own guess otherwise.
+    // A surface vehicle is still a surface vehicle whatever the type list
+    // says, so the on-ground rule is applied over the top of either.
+    const PlaneShape served = shapeFromName(aircraft["shape"] | "");
+    display.iconShape = served != PlaneShape::Generic
+                            ? served
+                            : shapeForAircraft(display.aircraftType, display.category, display.onGround);
+    if (display.onGround && display.iconShape == PlaneShape::Generic)
+      display.iconShape = PlaneShape::Ground;
     adoptServerRoute(display.flight, aircraft["route"].as<JsonObject>());
     JsonArray mlatFields = aircraft["mlat"].as<JsonArray>();
     display.positionSource = !mlatFields.isNull() && mlatFields.size() ? 2 : 0;
@@ -3921,7 +5111,6 @@ void fetchAdsbV2Aircraft() {
     saveRouteCacheToStorage();
     fetchPhases.routeSaveMs = millis() - saveStartedAt;
   }
-  if (aircraftAtZeroMiles) beepAlert();
   lastFetchCompletedAt = millis();
   finishFeedAttempt("OK", responseCode);
   { const uint32_t renderStartedAt = millis(); renderCurrentPage();
@@ -3950,7 +5139,6 @@ void fetchAircraft() {
     finishFeedAttempt("Authentication failed");
     status("AUTH", rgb(245,30,35)); present(); return;
   }
-  bool aircraftAtZeroMiles = false;
   // Release the large OpenSky response and JSON allocation before starting
   // the optional per-callsign HTTPS route lookups.
   {
@@ -4025,7 +5213,6 @@ void fetchAircraft() {
     display.longitude = longitude;
     display.track=state[10] | 0.0f;
     display.distanceMiles=distanceMilesFromHome(latitude,longitude);
-    if (lroundf(display.distanceMiles) == 0) aircraftAtZeroMiles = true;
     if (!state[7].isNull()) display.altitudeFt=lroundf(state[7].as<float>() * 3.28084f);
     else if (!state[13].isNull()) display.altitudeFt=lroundf(state[13].as<float>() * 3.28084f);
     if (!state[13].isNull()) display.geometricAltitudeFt=lroundf(state[13].as<float>() * 3.28084f);
@@ -4048,7 +5235,7 @@ void fetchAircraft() {
     if (!state[17].isNull()) openSkyCategoryToAdsb(state[17].as<int>(), display.category,
                                                    sizeof(display.category));
     strcpy(display.emergency, "none");
-    display.iconShape = shapeForAircraft(display.aircraftType, display.category);
+    display.iconShape = shapeForAircraft(display.aircraftType, display.category, display.onGround);
     ++lastCount;
   }
   sortAircraftByDistance();
@@ -4121,7 +5308,6 @@ void fetchAircraft() {
     saveRouteCacheToStorage();
     fetchPhases.routeSaveMs = millis() - saveStartedAt;
   }
-  if (aircraftAtZeroMiles) beepAlert();
   lastFetchCompletedAt = millis();
   finishFeedAttempt("OK", HTTP_CODE_OK);
   { const uint32_t renderStartedAt = millis(); renderCurrentPage();
@@ -4568,6 +5754,33 @@ void sendMessage(int statusCode, const char *message) {
   sendJson(statusCode, payload);
 }
 
+void handleLogApi() {
+  if (!requireWebAuthentication()) return;
+  if (!logRing) {
+    webServer.send(200, "text/plain",
+                   "No log buffer: the PSRAM allocation failed at boot, so "
+                   "these lines only went to the serial port.\n");
+    return;
+  }
+  // Oldest first, so it reads like a log file. Built in one String rather
+  // than streamed a line at a time: this runs on the network task, which
+  // also owns the fetches, and a chunked send would hold it longer.
+  String out;
+  out.reserve(static_cast<size_t>(logRingHeld) * 64);
+  const int first = (logRingHeld == LOG_RING_LINES) ? logRingNext : 0;
+  for (int n = 0; n < logRingHeld; ++n) {
+    const char *line = logRing + static_cast<size_t>((first + n) % LOG_RING_LINES) * LOG_RING_WIDTH;
+    if (line[0]) { out += line; out += '\n'; }
+  }
+  if (!logRingHeld) out = "Nothing logged yet.\n";
+  if (logRingDropped) {
+    out += "\n(";
+    out += logRingDropped;
+    out += " lines were logged before the buffer existed)\n";
+  }
+  webServer.send(200, "text/plain", out);
+}
+
 void handleStatusApi() {
   if (!requireWebAuthentication()) return;
   JsonDocument doc;
@@ -4624,10 +5837,16 @@ void handleStatusApi() {
   doc["sdUsedBytes"] = sdUsedBytes;
   doc["sdFreeBytes"] = sdTotalBytes >= sdUsedBytes ? sdTotalBytes - sdUsedBytes : 0;
   doc["tileCacheStorage"] = sdMounted ? "SD card" : "LittleFS";
+  // The fallback's own capacity, which was not reported at all: with a card
+  // fitted nobody looks at it, and the moment the card fails it is the only
+  // storage there is. Worth knowing how much room it has BEFORE that day -
+  // and every write to it disables the CPU cache, which is what starves the
+  // panel's bounce-buffer refill, so it is not a like-for-like substitute.
+  doc["fsTotalBytes"] = static_cast<uint32_t>(LittleFS.totalBytes());
+  doc["fsUsedBytes"] = static_cast<uint32_t>(LittleFS.usedBytes());
   doc["stagedUpdateReady"] = stagedUpdateReady;
   doc["stagedUpdateVersion"] = stagedUpdateVersion;
   doc["brightness"] = brightnessPercent;
-  doc["sound"] = soundAlerts;
   doc["screensaverEnabled"] = screensaverEnabled;
   doc["screensaverIdleMinutes"] = screensaverIdleMinutes;
   doc["pclkKhz"] = panelPclkHz / 1000UL;
@@ -4635,6 +5854,18 @@ void handleStatusApi() {
   doc["bounceLines"] = panelBounceLines;
   doc["bounceKb"] = 2UL * panelBounceLines * W * 2UL / 1024UL;
   doc["directDraw"] = panelDirectDraw;
+  // What the last present() pushed. 480 rows and 384,000 pixels is a whole
+  // frame; a typical update should be a small fraction of that.
+  doc["presentRows"] = lastPresentRows;
+  doc["presentPixels"] = lastPresentPixels;
+  doc["presentKb"] = static_cast<uint32_t>(lastPresentPixels * 2 / 1024);
+  // The restore side, which happens in both rendering modes - in direct
+  // draw there is no present() copy, so this is the only figure that moves.
+  doc["restoreRows"] = lastRestoreRows;
+  doc["restoreKb"] = static_cast<uint32_t>(lastRestorePixels * 2 / 1024);
+  doc["renderKb"] = static_cast<uint32_t>((lastRestorePixels + lastPresentPixels) * 2 / 1024);
+  doc["spanTracking"] = spansReady();
+  doc["logLines"] = logRingHeld;
   doc["screensaverActive"] = screensaverActive;
   doc["page"] = displayPageName();
   doc["latitude"] = homeLatitude;
@@ -4673,6 +5904,11 @@ void handleAircraftApi() {
     item["source"] = display.positionSource == 2 ? "MLAT" : "ADSB";
     item["registration"] = display.registration;
     item["aircraftType"] = display.aircraftType;
+    // Resolved by the aggregator from the ICAO lists: the full model name and
+    // the radio callsign. Empty on any other provider, which is why the
+    // browser falls back to the designator rather than showing a blank.
+    item["typeName"] = display.typeName;
+    item["telephony"] = display.telephony;
     item["squawk"] = display.squawk;
     item["category"] = display.category;
     // The browser map draws the same silhouette and colour as the panel, and
@@ -4783,6 +6019,35 @@ void handleWifiConnect() {
   WiFi.begin(ssid.c_str(), password.c_str());
 }
 
+void handleWifiSavedNetworks() {
+  if (!requireWebAuthentication()) return;
+  JsonDocument doc;
+  savedNetworkNames(doc["saved"].to<JsonArray>());
+  doc["max"] = MAX_SAVED_NETWORKS;
+  doc["current"] = WiFi.status() == WL_CONNECTED ? WiFi.SSID() : "";
+  String payload;
+  serializeJson(doc, payload);
+  sendJson(200, payload);
+}
+
+void handleWifiForgetNetwork() {
+  if (!requireWebAuthentication()) return;
+  if (!requireCsrfToken()) return;
+  const String ssid = webServer.arg("ssid");
+  if (!ssid.length()) {
+    sendMessage(400, "Name the network to forget");
+    return;
+  }
+  if (!forgetWifiNetwork(ssid)) {
+    sendMessage(404, "That network is not saved");
+    return;
+  }
+  // Deliberately does not disconnect. Forgetting the network the receiver
+  // is currently on should stop it being rejoined automatically later, not
+  // drop the connection the person is using to say so.
+  sendMessage(200, "Network forgotten");
+}
+
 void handlePageControl() {
   if (!requireWebAuthentication()) return;
   if (!requireCsrfToken()) return;
@@ -4809,10 +6074,6 @@ void handlePageControl() {
 void handleDisplaySettings() {
   if (!requireWebAuthentication()) return;
   if (!requireCsrfToken()) return;
-  if (webServer.hasArg("sound")) {
-    soundAlerts = webServer.arg("sound") == "1";
-    settingsStore.putBool("sound", soundAlerts);
-  }
   if (webServer.hasArg("screensaverEnabled")) {
     screensaverEnabled = webServer.arg("screensaverEnabled") == "1";
     settingsStore.putBool("ssaver-on", screensaverEnabled);
@@ -4834,52 +6095,6 @@ void handleDisplaySettings() {
     screensaverIdleMinutes = static_cast<uint16_t>(minutes);
     settingsStore.putUShort("ssaver-min", screensaverIdleMinutes);
     lastInteractionAt = millis();
-  }
-  if (webServer.hasArg("directDraw")) {
-    settingsStore.putBool("direct-draw", webServer.arg("directDraw") == "1");
-    // The framebuffer pointer is chosen once at boot, so this needs a
-    // restart like the other two panel settings.
-    restartPending = true;
-    restartAt = millis() + 1500;
-    sendMessage(202, "Rendering mode saved - rebooting to apply");
-    return;
-  }
-  if (webServer.hasArg("bounceLines")) {
-    long lines = 0;
-    bool known = false;
-    if (parseStrictLong(webServer.arg("bounceLines"), lines))
-      for (uint16_t choice : PANEL_BOUNCE_CHOICES)
-        if (choice == static_cast<uint16_t>(lines)) { known = true; break; }
-    if (!known) {
-      sendMessage(400, "Unsupported bounce buffer size");
-      return;
-    }
-    settingsStore.putUShort("bounce-lines", static_cast<uint16_t>(lines));
-    // Allocated when esp_lcd creates the panel, so like the pixel clock it
-    // only takes effect on the next boot.
-    restartPending = true;
-    restartAt = millis() + 1500;
-    sendMessage(202, "Bounce buffer saved - rebooting to apply");
-    return;
-  }
-  if (webServer.hasArg("pclkKhz")) {
-    long khz = 0;
-    bool known = false;
-    if (parseStrictLong(webServer.arg("pclkKhz"), khz))
-      for (uint32_t choice : PANEL_PCLK_CHOICES)
-        if (choice == static_cast<uint32_t>(khz) * 1000UL) { known = true; break; }
-    if (!known) {
-      sendMessage(400, "Unsupported pixel clock");
-      return;
-    }
-    settingsStore.putULong("pclk-khz", static_cast<uint32_t>(khz));
-    // The clock is latched when esp_lcd initialises the panel, so it cannot
-    // be changed on a running display - save it and restart. Long enough a
-    // delay for this response to reach the browser first.
-    restartPending = true;
-    restartAt = millis() + 1500;
-    sendMessage(202, "Pixel clock saved - rebooting to apply");
-    return;
   }
   // The brightness slider is gone: the CH422G drives the backlight enable as a
   // plain switch with no PWM channel, so any value between 10 and 100 looked
@@ -4922,6 +6137,7 @@ void handleLocationSettings() {
   settingsStore.putUChar("map-zoom", physicalMapZoom);
   physicalMapReady = false;
   physicalMapRefreshPending = true;
+  invalidateWholeFrame();
   nextFetchAt = 0;
   clearTileCache();
   sendMessage(202, "Location saved; rebuilding both maps and refreshing aircraft");
@@ -4966,6 +6182,7 @@ void handleSdRescan() {
   if (mounted) clearTileCache(true);
   physicalMapReady = false;
   physicalMapRefreshPending = true;
+  invalidateWholeFrame();
   sendMessage(200, mounted ? "SD card mounted; map cache moved to SD" :
                            "No readable SD card detected; LittleFS remains active");
 }
@@ -5229,6 +6446,7 @@ void beginWebControl() {
       webServer.send_P(200, "text/html", WEB_UI);
     });
     webServer.on("/api/status", HTTP_GET, handleStatusApi);
+    webServer.on("/api/log", HTTP_GET, handleLogApi);
     webServer.on("/api/aircraft", HTTP_GET, handleAircraftApi);
     webServer.on("/api/page", HTTP_POST, handlePageControl);
     webServer.on("/api/settings", HTTP_POST, handleDisplaySettings);
@@ -5245,6 +6463,8 @@ void beginWebControl() {
     webServer.on("/api/wifi/scan", HTTP_POST, handleWifiScanStart);
     webServer.on("/api/wifi/results", HTTP_GET, handleWifiScanResults);
     webServer.on("/api/wifi/connect", HTTP_POST, handleWifiConnect);
+    webServer.on("/api/wifi/saved", HTTP_GET, handleWifiSavedNetworks);
+    webServer.on("/api/wifi/forget", HTTP_POST, handleWifiForgetNetwork);
     webServer.on("/api/password", HTTP_POST, handlePasswordChange);
     webServer.on("/api/provider", HTTP_POST, handleProviderSettings);
     webServer.on("/api/marine/credentials", HTTP_POST, handleMarineCredentials);
@@ -5721,6 +6941,76 @@ void networkTask(void *) {
       previousWifiSsid = "";
       previousWifiPassword = "";
     }
+    // A logo the screensaver has just asked for. On the network task, so the
+    // TLS handshake and the SD write never happen on the core that drives
+    // the panel. At most one per pass, and the render path only asks for one
+    // at a time, so this cannot turn into a burst of HTTPS requests.
+    if (logoFetchPending) {
+      // Under the lock: the render task writes the code and the flag, and a
+      // three-byte copy read while it was being written would fetch some
+      // other airline's logo.
+      char code[4];
+      { MutexGuard guard(dataMutex); memcpy(code, logoFetchCode, 4); }
+      const LogoFetch outcome = cacheOperatorLogo(code);
+      MutexGuard guard(dataMutex);
+      if (outcome == LogoFetch::Cached) {
+        // Repaint so the logo replaces the initials now rather than at the
+        // next rotation. The screensaver skips repaints whose content has
+        // not changed, and the logo is not part of that signature, so
+        // without this the tile it was fetched for would already be gone.
+        screensaverNeedsRedraw = true;
+      } else if (outcome == LogoFetch::Unavailable) {
+        rememberLogoUnavailable(code);
+      }
+      // Cleared whatever happened: a Retry is worth another go, but on a
+      // later rotation rather than immediately, and clearing it here stops
+      // one unreachable logo blocking every other airline's.
+      logoFetchPending = false;
+    }
+
+    // And the type photograph, on the same terms. Separate from the logo so
+    // one missing image cannot block the other, and after it so a first
+    // sighting fetches the logo first - it is the smaller download and the
+    // more identifying picture.
+    if (photoFetchPending && !logoFetchPending) {
+      char code[8];
+      char airline[4];
+      {
+        MutexGuard guard(dataMutex);
+        memcpy(code, photoFetchCode, sizeof(code));
+        memcpy(airline, photoFetchAirline, sizeof(airline));
+      }
+      const LogoFetch outcome = cacheTypePhoto(code, airline);
+      MutexGuard guard(dataMutex);
+      if (outcome == LogoFetch::Cached) screensaverNeedsRedraw = true;
+      else if (outcome == LogoFetch::Unavailable) rememberPhotoUnavailable(code);
+      photoFetchPending = false;
+    }
+
+    // One place to record a network that works, whichever route got us
+    // there: the boot autoConnect, the setup portal, or the Wi-Fi page. The
+    // alternative was remembering at each of those call sites and missing
+    // one.
+    if (WiFi.status() == WL_CONNECTED) {
+      wifiDisconnectedSince = 0;
+      static String lastRemembered;
+      const String current = WiFi.SSID();
+      if (current.length() && current != lastRemembered) {
+        lastRemembered = current;
+        rememberWifiNetwork(current, WiFi.psk());
+      }
+    } else if (!wifiRollbackAt) {
+      // Not while a rollback is pending - that already has a network in
+      // mind and walking the list would fight it.
+      const uint32_t now = millis();
+      // Zero means "not currently disconnected", so the one tick per ~49
+      // days where millis() is genuinely 0 borrows the next millisecond.
+      if (!wifiDisconnectedSince) wifiDisconnectedSince = now ? now : 1;
+      else if (now - wifiDisconnectedSince >= WIFI_RETRY_AFTER_MS) {
+        wifiDisconnectedSince = 0;
+        connectSavedWifiNetwork();
+      }
+    }
     if (restartPending && static_cast<int32_t>(millis() - restartAt) >= 0) {
       delay(100);
       ESP.restart();
@@ -5768,32 +7058,37 @@ void networkTask(void *) {
       // failure backoff, which doesn't apply here.
       if (pauseAis) connectAisWebSocket();
       const uint32_t blockedMs = millis() - fetchStartedAt;
-      Serial.printf("fetchAircraft blocked the network task for %lu ms\n",
-                    static_cast<unsigned long>(blockedMs));
-      // Every blocking call inside a fetch is separately bounded (9s connect,
-      // 6s per route lookup, an explicit deadline on the body read), so a
-      // cycle in the tens of seconds means one of those bounds is not
-      // holding. Print where the time went so the next long cycle names the
-      // culprit instead of leaving it to inference. Anything the phases do
-      // not account for shows up as "other" - which is itself the answer if
-      // it is the large number.
+      // This is the number that says how long the panel and the web UI were
+      // frozen: the fetch holds dataMutex for its whole duration, the render
+      // task on the other core needs the same mutex, and the admin web
+      // server runs on this task.
+      //
+      // One line, with the breakdown folded in rather than printed
+      // separately. Every blocking call inside a fetch is separately bounded
+      // (9s connect, 6s per route lookup, a deadline on the body read), so
+      // the interesting question is always which phase the time went to -
+      // and whatever the phases do not account for shows up as "other",
+      // which is itself the answer when it is the large number. Two lines
+      // per cycle also halved how much history the 60-line ring could hold.
       if (blockedMs > FETCH_PHASE_REPORT_MS) {
         const uint32_t accounted = fetchPhases.aisPauseMs + fetchPhases.connectMs +
                                    fetchPhases.bodyMs + fetchPhases.parseMs +
                                    fetchPhases.routeMs + fetchPhases.routeSaveMs +
                                    fetchPhases.renderMs;
-        Serial.printf(
-            "  slow fetch breakdown: ais=%lu connect=%lu(x%u) body=%lu parse=%lu "
-            "routes=%lu(x%u worst=%lu) save=%lu render=%lu other=%lu\n",
-            static_cast<unsigned long>(fetchPhases.aisPauseMs),
-            static_cast<unsigned long>(fetchPhases.connectMs), fetchPhases.attempts,
-            static_cast<unsigned long>(fetchPhases.bodyMs),
-            static_cast<unsigned long>(fetchPhases.parseMs),
-            static_cast<unsigned long>(fetchPhases.routeMs), fetchPhases.routeLookups,
-            static_cast<unsigned long>(fetchPhases.routeWorstMs),
-            static_cast<unsigned long>(fetchPhases.routeSaveMs),
-            static_cast<unsigned long>(fetchPhases.renderMs),
-            static_cast<unsigned long>(blockedMs > accounted ? blockedMs - accounted : 0));
+        logLine("fetch blocked %lu ms: ais=%lu connect=%lu(x%u) body=%lu parse=%lu "
+                "routes=%lu(x%u worst=%lu) save=%lu render=%lu other=%lu",
+                static_cast<unsigned long>(blockedMs),
+                static_cast<unsigned long>(fetchPhases.aisPauseMs),
+                static_cast<unsigned long>(fetchPhases.connectMs), fetchPhases.attempts,
+                static_cast<unsigned long>(fetchPhases.bodyMs),
+                static_cast<unsigned long>(fetchPhases.parseMs),
+                static_cast<unsigned long>(fetchPhases.routeMs), fetchPhases.routeLookups,
+                static_cast<unsigned long>(fetchPhases.routeWorstMs),
+                static_cast<unsigned long>(fetchPhases.routeSaveMs),
+                static_cast<unsigned long>(fetchPhases.renderMs),
+                static_cast<unsigned long>(blockedMs > accounted ? blockedMs - accounted : 0));
+      } else {
+        logLine("fetch blocked %lu ms", static_cast<unsigned long>(blockedMs));
       }
       if (openSkyAuthRetryPending) nextFetchAt = millis() + 1000UL;
       else if (static_cast<int32_t>(millis() - nextFetchAt) >= 0) nextFetchAt = millis() + REFRESH_MS;
@@ -5804,6 +7099,9 @@ void networkTask(void *) {
 
 void setup() {
   Serial.begin(115200);
+  // Before anything that could fail interestingly, so the ring has somewhere
+  // to put it. PSRAM is up by now; nothing else has claimed any.
+  initLogRing();
   // First thing on the wire, before anything can fail: which binary is
   // actually running. Several rounds of debugging were spent on symptoms that
   // turned out to be a stale build or the wrong checkout being flashed, and
@@ -5848,8 +7146,8 @@ void setup() {
   dataMutex = xSemaphoreCreateRecursiveMutex();
   if (!LittleFS.begin(true)) Serial.println("LittleFS map cache unavailable");
   settingsStore.begin("adsb-web", false);
-  managementPassword = settingsStore.getString("password", "aircraft");
-  apiProvider = settingsStore.getString("provider", "opensky");
+  managementPassword = storedString("password", "aircraft");
+  apiProvider = storedString("provider", "opensky");
   if (apiProvider != "opensky" && apiProvider != "adsbfi" &&
       apiProvider != "airplaneslive" && apiProvider != "adsblol" &&
       apiProvider != "adsbone" && apiProvider != "adsbx" &&
@@ -5857,21 +7155,21 @@ void setup() {
   // Compiled-in credentials are opt-in. Without this flag a locally built
   // image carries no secret that `strings firmware.bin` could recover.
 #ifdef ADSB_BAKE_CREDENTIALS
-  openSkyClientId = settingsStore.getString("os-client", OPENSKY_CLIENT_ID);
-  openSkyClientSecret = settingsStore.getString("os-secret", OPENSKY_CLIENT_SECRET);
+  openSkyClientId = storedString("os-client", OPENSKY_CLIENT_ID);
+  openSkyClientSecret = storedString("os-secret", OPENSKY_CLIENT_SECRET);
 #else
-  openSkyClientId = settingsStore.getString("os-client", "");
-  openSkyClientSecret = settingsStore.getString("os-secret", "");
+  openSkyClientId = storedString("os-client", "");
+  openSkyClientSecret = storedString("os-secret", "");
 #endif
-  rapidApiKey = settingsStore.getString("rapid-key", "");
-  aggregatorApiKey = settingsStore.getString("agg-key", "");
-  flyItalyApiKey = settingsStore.getString("flyitaly-key", "");
-  aisApiKey = settingsStore.getString("ais-key", "");
-  aisHubUsername = settingsStore.getString("aishub-user", "");
-  myShipTrackingApiKey = settingsStore.getString("mst-key", "");
-  datalasticApiKey = settingsStore.getString("datalastic-key", "");
+  rapidApiKey = storedString("rapid-key", "");
+  aggregatorApiKey = storedString("agg-key", "");
+  flyItalyApiKey = storedString("flyitaly-key", "");
+  aisApiKey = storedString("ais-key", "");
+  aisHubUsername = storedString("aishub-user", "");
+  myShipTrackingApiKey = storedString("mst-key", "");
+  datalasticApiKey = storedString("datalastic-key", "");
   marineTrackingEnabled = settingsStore.getBool("marine-enabled", false);
-  marineProvider = settingsStore.getString("marine-provider", "aisstream");
+  marineProvider = storedString("marine-provider", "aisstream");
   if (marineProvider != "aisstream" && marineProvider != "aishub" &&
       marineProvider != "myshiptracking" && marineProvider != "datalastic") marineProvider = "aisstream";
   marineRadiusNm = constrain(settingsStore.getUShort("marine-radius", DEFAULT_MARINE_RADIUS_NM), 5, 250);
@@ -5882,7 +7180,6 @@ void setup() {
   if (!isfinite(homeLongitude) || homeLongitude < -180.0f || homeLongitude > 180.0f) homeLongitude = DEFAULT_HOME_LON;
   physicalMapZoom = constrain(settingsStore.getUChar("map-zoom", zoomForRadius()), 3, 16);
   displayPage = static_cast<DisplayPage>(constrain(settingsStore.getUChar("display-page", 0), 0, DISPLAY_PAGE_COUNT - 1));
-  soundAlerts = settingsStore.getBool("sound", true);
   screensaverEnabled = settingsStore.getBool("ssaver-on", false);
   screensaverIdleMinutes = constrain(settingsStore.getUShort("ssaver-min", 5), 1, 120);
   brightnessPercent = settingsStore.getUChar("brightness", 100);
@@ -5906,25 +7203,13 @@ void setup() {
     Serial.println("Rev4 display helper unavailable");
   }
   applyBrightness(brightnessPercent);
-  // Read before the panel exists: esp_lcd latches the pixel clock at init, so
-  // a change only takes effect on the next boot. An unknown stored value (a
-  // downgrade, a corrupted key) falls back to the board default rather than
-  // initialising the panel with something it cannot drive.
-  {
-    const uint32_t storedKhz = settingsStore.getULong("pclk-khz", PANEL_PCLK_HZ / 1000UL);
-    const uint32_t storedHz = storedKhz * 1000UL;
-    panelPclkHz = PANEL_PCLK_HZ;
-    for (uint32_t choice : PANEL_PCLK_CHOICES)
-      if (choice == storedHz) { panelPclkHz = storedHz; break; }
-  }
-  {
-    const uint16_t buildDefault = Arduino_ESP32RGBPanel::bounceBufferLines();
-    const uint16_t storedLines = settingsStore.getUShort("bounce-lines", buildDefault);
-    panelBounceLines = buildDefault;
-    for (uint16_t choice : PANEL_BOUNCE_CHOICES)
-      if (choice == storedLines) { panelBounceLines = storedLines; break; }
-    Arduino_ESP32RGBPanel::setBounceBufferLines(panelBounceLines);
-  }
+  // Fixed, not read from NVS - see the note by panelPclkHz. Any value a
+  // previous build stored is deliberately ignored, so a device that was once
+  // set to something worse comes back to the good configuration on this
+  // flash rather than keeping it with no UI left to change it.
+  panelPclkHz = PANEL_PCLK_HZ;
+  panelBounceLines = PANEL_BOUNCE_LINES;
+  Arduino_ESP32RGBPanel::setBounceBufferLines(panelBounceLines);
   createDisplay(panelPclkHz);
   Serial.printf("Panel pixel clock: %.1f MHz (~%.1f Hz refresh), bounce buffer %u lines (%u KB internal)\n",
                 panelPclkHz / 1000000.0f, panelRefreshHz(panelPclkHz), panelBounceLines,
@@ -5949,16 +7234,19 @@ void setup() {
   gfx->println("DISPLAY OK");
   return;
 #endif
-  renderBootScreen();
-  delay(2800);
   // Both of these used to be plain globals in internal DRAM - 44.5 KB for
   // the PNG decoder and 8.4 KB for the route cache - competing with the RGB
   // bounce buffers and every mbedTLS handshake for the scarcest memory on
   // the board. Neither needs the speed.
-  panelDirectDraw = settingsStore.getBool("direct-draw", false);
+  //
+  // The decoder is set up before the first boot screen rather than after it,
+  // because the boot screen is now a PNG and needs it. It only wants a PSRAM
+  // allocation, so there is nothing here that has to wait.
   initPngDecoder();
+  if (!pngDecoderPtr) Serial.println("PNG decoder allocation failed - images unavailable");
+  renderBootScreen();
+  delay(2800);
   initRouteCache();
-  if (!pngDecoderPtr) Serial.println("PNG decoder allocation failed - map tiles unavailable");
   if (!routeCache.data) Serial.println("Route cache allocation failed - routes unavailable");
   // In direct mode every pixel() lands in the panel's own buffer, so there
   // is no shadow to allocate and present() has nothing to copy.
@@ -5970,6 +7258,22 @@ void setup() {
                                         ? "direct to panel framebuffer"
                                         : "shadow buffer, copied on present()");
   baseMap=(uint16_t*)heap_caps_malloc(W*H*sizeof(uint16_t),MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
+  // One allocation sliced four ways rather than four allocations. If it
+  // fails, spansReady() stays false and restoreMap()/present() fall back to
+  // whole-frame copies - the behaviour before this existed - rather than
+  // drawing nothing.
+  int16_t *spans = static_cast<int16_t *>(heap_caps_malloc(
+      4 * H * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (spans) {
+    paintedLeft = spans;
+    paintedRight = spans + H;
+    pendingLeft = spans + 2 * H;
+    pendingRight = spans + 3 * H;
+    spanReset(paintedLeft, paintedRight);
+    spanReset(pendingLeft, pendingRight);
+  } else {
+    logLine("Dirty-span buffers unavailable - falling back to full-frame copies");
+  }
   latestAircraft = static_cast<AircraftDisplay *>(heap_caps_calloc(
       MAX_AIRCRAFT, sizeof(AircraftDisplay), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
   latestVessels = static_cast<VesselDisplay *>(heap_caps_calloc(
@@ -5991,9 +7295,15 @@ void setup() {
   });
   renderBootScreen("Wi-Fi connecting - please wait", rgb(53,169,244));
   if (!wm.autoConnect("ADSB_WIFI")) {
-    renderBootScreen("Wi-Fi failed - setup required", rgb(255,65,65));
-    delay(5000);
-    restoreMap(); status("WIFI",rgb(245,30,35)); present();
+    // autoConnect only knows the one network the ESP32 itself remembers.
+    // Before declaring setup required, try the others this receiver has
+    // successfully used - which is the whole point of keeping them.
+    renderBootScreen("Trying saved networks", rgb(53,169,244));
+    if (!connectSavedWifiNetwork()) {
+      renderBootScreen("Wi-Fi failed - setup required", rgb(255,65,65));
+      delay(5000);
+      restoreMap(); status("WIFI",rgb(245,30,35)); present();
+    }
   }
   if (WiFi.status() == WL_CONNECTED) {
     renderBootScreen("Wi-Fi connected: " + WiFi.localIP().toString(), rgb(55,215,110));
@@ -6150,23 +7460,21 @@ void loop() {
       millis() - lastInteractionAt > screensaverIdleMinutes * 60000UL) {
     screensaverActive = true;
     screensaverNeedsRedraw = true;
-    screensaverAircraftIndex = 0;
-    screensaverRotateAt = millis() + 6000UL;
+    screensaverRefreshAt = millis() + SCREENSAVER_REFRESH_MS;
     MutexGuard guard(dataMutex);
     renderCurrentPage();
-  } else if (screensaverActive && static_cast<int32_t>(millis() - screensaverRotateAt) >= 0) {
-    screensaverRotateAt = millis() + 6000UL;
-    // Rotating through one aircraft, or none, redraws an identical frame.
-    // Every one of those repaints clears the full screen - 768 KB of writes
-    // across the bus the panel refills its bounce buffers from - so it is a
-    // burst of exactly the kind that makes the picture slip, spent on a
-    // frame no one can tell from the one already on screen. Only redraw
-    // when the content will actually differ.
-    if (overheadAircraftCount() > 1) {
-      ++screensaverAircraftIndex;
-      MutexGuard guard(dataMutex);
-      renderCurrentPage();
-    }
+  } else if (screensaverActive && static_cast<int32_t>(millis() - screensaverRefreshAt) >= 0) {
+    screensaverRefreshAt = millis() + SCREENSAVER_REFRESH_MS;
+    // Every repaint clears the full screen - 768 KB of writes across the bus
+    // the panel refills its bounce buffers from - so it is a burst of
+    // exactly the kind that makes the picture slip. Hence a deliberately
+    // slow cadence, and renderScreensaverPage() still compares a signature
+    // of everything it draws and returns without touching the framebuffer
+    // when the frame would be identical. So this tick costs nothing on a
+    // quiet sky and repaints only when a value on screen has actually
+    // moved, or when a closer aircraft has taken over the display.
+    MutexGuard guard(dataMutex);
+    renderCurrentPage();
   }
   delay(15);
 }

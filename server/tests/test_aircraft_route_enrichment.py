@@ -114,3 +114,69 @@ def test_unknown_callsign_leaves_the_aircraft_untouched(client, resolver_with_st
     # "not looked up yet" from "looked up, nothing on file" by other means.
     assert "route" not in entry
     assert entry["flight"] == "PRIVATE1"
+
+
+# --- nearest first, and capped -----------------------------------------
+
+def _seed_many(client, count, spread_nm=90.0):
+    """count aircraft at increasing distance from the receiver."""
+    from app.main import app
+
+    fleet = []
+    for n in range(count):
+        # ~1 nm per 1/60 degree of latitude, so this walks steadily north.
+        fleet.append({"hex": f"4c{n:04x}", "flight": f"TST{n:04d}",
+                      "lat": 53.73 + (spread_nm * (n + 1) / count) / 60.0,
+                      "lon": -1.57, "alt_baro": 30000})
+    asyncio.get_event_loop().run_until_complete(
+        app.state.aggregator.cache.merge("test", fleet))
+    return fleet
+
+
+def test_aircraft_come_back_nearest_first(client):
+    """The firmware keeps the first MAX_AIRCRAFT it sees and only then sorts
+    by distance, so the order this endpoint returns decides which aircraft
+    exist as far as the panel is concerned."""
+    key = _issue_key(client)
+    _seed_many(client, 20)
+
+    body = client.get("/v1/aircraft", params={"lat": 53.73, "lon": -1.57, "radius": 250},
+                      headers={"Authorization": f"Bearer {key}"}).json()
+
+    latitudes = [entry["lat"] for entry in body["ac"]]
+    assert latitudes == sorted(latitudes), "not ordered by distance from the receiver"
+    assert body["ac"][0]["flight"] == "TST0000"
+
+
+def test_a_crowded_sky_is_capped_at_what_the_device_can_hold(client):
+    """Past the cap the device discards the rest. Capping here, after
+    sorting, makes that "the nearest 250" instead of an arbitrary 250 - at
+    100 nm on a busy evening the aircraft overhead could otherwise be the
+    one dropped."""
+    from app.routers.public import MAX_AIRCRAFT_PER_RESPONSE
+
+    key = _issue_key(client)
+    _seed_many(client, MAX_AIRCRAFT_PER_RESPONSE + 60)
+
+    body = client.get("/v1/aircraft", params={"lat": 53.73, "lon": -1.57, "radius": 250},
+                      headers={"Authorization": f"Bearer {key}"}).json()
+
+    assert len(body["ac"]) == MAX_AIRCRAFT_PER_RESPONSE
+    assert body["returned"] == MAX_AIRCRAFT_PER_RESPONSE
+    # total is what is in range, so a device can say "250 of 310" rather
+    # than presenting 250 as the whole sky.
+    assert body["total"] == MAX_AIRCRAFT_PER_RESPONSE + 60
+    # And the ones kept are the near ones.
+    latitudes = [entry["lat"] for entry in body["ac"]]
+    assert latitudes == sorted(latitudes)
+    assert max(latitudes) < 53.73 + 90 / 60.0
+
+
+def test_an_uncrowded_sky_reports_the_same_count_both_ways(client):
+    key = _issue_key(client)
+    _seed_many(client, 5)
+
+    body = client.get("/v1/aircraft", params={"lat": 53.73, "lon": -1.57, "radius": 250},
+                      headers={"Authorization": f"Bearer {key}"}).json()
+
+    assert body["total"] == body["returned"] == len(body["ac"]) == 5
