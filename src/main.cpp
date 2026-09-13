@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <strings.h>  // strncasecmp, used by the icon type-designator table
+#include <cstdarg>  // logLine() formats its own varargs into the ring buffer
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/semphr.h>
@@ -1304,10 +1305,77 @@ void applyTlsPolicy(WiFiClientSecure &client) {
 // shrinking cycle over cycle (a leak somewhere) or is already pinned at a
 // low ceiling from the very first cycle (something else holding it, e.g.
 // the web server's own connections or WiFiManager's leftover state).
+// The last few diagnostic lines, readable from a browser.
+//
+// This board already prints the one line that identifies a stall - the
+// "slow fetch breakdown" that names which phase of a fetch ate the time -
+// but only over USB. A receiver on a shelf with a frozen panel and an
+// unresponsive web UI is exactly the one nobody has a serial cable plugged
+// into, and power-cycling it to attach one throws the evidence away.
+//
+// So the lines that matter also go into a ring buffer in PSRAM and out of
+// /api/log as plain text. Deliberately not everything Serial prints:
+// hooking that would mean rewriting every call site, and most of them are
+// routine. logLine() marks the ones worth keeping.
+constexpr int LOG_RING_LINES = 60;
+constexpr int LOG_RING_WIDTH = 192;
+// The message is formatted into this before the uptime prefix is added, and
+// is deliberately smaller than the slot so the prefix can never push the
+// tail of a line off the end. The longest line kept here - the slow-fetch
+// breakdown, which is the whole reason this exists - runs to about 135
+// characters. 24 is what the prefix can reach at its widest - millis()
+// runs to ten digits before it wraps, so "[4294967.295s] " is the worst
+// case, not the five-digit field the format string suggests.
+constexpr int LOG_LINE_MAX = LOG_RING_WIDTH - 24;
+char *logRing = nullptr;
+uint16_t logRingNext = 0;
+uint16_t logRingHeld = 0;
+uint32_t logRingDropped = 0;
+
+void initLogRing() {
+  logRing = static_cast<char *>(heap_caps_calloc(
+      LOG_RING_LINES, LOG_RING_WIDTH, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  // No internal-RAM fallback: 9.6 KB of the scarcest memory on the board,
+  // for a convenience, is the wrong trade. Without it the lines still go to
+  // Serial and /api/log says so.
+}
+
+// Prints to Serial as before, and keeps a copy.
+void logLine(const char *format, ...) {
+  char line[LOG_LINE_MAX];
+  va_list args;
+  va_start(args, format);
+  const int written = vsnprintf(line, sizeof(line), format, args);
+  va_end(args);
+  if (written < 0) return;
+  Serial.println(line);
+  if (!logRing) {
+    ++logRingDropped;
+    return;
+  }
+  // Timestamped by uptime rather than wall clock: this board only learns the
+  // time from the aircraft feed, which is the thing most likely to be broken
+  // when somebody is reading this.
+  const uint32_t seconds = millis() / 1000;
+  char *slot = logRing + static_cast<size_t>(logRingNext) * LOG_RING_WIDTH;
+  snprintf(slot, LOG_RING_WIDTH, "[%5lu.%03lus] %s",
+           static_cast<unsigned long>(seconds),
+           static_cast<unsigned long>(millis() % 1000), line);
+  logRingNext = (logRingNext + 1) % LOG_RING_LINES;
+  if (logRingHeld < LOG_RING_LINES) ++logRingHeld;
+}
+
 void logHeapDiagnostics(const char *tag) {
-  Serial.printf("heap[%s]: free=%u largestInternal=%u\n", tag,
-                static_cast<unsigned>(ESP.getFreeHeap()),
-                static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)));
+  const size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  // Only the tight ones are worth a ring slot; at 32 KB a TLS handshake is
+  // already failing, which is what turns a fetch into a two-minute stall.
+  if (largest < 40000) {
+    logLine("heap[%s]: free=%u largestInternal=%u - TLS needs about 32 KB contiguous",
+            tag, static_cast<unsigned>(ESP.getFreeHeap()), static_cast<unsigned>(largest));
+  } else {
+    Serial.printf("heap[%s]: free=%u largestInternal=%u\n", tag,
+                  static_cast<unsigned>(ESP.getFreeHeap()), static_cast<unsigned>(largest));
+  }
 }
 
 // Where a fetch cycle's wall-clock time actually goes. The networkTask
@@ -2160,7 +2228,7 @@ bool paintBootImage() {
   // instead rather than failing to boot.
   bootPixels = static_cast<uint16_t *>(heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
   if (!bootPixels) {
-    Serial.println("Boot image: no PSRAM for the decode buffer");
+    logLine("Boot image: no PSRAM for the decode buffer");
     return false;
   }
   const int opened = pngDecoder.openRAM(const_cast<uint8_t *>(BOOT_IMAGE_PNG),
@@ -2174,7 +2242,7 @@ bool paintBootImage() {
     gfx->draw16bitRGBBitmap((W - BOOT_IMAGE_W) / 2, (H - BOOT_IMAGE_H) / 2,
                             bootPixels, BOOT_IMAGE_W, BOOT_IMAGE_H);
   } else {
-    Serial.printf("Boot image decode failed (open=%d)\n", opened);
+    logLine("Boot image decode failed (open=%d)", opened);
   }
   heap_caps_free(bootPixels);
   bootPixels = nullptr;
@@ -5456,6 +5524,33 @@ void sendMessage(int statusCode, const char *message) {
   sendJson(statusCode, payload);
 }
 
+void handleLogApi() {
+  if (!requireWebAuthentication()) return;
+  if (!logRing) {
+    webServer.send(200, "text/plain",
+                   "No log buffer: the PSRAM allocation failed at boot, so "
+                   "these lines only went to the serial port.\n");
+    return;
+  }
+  // Oldest first, so it reads like a log file. Built in one String rather
+  // than streamed a line at a time: this runs on the network task, which
+  // also owns the fetches, and a chunked send would hold it longer.
+  String out;
+  out.reserve(static_cast<size_t>(logRingHeld) * 64);
+  const int first = (logRingHeld == LOG_RING_LINES) ? logRingNext : 0;
+  for (int n = 0; n < logRingHeld; ++n) {
+    const char *line = logRing + static_cast<size_t>((first + n) % LOG_RING_LINES) * LOG_RING_WIDTH;
+    if (line[0]) { out += line; out += '\n'; }
+  }
+  if (!logRingHeld) out = "Nothing logged yet.\n";
+  if (logRingDropped) {
+    out += "\n(";
+    out += logRingDropped;
+    out += " lines were logged before the buffer existed)\n";
+  }
+  webServer.send(200, "text/plain", out);
+}
+
 void handleStatusApi() {
   if (!requireWebAuthentication()) return;
   JsonDocument doc;
@@ -5534,6 +5629,7 @@ void handleStatusApi() {
   doc["restoreKb"] = static_cast<uint32_t>(lastRestorePixels * 2 / 1024);
   doc["renderKb"] = static_cast<uint32_t>((lastRestorePixels + lastPresentPixels) * 2 / 1024);
   doc["spanTracking"] = spansReady();
+  doc["logLines"] = logRingHeld;
   doc["screensaverActive"] = screensaverActive;
   doc["page"] = displayPageName();
   doc["latitude"] = homeLatitude;
@@ -6164,6 +6260,7 @@ void beginWebControl() {
       webServer.send_P(200, "text/html", WEB_UI);
     });
     webServer.on("/api/status", HTTP_GET, handleStatusApi);
+    webServer.on("/api/log", HTTP_GET, handleLogApi);
     webServer.on("/api/aircraft", HTTP_GET, handleAircraftApi);
     webServer.on("/api/page", HTTP_POST, handlePageControl);
     webServer.on("/api/settings", HTTP_POST, handleDisplaySettings);
@@ -6770,8 +6867,11 @@ void networkTask(void *) {
       // failure backoff, which doesn't apply here.
       if (pauseAis) connectAisWebSocket();
       const uint32_t blockedMs = millis() - fetchStartedAt;
-      Serial.printf("fetchAircraft blocked the network task for %lu ms\n",
-                    static_cast<unsigned long>(blockedMs));
+      // Kept: this is the number that says the panel and the web UI were
+      // frozen, because the fetch holds dataMutex for its whole duration
+      // and the render task on the other core needs the same mutex.
+      logLine("fetchAircraft blocked the network task for %lu ms",
+              static_cast<unsigned long>(blockedMs));
       // Every blocking call inside a fetch is separately bounded (9s connect,
       // 6s per route lookup, an explicit deadline on the body read), so a
       // cycle in the tens of seconds means one of those bounds is not
@@ -6784,9 +6884,12 @@ void networkTask(void *) {
                                    fetchPhases.bodyMs + fetchPhases.parseMs +
                                    fetchPhases.routeMs + fetchPhases.routeSaveMs +
                                    fetchPhases.renderMs;
-        Serial.printf(
+        // The line that names the culprit, so it has to survive to
+        // /api/log rather than only reaching a serial cable nobody has
+        // attached when this happens.
+        logLine(
             "  slow fetch breakdown: ais=%lu connect=%lu(x%u) body=%lu parse=%lu "
-            "routes=%lu(x%u worst=%lu) save=%lu render=%lu other=%lu\n",
+            "routes=%lu(x%u worst=%lu) save=%lu render=%lu other=%lu",
             static_cast<unsigned long>(fetchPhases.aisPauseMs),
             static_cast<unsigned long>(fetchPhases.connectMs), fetchPhases.attempts,
             static_cast<unsigned long>(fetchPhases.bodyMs),
@@ -6806,6 +6909,9 @@ void networkTask(void *) {
 
 void setup() {
   Serial.begin(115200);
+  // Before anything that could fail interestingly, so the ring has somewhere
+  // to put it. PSRAM is up by now; nothing else has claimed any.
+  initLogRing();
   // First thing on the wire, before anything can fail: which binary is
   // actually running. Several rounds of debugging were spent on symptoms that
   // turned out to be a stale build or the wrong checkout being flashed, and
@@ -6990,7 +7096,7 @@ void setup() {
     spanReset(paintedLeft, paintedRight);
     spanReset(pendingLeft, pendingRight);
   } else {
-    Serial.println("Dirty-span buffers unavailable - falling back to full-frame copies");
+    logLine("Dirty-span buffers unavailable - falling back to full-frame copies");
   }
   latestAircraft = static_cast<AircraftDisplay *>(heap_caps_calloc(
       MAX_AIRCRAFT, sizeof(AircraftDisplay), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
