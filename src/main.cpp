@@ -1024,6 +1024,18 @@ constexpr int TABLE_VISIBLE_ROWS = 10;
 volatile bool bootButtonPending = false;
 WebServer webServer(80);
 Preferences settingsStore;
+
+// Preferences::getString() logs an ERROR line for a key that was never set,
+// which is not an error - an unconfigured API key or an unchanged password
+// is the normal state. The boot log opened with four of them:
+//
+//   [E][Preferences.cpp:506] getString(): nvs_get_str len fail: password NOT_FOUND
+//
+// which reads like something is wrong on a board where nothing is, and
+// buries the lines that matter. Asking first is silent.
+String storedString(const char *key, const char *fallback = "") {
+  return settingsStore.isKey(key) ? settingsStore.getString(key, fallback) : String(fallback);
+}
 String managementPassword;
 String firmwareUploadError;
 bool firmwareUploadStarted = false;
@@ -1186,7 +1198,7 @@ constexpr uint32_t WIFI_JOIN_TIMEOUT_MS = 12000UL;  // per network, while walkin
 uint32_t wifiDisconnectedSince = 0;
 
 String savedNetworksJson() {
-  return settingsStore.getString("wifi-nets", "[]");
+  return storedString("wifi-nets", "[]");
 }
 
 // SSIDs only. A password that has been stored is never sent back out, the
@@ -1308,7 +1320,7 @@ void applyTlsPolicy(WiFiClientSecure &client) {
 // The last few diagnostic lines, readable from a browser.
 //
 // This board already prints the one line that identifies a stall - the
-// "slow fetch breakdown" that names which phase of a fetch ate the time -
+// "fetch blocked" line that names which phase of a fetch ate the time -
 // but only over USB. A receiver on a shelf with a frozen panel and an
 // unresponsive web UI is exactly the one nobody has a serial cable plugged
 // into, and power-cycling it to attach one throws the evidence away.
@@ -1401,9 +1413,12 @@ struct FetchPhaseTimings {
 };
 FetchPhaseTimings fetchPhases;
 
-// Anything past this and the breakdown is worth the serial bandwidth. A
-// healthy cycle on a working feed completes in well under a second.
-constexpr uint32_t FETCH_PHASE_REPORT_MS = 5000;
+// Anything past this and the breakdown is worth the bandwidth. It was
+// 5,000 ms, which a healthy cycle never reaches - so the one thing that
+// would have explained a 1.5-second cycle never printed. A working feed on
+// this board blocks for about 1.4 s, nearly all of it outside the body
+// read, and that is worth knowing about rather than hiding.
+constexpr uint32_t FETCH_PHASE_REPORT_MS = 900;
 
 // One User-Agent for every outbound request, always matching the running
 // build. OpenStreetMap's tile policy requires an identifying, accurate UA.
@@ -1526,8 +1541,8 @@ bool mountSdCard() {
   sdUsedBytes = SDCARD.usedBytes();
   // Restore the staging metadata so a firmware staged before a reboot can
   // still be validated and installed; discard the file if it cannot be.
-  stagedUpdateVersion = settingsStore.getString("staged-ver", "");
-  stagedUpdateSha256 = settingsStore.getString("staged-sha", "");
+  stagedUpdateVersion = storedString("staged-ver", "");
+  stagedUpdateSha256 = storedString("staged-sha", "");
   stagedUpdateSize = settingsStore.getULong("staged-size", 0);
   stagedUpdateReady = SDCARD.exists(SD_UPDATE_FILE);
   if (stagedUpdateReady && (!stagedUpdateSize || stagedUpdateSha256.length() != 64)) {
@@ -3686,6 +3701,34 @@ void status(const char *label, uint16_t colour) {
   text5(layout::centreX-width/2,32,label,rgb(255,255,255));
 }
 
+// Walks the rows that differ from the panel: copies each span across when
+// asked to, records how much there was either way, and clears them.
+void pushPendingSpans(bool copyToPanel) {
+  if (!spansReady()) {
+    if (copyToPanel) gfx->draw16bitRGBBitmap(0, 0, framebuffer, W, H);
+    lastPresentRows = H;
+    lastPresentPixels = static_cast<uint32_t>(W) * H;
+    return;
+  }
+  uint16_t rows = 0;
+  uint32_t pixels = 0;
+  for (int y = 0; y < H; ++y) {
+    const int x0 = pendingLeft[y];
+    const int x1 = pendingRight[y];
+    if (x1 <= x0) continue;
+    // One row per call: the library's bitmap copy takes no source stride,
+    // so a taller block would have to be contiguous, which a span of the
+    // shadow buffer is not.
+    if (copyToPanel) gfx->draw16bitRGBBitmap(x0, y, framebuffer + y * W + x0, x1 - x0, 1);
+    pendingLeft[y] = static_cast<int16_t>(W);
+    pendingRight[y] = 0;
+    ++rows;
+    pixels += static_cast<uint32_t>(x1 - x0);
+  }
+  lastPresentRows = rows;
+  lastPresentPixels = pixels;
+}
+
 void present() {
   // Start the copy at the top of the vertical blanking interval. There is
   // exactly one framebuffer and the panel scans it out continuously, so
@@ -3707,7 +3750,14 @@ void present() {
     // cache so the LCD DMA reads what was drawn. No vsync wait either -
     // there is no bulk copy to keep ahead of the scan.
     gfx->flush(true);
-    // And no restart: the realign below exists to recover from that copy
+    // Nothing to copy, but the spans still have to be read and cleared.
+    // They say how much of the frame was drawn, which in this mode IS the
+    // PSRAM traffic - every pixel went straight into the panel's own
+    // buffer. Left unread they would also saturate to full rows, since
+    // nothing else clears them, and the figures would stop meaning
+    // anything.
+    pushPendingSpans(false);
+    // And no restart: the realign below exists to recover from the copy
     // starving the bounce-buffer refill, and in this mode there is no copy.
     // It was firing on every frame here regardless - re-initialising the
     // panel's DMA and the refill that is already the tight deadline, for a
@@ -3715,29 +3765,7 @@ void present() {
     return;
   }
   rgbpanel->waitForVsync(50);
-  if (spansReady()) {
-    uint16_t rows = 0;
-    uint32_t pixels = 0;
-    for (int y = 0; y < H; ++y) {
-      const int x0 = pendingLeft[y];
-      const int x1 = pendingRight[y];
-      if (x1 <= x0) continue;
-      // One row per call: the library's bitmap copy takes no source stride,
-      // so a taller block would have to be contiguous, which a span of the
-      // shadow buffer is not.
-      gfx->draw16bitRGBBitmap(x0, y, framebuffer + y * W + x0, x1 - x0, 1);
-      pendingLeft[y] = static_cast<int16_t>(W);
-      pendingRight[y] = 0;
-      ++rows;
-      pixels += static_cast<uint32_t>(x1 - x0);
-    }
-    lastPresentRows = rows;
-    lastPresentPixels = pixels;
-  } else {
-    gfx->draw16bitRGBBitmap(0, 0, framebuffer, W, H);
-    lastPresentRows = H;
-    lastPresentPixels = static_cast<uint32_t>(W) * H;
-  }
+  pushPendingSpans(true);
   // Realign the scan after the copy. esp_lcd_rgb_panel_restart() needs
   // CONFIG_LCD_RGB_RESTART_IN_VSYNC, which cannot be set from
   // platformio.ini with the prebuilt Arduino libraries - but it is already
@@ -4521,7 +4549,9 @@ void sortAircraftByDistance() {
 }
 
 void fetchAdsbV2Aircraft() {
-  logHeapDiagnostics("fetch-start");
+  // No heap line here: fetchAircraft() has just logged one, and two
+  // identical "fetch-start" readings per cycle is half the serial output
+  // saying the same thing twice.
   // Provider terms, checked directly against each provider's own published
   // docs (also summarised for the user in web_ui.h's providerNotes):
   // - adsb.fi (github.com/adsbfi/opendata): personal, non-commercial use
@@ -6867,38 +6897,37 @@ void networkTask(void *) {
       // failure backoff, which doesn't apply here.
       if (pauseAis) connectAisWebSocket();
       const uint32_t blockedMs = millis() - fetchStartedAt;
-      // Kept: this is the number that says the panel and the web UI were
-      // frozen, because the fetch holds dataMutex for its whole duration
-      // and the render task on the other core needs the same mutex.
-      logLine("fetchAircraft blocked the network task for %lu ms",
-              static_cast<unsigned long>(blockedMs));
-      // Every blocking call inside a fetch is separately bounded (9s connect,
-      // 6s per route lookup, an explicit deadline on the body read), so a
-      // cycle in the tens of seconds means one of those bounds is not
-      // holding. Print where the time went so the next long cycle names the
-      // culprit instead of leaving it to inference. Anything the phases do
-      // not account for shows up as "other" - which is itself the answer if
-      // it is the large number.
+      // This is the number that says how long the panel and the web UI were
+      // frozen: the fetch holds dataMutex for its whole duration, the render
+      // task on the other core needs the same mutex, and the admin web
+      // server runs on this task.
+      //
+      // One line, with the breakdown folded in rather than printed
+      // separately. Every blocking call inside a fetch is separately bounded
+      // (9s connect, 6s per route lookup, a deadline on the body read), so
+      // the interesting question is always which phase the time went to -
+      // and whatever the phases do not account for shows up as "other",
+      // which is itself the answer when it is the large number. Two lines
+      // per cycle also halved how much history the 60-line ring could hold.
       if (blockedMs > FETCH_PHASE_REPORT_MS) {
         const uint32_t accounted = fetchPhases.aisPauseMs + fetchPhases.connectMs +
                                    fetchPhases.bodyMs + fetchPhases.parseMs +
                                    fetchPhases.routeMs + fetchPhases.routeSaveMs +
                                    fetchPhases.renderMs;
-        // The line that names the culprit, so it has to survive to
-        // /api/log rather than only reaching a serial cable nobody has
-        // attached when this happens.
-        logLine(
-            "  slow fetch breakdown: ais=%lu connect=%lu(x%u) body=%lu parse=%lu "
-            "routes=%lu(x%u worst=%lu) save=%lu render=%lu other=%lu",
-            static_cast<unsigned long>(fetchPhases.aisPauseMs),
-            static_cast<unsigned long>(fetchPhases.connectMs), fetchPhases.attempts,
-            static_cast<unsigned long>(fetchPhases.bodyMs),
-            static_cast<unsigned long>(fetchPhases.parseMs),
-            static_cast<unsigned long>(fetchPhases.routeMs), fetchPhases.routeLookups,
-            static_cast<unsigned long>(fetchPhases.routeWorstMs),
-            static_cast<unsigned long>(fetchPhases.routeSaveMs),
-            static_cast<unsigned long>(fetchPhases.renderMs),
-            static_cast<unsigned long>(blockedMs > accounted ? blockedMs - accounted : 0));
+        logLine("fetch blocked %lu ms: ais=%lu connect=%lu(x%u) body=%lu parse=%lu "
+                "routes=%lu(x%u worst=%lu) save=%lu render=%lu other=%lu",
+                static_cast<unsigned long>(blockedMs),
+                static_cast<unsigned long>(fetchPhases.aisPauseMs),
+                static_cast<unsigned long>(fetchPhases.connectMs), fetchPhases.attempts,
+                static_cast<unsigned long>(fetchPhases.bodyMs),
+                static_cast<unsigned long>(fetchPhases.parseMs),
+                static_cast<unsigned long>(fetchPhases.routeMs), fetchPhases.routeLookups,
+                static_cast<unsigned long>(fetchPhases.routeWorstMs),
+                static_cast<unsigned long>(fetchPhases.routeSaveMs),
+                static_cast<unsigned long>(fetchPhases.renderMs),
+                static_cast<unsigned long>(blockedMs > accounted ? blockedMs - accounted : 0));
+      } else {
+        logLine("fetch blocked %lu ms", static_cast<unsigned long>(blockedMs));
       }
       if (openSkyAuthRetryPending) nextFetchAt = millis() + 1000UL;
       else if (static_cast<int32_t>(millis() - nextFetchAt) >= 0) nextFetchAt = millis() + REFRESH_MS;
@@ -6956,8 +6985,8 @@ void setup() {
   dataMutex = xSemaphoreCreateRecursiveMutex();
   if (!LittleFS.begin(true)) Serial.println("LittleFS map cache unavailable");
   settingsStore.begin("adsb-web", false);
-  managementPassword = settingsStore.getString("password", "aircraft");
-  apiProvider = settingsStore.getString("provider", "opensky");
+  managementPassword = storedString("password", "aircraft");
+  apiProvider = storedString("provider", "opensky");
   if (apiProvider != "opensky" && apiProvider != "adsbfi" &&
       apiProvider != "airplaneslive" && apiProvider != "adsblol" &&
       apiProvider != "adsbone" && apiProvider != "adsbx" &&
@@ -6965,21 +6994,21 @@ void setup() {
   // Compiled-in credentials are opt-in. Without this flag a locally built
   // image carries no secret that `strings firmware.bin` could recover.
 #ifdef ADSB_BAKE_CREDENTIALS
-  openSkyClientId = settingsStore.getString("os-client", OPENSKY_CLIENT_ID);
-  openSkyClientSecret = settingsStore.getString("os-secret", OPENSKY_CLIENT_SECRET);
+  openSkyClientId = storedString("os-client", OPENSKY_CLIENT_ID);
+  openSkyClientSecret = storedString("os-secret", OPENSKY_CLIENT_SECRET);
 #else
-  openSkyClientId = settingsStore.getString("os-client", "");
-  openSkyClientSecret = settingsStore.getString("os-secret", "");
+  openSkyClientId = storedString("os-client", "");
+  openSkyClientSecret = storedString("os-secret", "");
 #endif
-  rapidApiKey = settingsStore.getString("rapid-key", "");
-  aggregatorApiKey = settingsStore.getString("agg-key", "");
-  flyItalyApiKey = settingsStore.getString("flyitaly-key", "");
-  aisApiKey = settingsStore.getString("ais-key", "");
-  aisHubUsername = settingsStore.getString("aishub-user", "");
-  myShipTrackingApiKey = settingsStore.getString("mst-key", "");
-  datalasticApiKey = settingsStore.getString("datalastic-key", "");
+  rapidApiKey = storedString("rapid-key", "");
+  aggregatorApiKey = storedString("agg-key", "");
+  flyItalyApiKey = storedString("flyitaly-key", "");
+  aisApiKey = storedString("ais-key", "");
+  aisHubUsername = storedString("aishub-user", "");
+  myShipTrackingApiKey = storedString("mst-key", "");
+  datalasticApiKey = storedString("datalastic-key", "");
   marineTrackingEnabled = settingsStore.getBool("marine-enabled", false);
-  marineProvider = settingsStore.getString("marine-provider", "aisstream");
+  marineProvider = storedString("marine-provider", "aisstream");
   if (marineProvider != "aisstream" && marineProvider != "aishub" &&
       marineProvider != "myshiptracking" && marineProvider != "datalastic") marineProvider = "aisstream";
   marineRadiusNm = constrain(settingsStore.getUShort("marine-radius", DEFAULT_MARINE_RADIUS_NM), 5, 250);

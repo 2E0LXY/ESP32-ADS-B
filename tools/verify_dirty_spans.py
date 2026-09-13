@@ -46,14 +46,15 @@ def build_harness(source: str) -> str:
     spans += "inline void invalidateWholeFrame() { fullFrameNeeded = true; }\n"
     pixel = extract(source, "void pixel(int x, int y, uint16_t c) {", "\n}\n") + "\n}\n"
     restore = extract(source, "void restoreMap() {", "\n}\n") + "\n}\n"
-    present = extract(source, "  rgbpanel->waitForVsync(50);\n  if (spansReady()) {",
-                      "  // Realign the scan after the copy.")
+    present = extract(source, "void pushPendingSpans(bool copyToPanel) {", "\nvoid present()")
     present = (present
-               .replace("gfx->draw16bitRGBBitmap(x0, y, framebuffer + y * W + x0, x1 - x0, 1);",
-                        "panelBlit(x0, y, framebuffer + y * W + x0, x1 - x0, 1);")
-               .replace("gfx->draw16bitRGBBitmap(0, 0, framebuffer, W, H);",
-                        "panelBlit(0, 0, framebuffer, W, H);")
-               .replace("rgbpanel->waitForVsync(50);", ""))
+               .replace("if (copyToPanel) gfx->draw16bitRGBBitmap(x0, y, framebuffer + y * W + x0, x1 - x0, 1);",
+                        "if (copyToPanel) panelBlit(x0, y, framebuffer + y * W + x0, x1 - x0, 1);")
+               .replace("if (copyToPanel) gfx->draw16bitRGBBitmap(0, 0, framebuffer, W, H);",
+                        "if (copyToPanel) panelBlit(0, 0, framebuffer, W, H);"))
+    # The harness drives the span walk directly; present() itself is mode
+    # selection and a panel restart, neither of which exists on the host.
+    present += "\nvoid present() { pushPendingSpans(true); }\n"
     return HARNESS.replace("@SPANS@", spans).replace("@PIXEL@", pixel) \
                   .replace("@RESTORE@", restore).replace("@PRESENT@", present)
 
@@ -89,9 +90,7 @@ void panelBlit(int x, int y, const uint16_t *bitmap, int w, int h) {
 @PIXEL@
 @RESTORE@
 
-void present() {
 @PRESENT@
-}
 
 // --- the reference: whole-frame restore and whole-frame present ----------
 static std::vector<uint16_t> refShadow(W * H), refPanel(W * H);
