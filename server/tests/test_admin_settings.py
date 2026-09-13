@@ -349,3 +349,41 @@ def test_the_system_page_reports_a_shared_cache_and_checks_it_is_reachable(admin
         client_close = getattr(redis_client, "aclose", None)
         if client_close:
             admin.portal.call(client_close)
+
+
+def test_the_system_page_reports_both_key_gated_integrations(admin):
+    """With no keys set the page has to say so plainly. An operator who has
+    pasted a key needs somewhere that confirms it took, and the two
+    integrations are invisible otherwise - OpenSky merges into the same
+    aircraft response as the other three sources, and a schedule is a few
+    extra fields on an aircraft."""
+    page = admin.get("/admin/system")
+    assert page.status_code == 200, page.text
+    assert "Flight schedules" in page.text
+    assert "OpenSky" in page.text
+    assert "No API key" in page.text          # AirLabs, nothing stored
+    assert "no token held" in page.text       # OpenSky, no exchange has happened
+
+
+def test_a_stored_key_is_never_rendered_back(admin):
+    """The one hard rule about these three settings. The forms and the
+    status pages report whether a key is set, never what it is - a screen
+    share or a page saved by a browser must not be able to leak it."""
+    secret = "pk_live_do_not_show_this_anywhere"
+    saved = admin.post("/admin/settings", data=_form(airlabs_api_key=secret),
+                       follow_redirects=True)
+    assert saved.status_code == 200, saved.text
+
+    for path in ("/admin/settings", "/admin/system", "/admin/audit-log"):
+        page = admin.get(path)
+        assert secret not in page.text, path
+
+    # And it really was stored - otherwise the assertions above would pass
+    # for the wrong reason.
+    db = SessionLocal()
+    try:
+        stored = db.query(models.Setting).filter(
+            models.Setting.key == "airlabs_api_key").one()
+        assert stored.value == secret
+    finally:
+        db.close()

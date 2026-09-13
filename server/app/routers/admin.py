@@ -236,7 +236,16 @@ def _grouped_settings(store) -> list[tuple[str, list]]:
     groups: dict[str, list] = {}
     values = store.all()
     for definition in runtime_settings.DEFINITIONS:
-        definition.current = values[definition.name]
+        if definition.secret:
+            # The value never reaches the page. A stored key is not something
+            # the form needs to show in order to keep it, and a rendered one
+            # is a key in a browser cache, a screenshot and anybody's
+            # shoulder view.
+            definition.current = ""
+            definition.is_set = bool(values[definition.name])
+        else:
+            definition.current = values[definition.name]
+            definition.is_set = False
         groups.setdefault(definition.group, []).append(definition)
     return list(groups.items())
 
@@ -349,6 +358,15 @@ async def admin_system(
                 "percent": round(usage.used / usage.total * 100) if usage.total else 0}
 
     photos = state.photos.stats() if hasattr(state.photos, "stats") else {}
+    # The two key-gated integrations. Neither reports a key's value, here or
+    # anywhere: "configured" is a boolean derived from whether one is set.
+    opensky = state.aggregator._opensky
+    opensky_state = {
+        "enabled": state.settings.get("source_opensky"),
+        "configured": opensky.configured(state.settings.get("opensky_client_id"),
+                                         state.settings.get("opensky_client_secret")),
+        "token_seconds": opensky.token_seconds_left(),
+    }
     return templates.TemplateResponse(
         request,
         "admin_system.html",
@@ -373,6 +391,8 @@ async def admin_system(
             "reference_stats": state.reference.stats(),
             "logo_stats": state.logos.stats(),
             "pruner": state.usage_pruner,
+            "opensky": opensky_state,
+            "schedule_stats": state.schedules.stats(),
         },
     )
 

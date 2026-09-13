@@ -94,6 +94,7 @@ async def get_aircraft(
     # with a route on a later poll.
     resolver = _routes(request)
     reference = _reference(request)
+    schedules = getattr(request.app.state, "schedules", None)
     enriched = []
     for entry in aircraft:
         # Operator, model, country and the silhouette, from the offline
@@ -102,7 +103,17 @@ async def get_aircraft(
         # falls back to when a provider other than this one is selected.
         entry = reference.enrich(entry)
         route = resolver.lookup(entry.get("flight"))
-        enriched.append({**entry, "route": route} if route else entry)
+        if route:
+            entry = {**entry, "route": route}
+        # The airline's own view of the flight: times, terminal, gate, belt,
+        # delay. None until AirLabs is configured and the callsign has come
+        # back from the queue, and absent rather than empty when there is
+        # nothing - the firmware's filter drops what it is not asked for, so
+        # an extra key costs nothing until a build wants it.
+        timetable = schedules.lookup(entry.get("flight")) if schedules else None
+        if timetable:
+            entry = {**entry, "sched": timetable}
+        enriched.append(entry)
     aircraft = enriched
     ip = request.client.host if request.client else None
     firmware = firmware_from_user_agent(request.headers.get("user-agent"))

@@ -17,6 +17,7 @@ from .leader import Leadership
 from .log_buffer import install as install_log_buffer
 from .retention import UsageLogPruner
 from .runtime_settings import SettingsStore
+from .schedules import ScheduleResolver
 from .routers import admin, public
 
 logging.basicConfig(level=logging.INFO)
@@ -111,6 +112,14 @@ async def startup():
     app.state.routes = RouteResolver()
     app.state.routes.start()
 
+    # Scheduled and estimated times, terminal, gate, baggage belt and delay -
+    # the only things here that come from the airline rather than the
+    # aircraft. Off until an AirLabs key is set in the admin panel; queued
+    # in the background so no receiver ever waits on it. See
+    # app/schedules.py.
+    app.state.schedules = ScheduleResolver(app.state.settings)
+    app.state.schedules.start()
+
     # Operator names, aircraft models, countries and - most usefully - the
     # silhouette for each of 2,735 type designators. Loaded once, here, so no
     # request pays for reading a CSV. See app/reference.py.
@@ -171,6 +180,7 @@ async def startup():
 @app.on_event("shutdown")
 async def shutdown():
     await app.state.leadership.stop()
+    await app.state.schedules.stop()
     await app.state.usage_pruner.stop()
     await app.state.photos.stop()
     await app.state.logos.stop()

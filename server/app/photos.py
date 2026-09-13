@@ -141,10 +141,16 @@ class PhotoStore:
 
     def start(self):
         os.makedirs(self._dir, exist_ok=True)
-        self._client = httpx.AsyncClient(
-            timeout=DOWNLOAD_TIMEOUT_SECONDS, headers={"User-Agent": USER_AGENT},
-            follow_redirects=True,
-        )
+        # Whatever client is already set is kept. In the deployment there
+        # never is one, so this reads as "create it"; a second start() then
+        # cannot orphan the first client with its connections still open,
+        # and a test that injected a fake upstream keeps it instead of
+        # silently having its traffic sent to the real Openverse.
+        if self._client is None:
+            self._client = httpx.AsyncClient(
+                timeout=DOWNLOAD_TIMEOUT_SECONDS, headers={"User-Agent": USER_AGENT},
+                follow_redirects=True,
+            )
         self._queue = asyncio.Queue(maxsize=MAX_QUEUE)
         self._workers = [asyncio.create_task(self._worker()) for _ in range(WORKERS)]
 

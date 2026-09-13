@@ -19,6 +19,11 @@
     {% if setting.kind == "bool" %}
       <input type="checkbox" id="{{ setting.name }}" name="{{ setting.name }}"
              {% if setting.current %}checked{% endif %}>
+    {% elif setting.kind == "secret" %}
+      <input class="input" type="password" id="{{ setting.name }}" name="{{ setting.name }}"
+             autocomplete="new-password" spellcheck="false"
+             placeholder="{{ 'stored - leave blank to keep' if setting.is_set else 'not set' }}"
+             style="width:15em">
     {% else %}
       <input class="input" type="number" id="{{ setting.name }}" name="{{ setting.name }}"
              value="{{ setting.current }}"
@@ -30,7 +35,14 @@
     {% endif %}
   </td>
   <td class="sub">
-    {% if setting.kind != "bool" and setting.minimum is not none %}
+    {% if setting.kind == "secret" %}
+      {% if setting.is_set %}
+        <span class="badge ok">stored</span>
+        <label style="display:inline;margin:0 0 0 8px">
+          <input type="checkbox" name="{{ setting.name }}__clear"> clear
+        </label>
+      {% else %}not set{% endif %}
+    {% elif setting.kind != "bool" and setting.minimum is not none %}
       {{ setting.minimum }}{{ setting.unit }} to {{ setting.maximum }}{{ setting.unit }}
     {% endif %}
   </td>
@@ -44,7 +56,9 @@
 <div class="panel">
 <button type="submit">Save settings</button>
 <p class="sub" style="margin-bottom:0">These take effect immediately - no restart, so no
-  feeder connection is dropped. Anything that cannot be changed while running is shown
+  feeder connection is dropped. A stored key is never shown again: leave its box blank to
+  keep it, type over it to replace it, or tick <b>clear</b> to remove it. The audit log
+  records that a key changed, never what it is. Anything that cannot be changed while running is shown
   read-only on <a href="/admin/system">System</a>. Every change is recorded in the
   <a href="/admin/audit-log">audit log</a>.</p>
 </div>

@@ -6,10 +6,14 @@ management system, an admin panel, and feeder-key pooling.
 
 ## What this does
 
-- Polls adsb.fi, airplanes.live, and adsb.lol centrally on a shared cache and
-  dedupes by ICAO hex, so devices never hit those public APIs directly (see
-  the provider-terms comment in the firmware's `fetchAdsbV2Aircraft()` for why
-  that matters at more than a handful of devices).
+- Polls adsb.fi, airplanes.live, adsb.lol and (with credentials) the OpenSky
+  Network centrally on a shared cache and dedupes by ICAO hex, so devices
+  never hit those public APIs directly (see the provider-terms comment in the
+  firmware's `fetchAdsbV2Aircraft()` for why that matters at more than a
+  handful of devices).
+- Optional airline schedules from AirLabs - scheduled and estimated times,
+  terminal, gate, baggage belt, delay - attached to the aircraft already on
+  their way, none of which an ADS-B broadcast carries.
 - Customer accounts: sign up, register a device, get an issued API key.
 - Admin panel (separate login from customer accounts): create/suspend/delete
   accounts, view device activity, view upstream source health, audit log of
@@ -124,6 +128,8 @@ raw data being pushed straight into this backend.
 - `app/runtime_settings.py` - the settings an operator can change from the admin panel
 - `app/log_buffer.py` - recent log lines in memory, for `/admin/logs`
 - `app/feed_guard.py` - rejects aircraft a feeder could not really have heard
+- `app/opensky.py` - OpenSky as a fourth source: one OAuth token, SI units converted
+- `app/schedules.py` - AirLabs schedule lookups, cached and resolved in the background
 - `app/sbs.py` - SBS/BaseStation protocol decoder for incoming feeder connections
 - `app/feed_ingest.py` - per-device TCP listeners that accept customers' own feeds
 - `app/security.py` - password hashing, session tokens, API key generation/hashing
@@ -141,18 +147,30 @@ raw data being pushed straight into this backend.
   with firmware, address, location, last result, polls in 24h and feeder
   state.
 - **Settings** - `/admin/settings`. Poll interval, maximum polling areas
-  and area radius, which upstream sources are polled, usage-history
-  retention and whether aircraft photos are fetched. These take effect
+  and area radius, which upstream sources are polled, the OpenSky and
+  AirLabs credentials, usage-history retention and whether aircraft photos
+  are fetched. These take effect
   immediately: no restart, so no feeder connection is dropped. Values are
   validated (a poll interval of zero would hammer three free public APIs in
   a tight loop), a bad value rejects the whole submission rather than
   half-applying it, and every change is written to the audit log. There is
   also a "prune usage history now" button for when the retention window has
   just been shortened.
+
+  API keys are handled differently from every other setting on that page.
+  They are write-only: the form shows whether one is stored, never what it
+  is, an empty box means "leave the stored key alone" rather than "clear it"
+  (there is a checkbox for clearing), the audit log records that a key was
+  set or cleared and never its value, and no key is ever sent to a receiver.
+  Both integrations do nothing at all until their key is present - OpenSky
+  switched on without credentials says so once and is skipped rather than
+  recording an error every fifteen seconds.
 - **System** - `/admin/system`. What this process is actually doing: cache
   mode, whether Redis is reachable, which worker holds the polling role,
   database and image-cache sizes, disk free, reference-data counts, feeder
-  listeners. It also lists, explicitly, what **cannot** be changed without a
+  listeners, and whether the two key-gated integrations are configured (with
+  how long the held OpenSky token is still good for, so an operator who has
+  just pasted credentials can see the exchange succeed). It also lists, explicitly, what **cannot** be changed without a
   restart and why - `REDIS_URL` and the worker count are read once at
   startup, so a switch there would be lying.
 - **Password** - `/admin/password`. Until this existed the only admin
@@ -266,6 +284,13 @@ One resolution is shared by every customer who can see that flight. Lookups
 are queued and never block a device request: an unresolved callsign simply
 comes back without a route and picks one up on a later poll. See
 `app/routes.py`.
+
+Schedules follow the same pattern as routes: `app/schedules.py` queues an
+AirLabs lookup and attaches the answer as `sched` on a later poll, so a
+device never waits on it. The firmware does not display these fields yet -
+its ArduinoJson filter drops what it does not know, so the server can attach
+them harmlessly until the panel is taught to show a terminal, gate and
+delay. The web map is where they are visible today.
 
 Devices can be renamed from the account dashboard at any time; the name is
 cosmetic and does not affect the API key or the feeder port.

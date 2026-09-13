@@ -81,8 +81,31 @@
   <td>{% if photo_stats.enabled %}<span class="badge ok">On</span>{% else %}Off{% endif %}
     <span class="sub">{{ photo_stats.hits }} served, {{ photo_stats.fetches }} fetched,
       {{ photo_stats.queued }} queued, {{ photo_stats.search_failures }} search failures</span></td></tr>
+<tr><td>Flight schedules<br><span class="sub">AirLabs</span></td>
+  <td>{% if schedule_stats.enabled %}<span class="badge ok">On</span>
+    {% elif schedule_stats.configured %}Switched off
+    {% else %}<span class="badge bad">No API key</span>{% endif %}
+    <span class="sub">{{ schedule_stats.cached }} cached,
+      {{ schedule_stats.lookups }} looked up, {{ schedule_stats.hits }} served,
+      {{ schedule_stats.misses }} with no schedule, {{ schedule_stats.errors }} errors,
+      {{ schedule_stats.dropped }} dropped</span></td></tr>
+<tr><td>OpenSky<br><span class="sub">fourth upstream source</span></td>
+  <td>{% if opensky.enabled and opensky.configured %}<span class="badge ok">On</span>
+    {% elif opensky.enabled %}<span class="badge bad">No client ID and secret</span>
+    {% elif opensky.configured %}Switched off
+    {% else %}Not set up{% endif %}
+    <span class="sub">{% if opensky.token_seconds %}token good for
+      {{ (opensky.token_seconds / 60) | round | int }} more minutes
+      {% else %}no token held{% endif %}</span></td></tr>
 </tbody>
 </table>
+<p class="sub" style="margin-bottom:0">Both take a key on
+  <a href="/admin/settings">Settings</a> and do nothing until one is set. Keys are
+  stored write-only: the form shows whether one is set, never what it is, and an
+  empty box leaves the stored key alone rather than clearing it (there is a
+  checkbox for that). Schedules resolve in the background, so a gate or a delay
+  appears on a later poll rather than holding up the response - the same rule the
+  route lookups follow.</p>
 </div>
 
 <div class="panel">

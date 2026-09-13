@@ -36,6 +36,7 @@ def only_adsbfi():
     settings = SettingsStore()
     settings._values["source_airplaneslive"] = False
     settings._values["source_adsblol"] = False
+    settings._values["source_opensky"] = False
     return Aggregator(53.73, -1.57, 50, SessionLocal, settings=settings)
 
 
@@ -56,7 +57,7 @@ async def test_a_disabled_source_is_listed_but_not_treated_as_failing(only_adsbf
     something back on if the panel does not admit it exists, and a source
     switched back on needs somewhere to record its first attempt.
     """
-    assert set(only_adsbfi.health()) == {"adsbfi", "airplaneslive", "adsblol"}
+    assert set(only_adsbfi.health()) == {"adsbfi", "airplaneslive", "adsblol", "opensky"}
     assert only_adsbfi.source_enabled("adsbfi") is True
     assert only_adsbfi.source_enabled("airplaneslive") is False
     # And being off is not an error - nothing has failed.

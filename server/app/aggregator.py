@@ -35,6 +35,7 @@ from .cache import (  # re-exported: all of these lived here before the cache mo
 )
 from .cache import distance_nm as _distance_nm
 from .models import FeederKey, FeederProvider
+from .opensky import OpenSkyClient
 from .runtime_settings import SettingsStore
 
 logger = logging.getLogger("aggregator")
@@ -112,8 +113,12 @@ class Aggregator:
         # first attempt, and the dashboard should show a disabled source as
         # disabled rather than omitting it and implying it does not exist.
         self._health: dict[str, SourceHealth] = {
-            name: SourceHealth(name) for name in ("adsbfi", "airplaneslive", "adsblol")
+            name: SourceHealth(name)
+            for name in ("adsbfi", "airplaneslive", "adsblol", "opensky")
         }
+        # Polled with one credential shared by every receiver rather than
+        # each device holding its own - see app/opensky.py.
+        self._opensky = OpenSkyClient()
         self._feeder_cycle: dict[FeederProvider, itertools.cycle] = {}
         self._region_cursor = 0
         self._task: asyncio.Task | None = None
@@ -244,6 +249,7 @@ class Aggregator:
             self._poll_adsbfi(client, regions),
             self._poll_airplaneslive(client, regions),
             self._poll_adsblol(client, regions),
+            self._poll_opensky(client, regions),
             return_exceptions=True,
         )
 
@@ -335,6 +341,25 @@ class Aggregator:
         for lat, lon, radius in regions:
             url = f"https://api.adsb.lol/v2/point/{lat}/{lon}/{radius:.0f}"
             await self._record("adsblol", self._fetch(client, url, "ac"))
+
+    async def _poll_opensky(self, client: httpx.AsyncClient, regions):
+        if not self.source_enabled("opensky"):
+            return
+        client_id = self.settings.get("opensky_client_id")
+        client_secret = self.settings.get("opensky_client_secret")
+        if not self._opensky.configured(client_id, client_secret):
+            # Switched on with no credentials: say so once rather than
+            # recording an error against the source every fifteen seconds
+            # for something the operator has simply not finished setting up.
+            health = self._health["opensky"]
+            if health.last_error != "no credentials":
+                health.last_error = "no credentials"
+                health.ok = False
+                logger.info("OpenSky is enabled but has no client ID and secret set")
+            return
+        for lat, lon, radius in regions:
+            await self._record("opensky", self._opensky.fetch_region(
+                client, client_id, client_secret, lat, lon, radius))
 
     async def _fetch(self, client: httpx.AsyncClient, url: str, list_key: str) -> list[dict]:
         response = await client.get(url)

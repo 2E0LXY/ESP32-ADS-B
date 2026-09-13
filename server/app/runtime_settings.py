@@ -40,7 +40,7 @@ class Setting:
     def __init__(self, name: str, kind: str, default, *, label: str, help: str = "",
                  minimum=None, maximum=None, group: str = "General", unit: str = ""):
         self.name = name
-        self.kind = kind  # "int" | "float" | "bool"
+        self.kind = kind  # "int" | "float" | "bool" | "secret"
         self.default = default
         self.label = label
         self.help = help
@@ -49,6 +49,10 @@ class Setting:
         self.group = group
         self.unit = unit
 
+    @property
+    def secret(self) -> bool:
+        return self.kind == "secret"
+
     def parse(self, raw):
         """Turns form input or a stored string into the real value.
 
@@ -56,6 +60,14 @@ class Setting:
         typing 0 into the poll interval should be told the range, not given
         a service that hammers three public APIs in a tight loop.
         """
+        if self.kind == "secret":
+            # Whitespace only, because a pasted key regularly arrives with a
+            # trailing newline and a key that differs from the real one by
+            # one invisible character fails in a way nobody enjoys debugging.
+            value = ("" if raw is None else str(raw)).strip()
+            if value and len(value) > 200:
+                raise ValueError(f"{self.label} is too long to be a key")
+            return value
         if self.kind == "bool":
             return str(raw).strip().lower() in ("1", "true", "on", "yes")
         try:
@@ -69,7 +81,9 @@ class Setting:
         return value
 
     def to_text(self, value) -> str:
-        return "1" if (self.kind == "bool" and value) else "0" if self.kind == "bool" else str(value)
+        if self.kind == "bool":
+            return "1" if value else "0"
+        return str(value)
 
 
 def _env_int(name: str, fallback: int) -> int:
@@ -143,6 +157,53 @@ DEFINITIONS: list[Setting] = [
              "the position estimated from the feed itself, which a bad feed would move "
              "until it looked plausible.",
     ),
+    # --- OpenSky, pooled server-side ------------------------------------
+    Setting(
+        "source_opensky", "bool", os.environ.get("OPENSKY_ENABLED", "0") == "1",
+        label="Poll OpenSky Network", group="OpenSky",
+        help="A fourth upstream source, polled with one credential shared by every "
+             "receiver rather than each device holding its own. Off until a client ID "
+             "and secret are set below - it does nothing without them.",
+    ),
+    Setting(
+        "opensky_client_id", "secret", os.environ.get("OPENSKY_CLIENT_ID", ""),
+        label="OpenSky client ID", group="OpenSky",
+        help="From an OpenSky Network account's API client. OpenSky now accepts only "
+             "the OAuth2 client-credentials flow; username and password no longer work.",
+    ),
+    Setting(
+        "opensky_client_secret", "secret", os.environ.get("OPENSKY_CLIENT_SECRET", ""),
+        label="OpenSky client secret", group="OpenSky",
+        help="Stored on this server only, never sent to a receiver and never shown "
+             "again once saved.",
+    ),
+
+    # --- AirLabs schedules ----------------------------------------------
+    Setting(
+        "airlabs_schedules", "bool", os.environ.get("AIRLABS_SCHEDULES", "0") == "1",
+        label="Look up AirLabs schedules", group="AirLabs",
+        help="Adds the scheduled and estimated times, terminal, gate, baggage belt and "
+             "delay for each flight - information no ADS-B source carries, because it "
+             "comes from the airline rather than the aircraft. Looked up in the "
+             "background and attached to the aircraft the devices already fetch, so no "
+             "receiver ever waits on it.",
+    ),
+    Setting(
+        "airlabs_api_key", "secret", os.environ.get("AIRLABS_API_KEY", ""),
+        label="AirLabs API key", group="AirLabs",
+        help="From an airlabs.co account. The free tier is limited, so lookups are "
+             "cached and each callsign is asked about at most once per the interval "
+             "below however many receivers are watching that flight.",
+    ),
+    Setting(
+        "airlabs_cache_minutes", "int", 30,
+        label="Re-ask about a flight after", unit=" min", minimum=5, maximum=1440,
+        group="AirLabs",
+        help="A schedule barely changes in flight, and a delay that does change is "
+             "worth re-reading. Lower means fresher gate and delay information and more "
+             "of the monthly allowance spent.",
+    ),
+
     Setting(
         "usage_log_retention_days", "int", _env_int("USAGE_LOG_RETENTION_DAYS", 30),
         label="Usage history kept", unit=" days", minimum=1, maximum=3650, group="Housekeeping",
@@ -165,6 +226,7 @@ SOURCE_SETTINGS = {
     "adsbfi": "source_adsbfi",
     "airplaneslive": "source_airplaneslive",
     "adsblol": "source_adsblol",
+    "opensky": "source_opensky",
 }
 
 
@@ -175,11 +237,22 @@ def from_form(form) -> dict:
     naively would treat "the operator just turned adsb.fi off" as "adsb.fi
     was not mentioned" and leave it on. Every boolean is therefore filled
     in explicitly as False when missing.
+
+    Secrets are the opposite case and need the opposite rule. The form never
+    renders a stored key back, so its field arrives empty on every save -
+    and treating empty as "clear it" would wipe every API key the first time
+    somebody changed the poll interval. So an empty secret field means
+    "leave it alone", and clearing one takes its explicit checkbox.
     """
     submitted = {}
     for definition in DEFINITIONS:
         if definition.kind == "bool":
             submitted[definition.name] = definition.name in form
+        elif definition.secret:
+            if f"{definition.name}__clear" in form:
+                submitted[definition.name] = ""
+            elif str(form.get(definition.name, "")).strip():
+                submitted[definition.name] = form[definition.name]
         elif definition.name in form:
             submitted[definition.name] = form[definition.name]
     return submitted
@@ -263,10 +336,15 @@ class SettingsStore:
                 else:
                     row.value = text
                     row.updated_by = actor
-                db.add(models.AuditLog(
-                    actor=actor, action="change_setting", target=name,
-                    detail=f"{self._values.get(name)} -> {parsed[name]}",
-                ))
+                if definition.secret:
+                    # Never the value: the audit log is readable by every
+                    # admin and kept for ever, and "what the key was" is not
+                    # something it needs to answer.
+                    detail = "cleared" if parsed[name] == "" else "set"
+                else:
+                    detail = f"{self._values.get(name)} -> {parsed[name]}"
+                db.add(models.AuditLog(actor=actor, action="change_setting",
+                                       target=name, detail=detail))
             db.commit()
         finally:
             db.close()
