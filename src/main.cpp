@@ -2602,6 +2602,10 @@ LogoFetch cacheTypePhoto(const char *designator) {
   const String url = String(PHOTO_ENDPOINT) + designator + ".png?size=" + String(PHOTO_WIDTH);
   if (!http.begin(client, url)) return LogoFetch::Retry;
   http.addHeader("User-Agent", userAgent());
+  // Needed before GET() or the header is discarded. It is the only thing
+  // that tells the two 503s apart - see the note where they are handled.
+  static const char *PHOTO_HEADERS[] = {"Retry-After"};
+  http.collectHeaders(PHOTO_HEADERS, 1);
   const int status = http.GET();
   if (status == HTTP_CODE_NOT_FOUND) {
     // A real answer: no attribution-free photograph exists for this type.
@@ -2613,7 +2617,26 @@ LogoFetch cacheTypePhoto(const char *designator) {
     return LogoFetch::Unavailable;
   }
   if (status == 503) {
-    Serial.printf("Photo %s: aggregator has photographs disabled\n", designator);
+    // Two different answers share this status, and the retry delay is what
+    // separates them: the aggregator queues a photograph it has not fetched
+    // yet and says to come back in 30 seconds, or it says the type has no
+    // photograph to fetch - switched off, or no model name to search on -
+    // and asks for an hour. Reporting both as "photographs disabled" was
+    // wrong and actively misleading: it printed that line for types that
+    // were merely queued and arrived seconds later, which is what "Photo
+    // EC45: aggregator has photographs disabled" followed by a cached
+    // B733 in the same run actually was.
+    //
+    // Behaviour is unchanged - Retry either way, and no miss marker, so a
+    // queued photograph is never recorded as absent. This is the log line
+    // telling the truth about which of the two happened.
+    const long retryAfter = http.header("Retry-After").toInt();
+    if (retryAfter > 300)
+      Serial.printf("Photo %s: aggregator has none to give (retry in %lds)\n",
+                    designator, retryAfter);
+    else
+      Serial.printf("Photo %s: queued on the aggregator, asking again shortly\n",
+                    designator);
     http.end();
     return LogoFetch::Retry;
   }
