@@ -400,7 +400,6 @@ If the board does not enter download mode, hold **BOOT**, tap **RESET**, begin t
 - MLAT aircraft: violet/red symbol
 - AIS vessel positions: event-driven over a persistent WebSocket, not polled - a quiet Marine page in low-traffic water is normal
 - Route lookup: public ADSBDB callsign endpoint, cached for six hours and persisted to SD (or LittleFS without a card) so a reboot doesn't start cold; the Table page shows the fullest name that fits (full name, then city, then a departure-board-style abbreviation, then the raw code), while the Overview and Map pages show the raw code. `NO ROUTE` / `NO RTE` means adsbdb was asked and had nothing on file (typically a private/GA registration), distinct from `---` which means still queued
-- Zero-mile aircraft: optional 200 ms buzzer alert
 - OSM failure: falls back to the built-in radar-style map
 
 ## OpenStreetMap usage

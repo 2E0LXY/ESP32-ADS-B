@@ -1057,7 +1057,6 @@ String openSkyClientSecret;
 String rapidApiKey;
 String aggregatorApiKey;
 String flyItalyApiKey;
-bool soundAlerts = true;
 // Screensaver: after screensaverIdleMinutes with no touch/button/web-UI
 // interaction, the panel switches to a rotating single-aircraft
 // departure-board style display (renderScreensaverPage()) instead of
@@ -2950,17 +2949,6 @@ bool applyBrightness(uint8_t percent) {
 #endif
 }
 
-void beepAlert() {
-#if BOARD_EXPANDER_CH32
-  if (!soundAlerts) return;
-  WS_CH32_IO::writeRegister(Wire, WS_CH32_IO::REG_OUTPUT,
-                            WS_CH32_IO::OUT_DISPLAY_ON | WS_CH32_IO::PIN_BEE_EN);
-  delay(200);
-  WS_CH32_IO::writeRegister(Wire, WS_CH32_IO::REG_OUTPUT,
-                            WS_CH32_IO::OUT_DISPLAY_ON);
-#endif  // no buzzer is wired on the CH422G boards
-}
-
 const char *compassDirection(float track) {
   static const char *directions[] = {"N","NE","E","SE","S","SW","W","NW"};
   int index = static_cast<int>((track + 22.5f) / 45.0f) & 7;
@@ -4845,7 +4833,6 @@ void fetchAdsbV2Aircraft() {
     return;
   }
 
-  bool aircraftAtZeroMiles = false;
   int responseCode = 0;
   // Keep the large provider response scoped so its String and JSON allocations
   // are released before the optional TLS route-enrichment requests.
@@ -5011,7 +4998,6 @@ void fetchAdsbV2Aircraft() {
     else if (!aircraft["true_heading"].isNull()) display.track = aircraft["true_heading"].as<float>();
     else display.track = aircraft["mag_heading"] | 0.0f;
     display.distanceMiles = distanceMilesFromHome(latitude, longitude);
-    if (lroundf(display.distanceMiles) == 0) aircraftAtZeroMiles = true;
     JsonVariant altitude = aircraft["alt_baro"];
     if (altitude.is<int>() || altitude.is<float>() || altitude.is<double>()) display.altitudeFt = lroundf(altitude.as<float>());
     else if (!aircraft["alt_geom"].isNull()) display.altitudeFt = lroundf(aircraft["alt_geom"].as<float>());
@@ -5125,7 +5111,6 @@ void fetchAdsbV2Aircraft() {
     saveRouteCacheToStorage();
     fetchPhases.routeSaveMs = millis() - saveStartedAt;
   }
-  if (aircraftAtZeroMiles) beepAlert();
   lastFetchCompletedAt = millis();
   finishFeedAttempt("OK", responseCode);
   { const uint32_t renderStartedAt = millis(); renderCurrentPage();
@@ -5154,7 +5139,6 @@ void fetchAircraft() {
     finishFeedAttempt("Authentication failed");
     status("AUTH", rgb(245,30,35)); present(); return;
   }
-  bool aircraftAtZeroMiles = false;
   // Release the large OpenSky response and JSON allocation before starting
   // the optional per-callsign HTTPS route lookups.
   {
@@ -5229,7 +5213,6 @@ void fetchAircraft() {
     display.longitude = longitude;
     display.track=state[10] | 0.0f;
     display.distanceMiles=distanceMilesFromHome(latitude,longitude);
-    if (lroundf(display.distanceMiles) == 0) aircraftAtZeroMiles = true;
     if (!state[7].isNull()) display.altitudeFt=lroundf(state[7].as<float>() * 3.28084f);
     else if (!state[13].isNull()) display.altitudeFt=lroundf(state[13].as<float>() * 3.28084f);
     if (!state[13].isNull()) display.geometricAltitudeFt=lroundf(state[13].as<float>() * 3.28084f);
@@ -5325,7 +5308,6 @@ void fetchAircraft() {
     saveRouteCacheToStorage();
     fetchPhases.routeSaveMs = millis() - saveStartedAt;
   }
-  if (aircraftAtZeroMiles) beepAlert();
   lastFetchCompletedAt = millis();
   finishFeedAttempt("OK", HTTP_CODE_OK);
   { const uint32_t renderStartedAt = millis(); renderCurrentPage();
@@ -5865,7 +5847,6 @@ void handleStatusApi() {
   doc["stagedUpdateReady"] = stagedUpdateReady;
   doc["stagedUpdateVersion"] = stagedUpdateVersion;
   doc["brightness"] = brightnessPercent;
-  doc["sound"] = soundAlerts;
   doc["screensaverEnabled"] = screensaverEnabled;
   doc["screensaverIdleMinutes"] = screensaverIdleMinutes;
   doc["pclkKhz"] = panelPclkHz / 1000UL;
@@ -6093,10 +6074,6 @@ void handlePageControl() {
 void handleDisplaySettings() {
   if (!requireWebAuthentication()) return;
   if (!requireCsrfToken()) return;
-  if (webServer.hasArg("sound")) {
-    soundAlerts = webServer.arg("sound") == "1";
-    settingsStore.putBool("sound", soundAlerts);
-  }
   if (webServer.hasArg("screensaverEnabled")) {
     screensaverEnabled = webServer.arg("screensaverEnabled") == "1";
     settingsStore.putBool("ssaver-on", screensaverEnabled);
@@ -7203,7 +7180,6 @@ void setup() {
   if (!isfinite(homeLongitude) || homeLongitude < -180.0f || homeLongitude > 180.0f) homeLongitude = DEFAULT_HOME_LON;
   physicalMapZoom = constrain(settingsStore.getUChar("map-zoom", zoomForRadius()), 3, 16);
   displayPage = static_cast<DisplayPage>(constrain(settingsStore.getUChar("display-page", 0), 0, DISPLAY_PAGE_COUNT - 1));
-  soundAlerts = settingsStore.getBool("sound", true);
   screensaverEnabled = settingsStore.getBool("ssaver-on", false);
   screensaverIdleMinutes = constrain(settingsStore.getUShort("ssaver-min", 5), 1, 120);
   brightnessPercent = settingsStore.getUChar("brightness", 100);
