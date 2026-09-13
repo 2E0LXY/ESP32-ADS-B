@@ -2264,6 +2264,49 @@ bool paintBootImage() {
   return success;
 }
 
+// "Nothing available for this one" markers, and how they are retired.
+//
+// A logo or photo the aggregator says it has none of is recorded so the
+// device stops asking - most of the 2,700 type designators are things
+// nobody photographs, and re-asking for all of them every rotation is
+// pointless traffic.
+//
+// The marker was an empty file and therefore permanent, which turned a
+// server-side bug into a lasting one: the photo endpoint answered "queued,
+// not fetched yet" with a 404, the device read that as "none exists", and
+// every type got blacklisted on the FIRST request - before the queue had
+// fetched anything. Receivers ran for hours reporting "none available" for
+// everything while the server held the pictures.
+//
+// The server side is fixed (that case is a 503 now), but the markers those
+// 404s wrote are still on every card. So a marker carries a generation
+// number and one from an older generation is deleted and retried. Bumping
+// the constant invalidates every miss on every receiver at the next
+// update, with no card surgery and no timestamps - which matters because
+// this board has no clock until it has a feed, and a card written with no
+// time source dates its files to 1980.
+constexpr char MISS_MARKER_GENERATION[] = "2";
+
+bool missMarkerIsCurrent(fs::FS &cache, const String &path) {
+  File marker = cache.open(path, FILE_READ);
+  if (!marker) return false;
+  char stored[8] = {0};
+  const size_t read = marker.readBytes(stored, sizeof(stored) - 1);
+  marker.close();
+  stored[read] = 0;
+  if (strcmp(stored, MISS_MARKER_GENERATION) == 0) return true;
+  // Older generation, or the empty file the permanent markers used to be.
+  cache.remove(path);
+  return false;
+}
+
+void writeMissMarker(fs::FS &cache, const String &path) {
+  File marker = cache.open(path, FILE_WRITE);
+  if (!marker) return;
+  marker.print(MISS_MARKER_GENERATION);
+  marker.close();
+}
+
 // The ICAO operator prefix of a callsign: RYR2BH is Ryanair. Empty when the
 // callsign cannot carry one, which is most GA traffic - those keep the
 // initials tile.
@@ -2472,7 +2515,7 @@ LogoFetch cacheOperatorLogo(const char *code) {
   fs::FS &cache = sdMounted ? static_cast<fs::FS &>(SDCARD) : static_cast<fs::FS &>(LittleFS);
   const String path = operatorLogoPath(code);
   const String missPath = operatorLogoMissPath(code);
-  if (cache.exists(missPath)) return LogoFetch::Unavailable;
+  if (missMarkerIsCurrent(cache, missPath)) return LogoFetch::Unavailable;
   // Present already means the draw that asked for this failed to decode it
   // and removed it, or another pass just fetched it. Either way it is worth
   // one repaint to find out.
@@ -2500,8 +2543,7 @@ LogoFetch cacheOperatorLogo(const char *code) {
     // A real answer, not a failure: the aggregator has no logo for this
     // airline. Remember it so we stop asking.
     http.end();
-    File marker = cache.open(missPath, FILE_WRITE);
-    if (marker) marker.close();
+    writeMissMarker(cache, missPath);
     Serial.printf("Logo %s: none available\n", code);
     return LogoFetch::Unavailable;
   }
@@ -2542,7 +2584,7 @@ LogoFetch cacheTypePhoto(const char *designator) {
   fs::FS &cache = sdMounted ? static_cast<fs::FS &>(SDCARD) : static_cast<fs::FS &>(LittleFS);
   const String path = typePhotoPath(designator);
   const String missPath = typePhotoMissPath(designator);
-  if (cache.exists(missPath)) return LogoFetch::Unavailable;
+  if (missMarkerIsCurrent(cache, missPath)) return LogoFetch::Unavailable;
   if (cache.exists(path)) return LogoFetch::Cached;
   if (WiFi.status() != WL_CONNECTED) return LogoFetch::Retry;
   if (tileCacheFreeBytes() < MIN_TILE_CACHE_FREE_BYTES) return LogoFetch::Retry;
@@ -2566,8 +2608,7 @@ LogoFetch cacheTypePhoto(const char *designator) {
     // Recorded so we stop asking, which matters more here than for logos -
     // most of the 2,700 designators are types nobody photographs.
     http.end();
-    File marker = cache.open(missPath, FILE_WRITE);
-    if (marker) marker.close();
+    writeMissMarker(cache, missPath);
     Serial.printf("Photo %s: none available\n", designator);
     return LogoFetch::Unavailable;
   }
@@ -4211,15 +4252,26 @@ void fitText(char *text, int xLeft, int scale) {
 // Split out of renderScreensaverPage() so the rotate timer can ask how many
 // there are without repainting the screen to find out.
 int collectOverheadAircraft(int *matches, int capacity) {
-  constexpr float OVERHEAD_MAX_SLANT_MILES = 5.0f;
+  // Ground distance, not slant range.
+  //
+  // This measured sqrt(ground^2 + altitude^2) against 5 miles, which makes
+  // altitude DISQUALIFYING: 5 miles is 26,400 ft, so an aircraft directly
+  // above the receiver at cruise scored 6.8 miles and was excluded, however
+  // exactly overhead it was. Nothing above 26,400 ft could ever qualify. A
+  // 787 passing at 3.1 miles and 35,900 ft - plotted on the web map, plainly
+  // overhead - scored 7.5 and the screensaver said NO OVERHEAD AIRCRAFT
+  // while showing a light aircraft at 1,725 ft instead.
+  //
+  // "Overhead" means in the sky above here, and altitude is what makes an
+  // aircraft overhead rather than on final approach somewhere else. The only
+  // thing that should exclude one is being on the ground, which onGround
+  // already covers.
+  constexpr float OVERHEAD_MAX_GROUND_MILES = 5.0f;
   int count = 0;
   for (int i = 0; i < lastCount && count < capacity; ++i) {
     const AircraftDisplay &candidate = latestAircraft[i];
     if (candidate.onGround) continue;
-    const float altitudeMiles = candidate.altitudeFt > 0 ? candidate.altitudeFt / 5280.0f : 0.0f;
-    const float slantMiles =
-        sqrtf(candidate.distanceMiles * candidate.distanceMiles + altitudeMiles * altitudeMiles);
-    if (slantMiles <= OVERHEAD_MAX_SLANT_MILES) matches[count++] = i;
+    if (candidate.distanceMiles <= OVERHEAD_MAX_GROUND_MILES) matches[count++] = i;
   }
   return count;
 }

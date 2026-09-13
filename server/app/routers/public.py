@@ -9,11 +9,18 @@ from sqlalchemy.orm import Session
 
 from .. import models, security
 from ..aggregator import Aggregator
+from ..cache import distance_nm as _distance_nm
 from ..database import get_db
 from ..deps import get_current_account, require_device_api_key
 from ..feed_ingest import allocate_port
 from ..logos import DEFAULT_SIZE, code_for_callsign
 from ..photos import DEFAULT_WIDTH as PHOTO_DEFAULT_WIDTH
+
+# The most aircraft one /v1/aircraft response may carry. Matches the
+# firmware's own MAX_AIRCRAFT, so the device never has to discard any: it
+# gets the nearest this many and keeps all of them. Raising it past what the
+# device can hold would put the arbitrary truncation straight back.
+MAX_AIRCRAFT_PER_RESPONSE = 250
 
 router = APIRouter()
 templates = Jinja2Templates(directory="app/templates")
@@ -62,6 +69,24 @@ async def get_aircraft(
 ):
     aggregator = _aggregator(request)
     aircraft = await aggregator.cache.query(lat, lon, radius)
+    total_in_range = len(aircraft)
+    # Nearest first, and capped.
+    #
+    # The cache returns whatever order it happens to hold - dict insertion
+    # order in process, GEOSEARCH member order in Redis - and the firmware
+    # keeps the first MAX_AIRCRAFT (250) it sees, THEN sorts those by
+    # distance. So beyond 250 aircraft in range it was keeping an arbitrary
+    # 250 and could silently drop the one overhead. At 50 nm there are about
+    # a hundred and it never bit; at 100 nm on a busy evening it would.
+    #
+    # Sorting here costs nothing extra - the distance was already computed
+    # to apply the radius filter and then thrown away - and it makes the
+    # firmware's truncation a deliberate "nearest 250" rather than a
+    # coin toss. It also bounds the response, so parse time on the device
+    # stops scaling with the radius the owner picked.
+    aircraft.sort(key=lambda entry: _distance_nm(lat, lon, entry["lat"], entry["lon"]))
+    if len(aircraft) > MAX_AIRCRAFT_PER_RESPONSE:
+        aircraft = aircraft[:MAX_AIRCRAFT_PER_RESPONSE]
     # Attach the route to each aircraft so the device does not have to ask
     # adsbdb itself - on the ESP32 that cost ~2.2s of blocked network task
     # per callsign and needed more contiguous internal RAM than it had.
@@ -87,7 +112,10 @@ async def get_aircraft(
     # on a write lock stopped reading a customer's live SBS stream with it.
     await asyncio.to_thread(_record_poll, db, device, ip, firmware,
                             lat, lon, radius, len(aircraft))
-    return {"ac": aircraft, "total": len(aircraft)}
+    # total is what is in range, not what was sent: a device showing 250 of
+    # 347 should be able to say so rather than presenting 250 as the whole
+    # sky. len(ac) is what was sent.
+    return {"ac": aircraft, "total": total_in_range, "returned": len(aircraft)}
 
 
 def _record_poll(
@@ -490,7 +518,10 @@ async def my_feed_aircraft(
         return {"ac": []}
     aircraft = await _aggregator(request).cache.query_by_source(f"feeder:{device.id}")
     aircraft = [_reference(request).enrich(entry) for entry in aircraft]
-    return {"ac": aircraft, "total": len(aircraft)}
+    # total is what is in range, not what was sent: a device showing 250 of
+    # 347 should be able to say so rather than presenting 250 as the whole
+    # sky. len(ac) is what was sent.
+    return {"ac": aircraft, "total": total_in_range, "returned": len(aircraft)}
 
 
 # --- Public share links ---------------------------------------------------
@@ -658,15 +689,29 @@ async def aircraft_photo(designator: str, request: Request, size: int = PHOTO_DE
     type_info = _reference(request).aircraft_type(code)
     if not type_info or not type_info.get("name"):
         return Response(status_code=status.HTTP_404_NOT_FOUND, headers=LOGO_CACHE_HEADERS)
-    data = await store.photo(code, type_info["name"], size)
-    if data is None:
-        # Distinguish "no free photograph of this type" from "the search is
-        # not working at all". Both are 404 to the device, which retries
-        # either way, but only one of them is something to go and fix.
-        headers = dict(LOGO_CACHE_HEADERS)
-        headers["X-Photo-Search-Failures"] = str(store.search_failures)
-        return Response(status_code=status.HTTP_404_NOT_FOUND, headers=headers)
-    return Response(content=data, media_type="image/png", headers=LOGO_CACHE_HEADERS)
+    data, state = await store.resolve(code, type_info["name"], size)
+    if state == "ready":
+        return Response(content=data, media_type="image/png", headers=LOGO_CACHE_HEADERS)
+    if state == "pending":
+        # Queued, not absent. This used to be a 404 like a genuine miss, and
+        # the firmware treats a 404 as final - it writes a marker file and
+        # never asks again - so the FIRST request for any type blacklisted
+        # that type on that receiver for good, and the picture the queue
+        # fetched seconds later was never asked for. A receiver could run all
+        # day reporting "none available" for everything while the server held
+        # the photographs. 503 with a Retry-After is what the device already
+        # understands as "ask me again".
+        return Response(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        headers={"Retry-After": "30"})
+    if state == "off":
+        return Response(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        headers={"Retry-After": "3600"})
+    # "missing": searched, and nothing attribution-free exists. The only
+    # case a caller may remember - and the header says whether the search is
+    # working at all, because a systemic failure looks the same from outside.
+    headers = dict(LOGO_CACHE_HEADERS)
+    headers["X-Photo-Search-Failures"] = str(store.search_failures)
+    return Response(status_code=status.HTTP_404_NOT_FOUND, headers=headers)
 
 
 @router.get("/aircraft-photo/credits")

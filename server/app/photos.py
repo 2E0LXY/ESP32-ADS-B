@@ -196,15 +196,35 @@ class PhotoStore:
         return base + ".png", base + ".json", base + ".miss"
 
     async def photo(self, designator: str, model: str, width: int = DEFAULT_WIDTH) -> bytes | None:
-        """The cached photo for a type, fetching one if there is not yet one.
+        """The cached photo for a type, or None. See resolve() for why None
+        is not one answer but three."""
+        data, _state = await self.resolve(designator, model, width)
+        return data
 
-        None means there is no free photograph of this type, or photos are
-        switched off. The caller draws its silhouette instead, which is what
-        it did before.
+    async def resolve(self, designator: str, model: str,
+                      width: int = DEFAULT_WIDTH) -> tuple[bytes | None, str]:
+        """The photo and, when there is not one, WHY there is not one.
+
+        None used to mean any of three different things, and the endpoint
+        turned all of them into a 404. The firmware treats a 404 as final -
+        it writes a marker file and never asks again - so the first request
+        for any type, which is necessarily "queued, not fetched yet",
+        permanently blacklisted that type on that receiver. The photo the
+        queue then fetched seconds later was never asked for again, which is
+        why a device could run for hours reporting "none available" for
+        everything while the server held the pictures.
+
+        So the three cases are now distinguishable:
+
+          ready    the bytes, cached on disk
+          missing  searched, and nothing attribution-free exists - the one
+                   case a caller may remember
+          pending  queued; ask again shortly
+          off      switched off deployment-wide, or not a designator
         """
         code = (designator or "").strip().upper()
         if not self.configured() or not DESIGNATOR_PATTERN.match(code) or not model:
-            return None
+            return None, "off"
         if width not in ALLOWED_WIDTHS:
             width = DEFAULT_WIDTH
         image_path, _meta_path, miss_path = self._paths(code, width)
@@ -212,18 +232,18 @@ class PhotoStore:
         cached = await asyncio.to_thread(_read_if_present, image_path)
         if cached is not None:
             self.hits += 1
-            return cached
+            return cached, "ready"
         if await asyncio.to_thread(_miss_is_fresh, miss_path, MISS_TTL_SECONDS):
             self.misses += 1
-            return None
+            return None, "missing"
         if self._client is None:
-            return None
+            return None, "off"
 
         # Queued, not fetched here: a caller must never wait on a search and
         # a download. The device asks again on its next rotation and gets the
         # picture then, which is exactly how route lookups behave.
         self._enqueue(code, model, width)
-        return None
+        return None, "pending"
 
     async def _fetch(self, code: str, model: str, width: int) -> bytes | None:
         image_path, meta_path, miss_path = self._paths(code, width)

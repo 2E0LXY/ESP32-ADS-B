@@ -8,6 +8,7 @@ feed it the kinds of result the live API actually returns.
 import io
 import json
 import struct
+import pathlib
 
 import httpx
 import pytest
@@ -313,3 +314,82 @@ async def test_the_same_type_is_only_queued_once(tmp_path):
         assert store._queue.qsize() == 1
     finally:
         await store.stop()
+
+
+# --- what the endpoint tells the device --------------------------------
+
+def _photo_client(client, monkeypatch, state):
+    """Points the running app's photo store at a canned resolve()."""
+    from app.main import app
+
+    async def resolve(designator, model, width=240):
+        return (b"\x89PNG fake", "ready") if state == "ready" else (None, state)
+
+    monkeypatch.setattr(app.state.photos, "resolve", resolve)
+    monkeypatch.setattr(app.state.photos, "configured", lambda: True)
+    return client
+
+
+def test_a_queued_photo_is_retry_later_not_not_found(client, monkeypatch):
+    """The firmware treats 404 as final - it writes a marker and never asks
+    again. The first request for any type is necessarily "queued, not
+    fetched yet", so answering that with 404 blacklisted every type on the
+    receiver the first time it asked, and the picture the queue fetched
+    seconds later was never requested. This is the whole bug."""
+    _photo_client(client, monkeypatch, "pending")
+
+    response = client.get("/aircraft-photo/B738.png")
+
+    assert response.status_code == 503
+    assert response.headers["Retry-After"] == "30"
+
+
+def test_a_type_with_no_free_photograph_is_not_found(client, monkeypatch):
+    """The one case a caller may remember."""
+    _photo_client(client, monkeypatch, "missing")
+
+    response = client.get("/aircraft-photo/B738.png")
+
+    assert response.status_code == 404
+    # Says whether the search is working at all, because a systemic failure
+    # looks identical from outside.
+    assert "X-Photo-Search-Failures" in response.headers
+
+
+def test_photographs_switched_off_are_retry_later_with_a_long_wait(client, monkeypatch):
+    _photo_client(client, monkeypatch, "off")
+
+    response = client.get("/aircraft-photo/B738.png")
+
+    assert response.status_code == 503
+    assert response.headers["Retry-After"] == "3600"
+
+
+def test_a_cached_photograph_is_served(client, monkeypatch):
+    _photo_client(client, monkeypatch, "ready")
+
+    response = client.get("/aircraft-photo/B738.png")
+
+    assert response.status_code == 200
+    assert response.content.startswith(b"\x89PNG")
+
+
+async def test_resolve_names_each_case(tmp_path):
+    """The three states, from the store rather than the endpoint."""
+    store = PhotoStore(cache_dir=str(tmp_path), enabled=True)
+    store._client = object()  # not None, so queueing is reachable
+
+    data, state = await store.resolve("B738", "Boeing 737-800", 240)
+    assert (data, state) == (None, "pending"), "first ask must be pending, not missing"
+
+    image_path, _meta, miss_path = store._paths("B738", 240)
+    pathlib.Path(miss_path).write_text("")
+    assert await store.resolve("B738", "Boeing 737-800", 240) == (None, "missing")
+
+    pathlib.Path(miss_path).unlink()
+    pathlib.Path(image_path).write_bytes(b"\x89PNG cached")
+    data, state = await store.resolve("B738", "Boeing 737-800", 240)
+    assert state == "ready" and data == b"\x89PNG cached"
+
+    disabled = PhotoStore(cache_dir=str(tmp_path), enabled=False)
+    assert await disabled.resolve("B738", "Boeing 737-800", 240) == (None, "off")
