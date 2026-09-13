@@ -5637,6 +5637,13 @@ void handleStatusApi() {
   doc["sdUsedBytes"] = sdUsedBytes;
   doc["sdFreeBytes"] = sdTotalBytes >= sdUsedBytes ? sdTotalBytes - sdUsedBytes : 0;
   doc["tileCacheStorage"] = sdMounted ? "SD card" : "LittleFS";
+  // The fallback's own capacity, which was not reported at all: with a card
+  // fitted nobody looks at it, and the moment the card fails it is the only
+  // storage there is. Worth knowing how much room it has BEFORE that day -
+  // and every write to it disables the CPU cache, which is what starves the
+  // panel's bounce-buffer refill, so it is not a like-for-like substitute.
+  doc["fsTotalBytes"] = static_cast<uint32_t>(LittleFS.totalBytes());
+  doc["fsUsedBytes"] = static_cast<uint32_t>(LittleFS.usedBytes());
   doc["stagedUpdateReady"] = stagedUpdateReady;
   doc["stagedUpdateVersion"] = stagedUpdateVersion;
   doc["brightness"] = brightnessPercent;
