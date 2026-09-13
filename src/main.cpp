@@ -78,18 +78,27 @@ Arduino_DataBus *bus = new Arduino_SWSPI(
     GFX_NOT_DEFINED);
 #endif
 
-// The pixel clock is settable from the web UI rather than fixed at
-// PANEL_PCLK_HZ, because it is the one lever on the frame roll and the
-// flickering scanlines that can be tested without a rebuild each time. Both
-// faults are the RGB bounce-buffer refill missing its deadline while the CPU
-// saturates the same PSRAM bus; a slower pixel clock asks for fewer bytes per
-// line and gives the refill more slack, at the cost of refresh rate. Which
-// value is enough is an empirical question about this panel and this
-// workload, so it belongs in a dropdown, not a #define.
+// The three panel settings below were a dropdown and two switches in the web
+// UI while the frame roll and the flickering scanlines were being chased:
+// all three are the same fault - the RGB bounce-buffer refill missing its
+// deadline while the CPU saturates the same PSRAM bus - and which values are
+// enough was an empirical question about this panel that needed answering on
+// the hardware rather than in a comment.
 //
-// esp_lcd captures the clock when the panel is initialised, so this is
-// applied at boot and a change reboots the device. The board's own
-// PANEL_PCLK_HZ remains the default and the value NVS is seeded with.
+// It has been answered, so they are no longer adjustable. The combination
+// below is the one that produced a clean picture on the 7 inch panel, and
+// every other combination reachable from that UI was worse in a way a user
+// would have no way to diagnose: the compiled-in defaults alone would give
+// 16 MHz, a 40 line bounce buffer and the shadow-buffer copy, which is the
+// configuration that both rolled the picture AND starved mbedTLS until
+// HTTPS failed outright (largest free internal block 17,960 bytes).
+//
+// Keeping them in NVS instead would be no safer: a stored value survives a
+// reflash, so a device that had once been set to 40 lines would stay there
+// with nothing in the UI left to change it back. Pinned here, every device
+// gets the good configuration on its next flash whatever its history.
+// /api/status still reports all three, so what a panel is actually running
+// can be read without a serial cable.
 uint32_t panelPclkHz = PANEL_PCLK_HZ;
 
 // Selectable values, coarse enough to tell apart on a panel and bounded so a
@@ -126,13 +135,14 @@ uint16_t panelBounceLines = 0;
 // once, which on mostly-static pages is invisible and on a full repaint
 // looks like a fast wipe. Runtime-selectable because that trade has to be
 // judged on the hardware.
-bool panelDirectDraw = false;
-constexpr uint16_t PANEL_BOUNCE_CHOICES[] = {0, 10, 20, 30, 40};
-
-constexpr uint32_t PANEL_PCLK_CHOICES[] = {
-    9000000L, 10000000L, 11000000L, 12000000L, 13000000L,
-    14000000L, 15000000L, 16000000L, 16500000L, 18000000L, 21000000L,
-};
+// Direct draw: every pixel lands in the panel's own framebuffer, so there is
+// no 768 KB copy per frame competing with the display's own DMA reads. This
+// is what stopped the tearing and the flickering lines.
+bool panelDirectDraw = true;
+// Two buffers of this many lines, from internal RAM. 20 is the value that
+// holds the refill deadline while leaving mbedTLS the ~32 KB contiguous it
+// needs for a TLS handshake; the library's own default of 40 does not.
+constexpr uint16_t PANEL_BOUNCE_LINES = 20;
 
 // Constructed in setup() once the stored clock has been read, not at static
 // init - hence pointers assigned later rather than initialisers here.
@@ -5995,52 +6005,6 @@ void handleDisplaySettings() {
     settingsStore.putUShort("ssaver-min", screensaverIdleMinutes);
     lastInteractionAt = millis();
   }
-  if (webServer.hasArg("directDraw")) {
-    settingsStore.putBool("direct-draw", webServer.arg("directDraw") == "1");
-    // The framebuffer pointer is chosen once at boot, so this needs a
-    // restart like the other two panel settings.
-    restartPending = true;
-    restartAt = millis() + 1500;
-    sendMessage(202, "Rendering mode saved - rebooting to apply");
-    return;
-  }
-  if (webServer.hasArg("bounceLines")) {
-    long lines = 0;
-    bool known = false;
-    if (parseStrictLong(webServer.arg("bounceLines"), lines))
-      for (uint16_t choice : PANEL_BOUNCE_CHOICES)
-        if (choice == static_cast<uint16_t>(lines)) { known = true; break; }
-    if (!known) {
-      sendMessage(400, "Unsupported bounce buffer size");
-      return;
-    }
-    settingsStore.putUShort("bounce-lines", static_cast<uint16_t>(lines));
-    // Allocated when esp_lcd creates the panel, so like the pixel clock it
-    // only takes effect on the next boot.
-    restartPending = true;
-    restartAt = millis() + 1500;
-    sendMessage(202, "Bounce buffer saved - rebooting to apply");
-    return;
-  }
-  if (webServer.hasArg("pclkKhz")) {
-    long khz = 0;
-    bool known = false;
-    if (parseStrictLong(webServer.arg("pclkKhz"), khz))
-      for (uint32_t choice : PANEL_PCLK_CHOICES)
-        if (choice == static_cast<uint32_t>(khz) * 1000UL) { known = true; break; }
-    if (!known) {
-      sendMessage(400, "Unsupported pixel clock");
-      return;
-    }
-    settingsStore.putULong("pclk-khz", static_cast<uint32_t>(khz));
-    // The clock is latched when esp_lcd initialises the panel, so it cannot
-    // be changed on a running display - save it and restart. Long enough a
-    // delay for this response to reach the browser first.
-    restartPending = true;
-    restartAt = millis() + 1500;
-    sendMessage(202, "Pixel clock saved - rebooting to apply");
-    return;
-  }
   // The brightness slider is gone: the CH422G drives the backlight enable as a
   // plain switch with no PWM channel, so any value between 10 and 100 looked
   // identical on the 800x480 boards. The backlight is still switched on at
@@ -7144,25 +7108,13 @@ void setup() {
     Serial.println("Rev4 display helper unavailable");
   }
   applyBrightness(brightnessPercent);
-  // Read before the panel exists: esp_lcd latches the pixel clock at init, so
-  // a change only takes effect on the next boot. An unknown stored value (a
-  // downgrade, a corrupted key) falls back to the board default rather than
-  // initialising the panel with something it cannot drive.
-  {
-    const uint32_t storedKhz = settingsStore.getULong("pclk-khz", PANEL_PCLK_HZ / 1000UL);
-    const uint32_t storedHz = storedKhz * 1000UL;
-    panelPclkHz = PANEL_PCLK_HZ;
-    for (uint32_t choice : PANEL_PCLK_CHOICES)
-      if (choice == storedHz) { panelPclkHz = storedHz; break; }
-  }
-  {
-    const uint16_t buildDefault = Arduino_ESP32RGBPanel::bounceBufferLines();
-    const uint16_t storedLines = settingsStore.getUShort("bounce-lines", buildDefault);
-    panelBounceLines = buildDefault;
-    for (uint16_t choice : PANEL_BOUNCE_CHOICES)
-      if (choice == storedLines) { panelBounceLines = storedLines; break; }
-    Arduino_ESP32RGBPanel::setBounceBufferLines(panelBounceLines);
-  }
+  // Fixed, not read from NVS - see the note by panelPclkHz. Any value a
+  // previous build stored is deliberately ignored, so a device that was once
+  // set to something worse comes back to the good configuration on this
+  // flash rather than keeping it with no UI left to change it.
+  panelPclkHz = PANEL_PCLK_HZ;
+  panelBounceLines = PANEL_BOUNCE_LINES;
+  Arduino_ESP32RGBPanel::setBounceBufferLines(panelBounceLines);
   createDisplay(panelPclkHz);
   Serial.printf("Panel pixel clock: %.1f MHz (~%.1f Hz refresh), bounce buffer %u lines (%u KB internal)\n",
                 panelPclkHz / 1000000.0f, panelRefreshHz(panelPclkHz), panelBounceLines,
@@ -7195,7 +7147,6 @@ void setup() {
   // The decoder is set up before the first boot screen rather than after it,
   // because the boot screen is now a PNG and needs it. It only wants a PSRAM
   // allocation, so there is nothing here that has to wait.
-  panelDirectDraw = settingsStore.getBool("direct-draw", false);
   initPngDecoder();
   if (!pngDecoderPtr) Serial.println("PNG decoder allocation failed - images unavailable");
   renderBootScreen();

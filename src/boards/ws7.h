@@ -35,7 +35,14 @@
 #define PANEL_VSYNC_PULSE_WIDTH 4
 #define PANEL_VSYNC_BACK_PORCH 23
 #define PANEL_PCLK_ACTIVE_NEG 1
-#define PANEL_PCLK_HZ 16000000L  // 820 x 529 -> 36.9 Hz
+// 13 MHz, not the 16 MHz this panel will nominally run at: the higher
+// clock asks for more bytes per line than the bounce-buffer refill can
+// reliably fetch while the CPU is using the same PSRAM bus, and the
+// symptom is the picture slipping vertically and flickering scanlines.
+// 13 MHz gives 820 x 529 -> 30.0 Hz, which is what the panel has been
+// stable at. Measured on the hardware, not calculated - see the note by
+// panelPclkHz in main.cpp.
+#define PANEL_PCLK_HZ 13000000L  // 820 x 529 -> 30.0 Hz
 
 // ST7262 is a plain RGB driver with no configuration bus.
 #define PANEL_NEEDS_SPI_INIT 0
