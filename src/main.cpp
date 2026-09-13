@@ -4508,6 +4508,14 @@ const char *displayPageName() {
 }
 
 void renderCurrentPage() {
+  // Zeroed per frame, not left to whichever function last ran. Only the
+  // map-backed pages call restoreMap(); the table and the screensaver paint
+  // their own opaque background instead. Without this reset those pages
+  // reported the restore figure from whenever a map page last drew, and
+  // /api/status added that stale number to this frame's real one - which
+  // read as a 1,500 KB render on a page that had done 750.
+  lastRestoreRows = 0;
+  lastRestorePixels = 0;
   if (screensaverActive) { renderScreensaverPage(); return; }
   if (displayPage == DisplayPage::Overview) renderOverviewPage();
   else if (displayPage == DisplayPage::Table) renderTablePage();
