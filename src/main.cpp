@@ -3250,7 +3250,7 @@ RouteCacheEntry *cachedRoute(const char *rawCallsign) {
 // version mismatch (from a firmware update changing RouteCacheEntry) just
 // means starting cache-cold again rather than reading garbage.
 constexpr uint32_t ROUTE_CACHE_FILE_MAGIC = 0x52435341; // "ASCR"
-constexpr uint8_t ROUTE_CACHE_FILE_VERSION = 1;
+constexpr uint8_t ROUTE_CACHE_FILE_VERSION = 2;
 
 const char *routeCacheFilePath() {
   return sdMounted ? "/adsb/route_cache.bin" : "/route_cache.bin";
@@ -3262,6 +3262,10 @@ void saveRouteCacheToStorage() {
   if (!file) return;
   file.write(reinterpret_cast<const uint8_t *>(&ROUTE_CACHE_FILE_MAGIC), sizeof(ROUTE_CACHE_FILE_MAGIC));
   file.write(&ROUTE_CACHE_FILE_VERSION, sizeof(ROUTE_CACHE_FILE_VERSION));
+  // Record length, so a RouteCacheEntry change is caught even when the
+  // version constant above is forgotten.
+  const uint16_t entrySize = static_cast<uint16_t>(sizeof(RouteCacheEntry));
+  file.write(reinterpret_cast<const uint8_t *>(&entrySize), sizeof(entrySize));
   uint8_t count = 0;
   for (auto &entry : routeCache) if (entry.occupied) ++count;
   file.write(&count, sizeof(count));
@@ -3278,13 +3282,25 @@ void loadRouteCacheFromStorage() {
   if (!file) return;
   uint32_t magic = 0;
   uint8_t version = 0, count = 0;
+  uint16_t entrySize = 0;
   bool headerOk = file.read(reinterpret_cast<uint8_t *>(&magic), sizeof(magic)) == sizeof(magic) &&
                   magic == ROUTE_CACHE_FILE_MAGIC &&
                   file.read(&version, sizeof(version)) == sizeof(version) &&
                   version == ROUTE_CACHE_FILE_VERSION &&
+                  file.read(reinterpret_cast<uint8_t *>(&entrySize), sizeof(entrySize)) == sizeof(entrySize) &&
+                  entrySize == sizeof(RouteCacheEntry) &&
                   file.read(&count, sizeof(count)) == sizeof(count);
+  if (!headerOk) {
+    // Stale or foreign record layout. Discard rather than leave a file that
+    // gets rejected on every boot from here on.
+    file.close();
+    fs::FS &target = sdMounted ? static_cast<fs::FS &>(SDCARD) : static_cast<fs::FS &>(LittleFS);
+    target.remove(routeCacheFilePath());
+    Serial.println("Route cache file discarded (layout changed); starting cache-cold");
+    return;
+  }
   int loaded = 0;
-  if (headerOk) {
+  {
     RouteCacheEntry entry;
     while (loaded < count && loaded < ROUTE_CACHE_SIZE &&
            file.read(reinterpret_cast<uint8_t *>(&entry), sizeof(entry)) == sizeof(entry)) {
@@ -5057,7 +5073,20 @@ void fetchAdsbV2Aircraft() {
       rgbpanel->restartAtNextVsync();
       // Nothing to ask: the aggregator already attached the route to this
       // aircraft, or will on a later poll once its own lookup completes.
-      if (serverSuppliesRoutes) continue;
+      // Skip only the aircraft the server actually resolved, not every
+      // aircraft because it resolved one. As a global latch, the first
+      // attached route switched this device's own lookups off permanently,
+      // so any callsign the aggregator had no route for stayed unresolved
+      // forever - the screensaver sat on "LOOKING UP ROUTE..." for a request
+      // that was never going to be sent, and the table showed no from/to at
+      // all. Server route coverage is per-aircraft, so the test has to be
+      // per-aircraft too. MAX_ROUTE_LOOKUPS_PER_REFRESH still caps the TLS
+      // cost per fetch, and anything the server does attach stays free and is
+      // already cached by adoptServerRoute().
+      {
+        const RouteCacheEntry *known = cachedRoute(display.flight);
+        if (known && known->hasRoute) continue;
+      }
       // A prior version kept one keep-alive connection open across every
       // lookup in this loop (HTTPClient::setReuse(true)) to save handshakes.
       // Every watchdog reboot logged after switching provider away from
@@ -5254,7 +5283,20 @@ void fetchAircraft() {
       rgbpanel->restartAtNextVsync();
       // Nothing to ask: the aggregator already attached the route to this
       // aircraft, or will on a later poll once its own lookup completes.
-      if (serverSuppliesRoutes) continue;
+      // Skip only the aircraft the server actually resolved, not every
+      // aircraft because it resolved one. As a global latch, the first
+      // attached route switched this device's own lookups off permanently,
+      // so any callsign the aggregator had no route for stayed unresolved
+      // forever - the screensaver sat on "LOOKING UP ROUTE..." for a request
+      // that was never going to be sent, and the table showed no from/to at
+      // all. Server route coverage is per-aircraft, so the test has to be
+      // per-aircraft too. MAX_ROUTE_LOOKUPS_PER_REFRESH still caps the TLS
+      // cost per fetch, and anything the server does attach stays free and is
+      // already cached by adoptServerRoute().
+      {
+        const RouteCacheEntry *known = cachedRoute(display.flight);
+        if (known && known->hasRoute) continue;
+      }
       // A prior version kept one keep-alive connection open across every
       // lookup in this loop (HTTPClient::setReuse(true)) to save handshakes.
       // Every watchdog reboot logged after switching provider away from
