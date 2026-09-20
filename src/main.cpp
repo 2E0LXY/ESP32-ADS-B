@@ -3848,6 +3848,17 @@ int findAircraftIconAt(int x, int y) {
   return best;
 }
 
+// A red M beside the icon: this position was computed by the server from
+// time-difference-of-arrival across several receivers, not broadcast by the
+// aircraft. Offset up-left so it clears both the icon and the route label
+// position used for ADS-B tracks.
+void drawMlatMarker(int x, int y) {
+  const int mx = constrain(x - 14, 2, W - 12);
+  const int my = constrain(y - 16, 2, H - 16);
+  filledRect(mx - 2, my - 2, 12, 16, rgb(0, 0, 0));
+  text5(mx, my, "M", rgb(255, 65, 65), 2);
+}
+
 void drawRouteLabel(int x, int y, const RouteCacheEntry *route) {
   if (!route || !route->hasRoute) return;
   char label[11];
@@ -4064,6 +4075,12 @@ void renderMapPage() {
     recordIconHit(display.x, display.y, i);
     if (display.positionSource != 2) {
       drawRouteLabel(display.x,display.y,cachedRoute(display.flight));
+    } else {
+      // Dimming alone reads as a stale ADS-B track, not a different kind of
+      // fix - the table and the detail card both say MLAT outright, so the
+      // map should too. Server-side multilateration, not a reported
+      // position: red M, offset clear of the icon.
+      drawMlatMarker(display.x, display.y);
     }
   }
   char count[20];
