@@ -17,6 +17,7 @@ from .leader import Leadership
 from .log_buffer import install as install_log_buffer
 from .retention import UsageLogPruner
 from .runtime_settings import SettingsStore
+from .tracks import TrackStore
 from .schedules import ScheduleResolver
 from .routers import admin, public
 
@@ -101,10 +102,15 @@ async def startup():
     home_lat = float(os.environ.get("HOME_LAT", "53.73"))
     home_lon = float(os.environ.get("HOME_LON", "-1.57"))
     home_radius_nm = float(os.environ.get("HOME_RADIUS_NM", "50"))
+    # Recent positions per aircraft, so a selected one can be drawn with the
+    # arc it flew to get here. Filled by the poll loop from the merged cache
+    # - see app/tracks.py.
+    app.state.tracks = TrackStore()
     app.state.aggregator = Aggregator(home_lat, home_lon, home_radius_nm, SessionLocal,
                                       cache=app.state.cache,
                                       leadership=app.state.leadership,
-                                      settings=app.state.settings)
+                                      settings=app.state.settings,
+                                      tracks=app.state.tracks)
     app.state.aggregator.start()
 
     # Resolves callsign -> route on behalf of every device, so the ESP32

@@ -58,6 +58,26 @@ def root():
     return RedirectResponse("https://2e0lxy.uk/adsb/7-inch-ESP32-S3-ADSB-MLAT-Receiver-site/index.html")
 
 
+@router.get("/v1/track/{hex_id}")
+async def get_track(
+    hex_id: str,
+    request: Request,
+    device: models.Device = Depends(require_device_api_key),
+):
+    """Where one aircraft has been recently, oldest point first.
+
+    Separate from /v1/aircraft rather than folded into it: a trail is only
+    wanted for the one aircraft somebody has selected, and attaching a
+    hundred points to every aircraft in a response would multiply a 40 KB
+    payload by something like twenty for data nobody asked to see.
+
+    Points are [latitude, longitude, altitude ft or null, seconds ago].
+    """
+    store = getattr(request.app.state, "tracks", None)
+    points = store.get(hex_id) if store is not None else []
+    return {"hex": hex_id.strip().lower(), "points": points, "count": len(points)}
+
+
 @router.get("/v1/aircraft")
 async def get_aircraft(
     lat: float,
