@@ -2,7 +2,7 @@ import asyncio
 import datetime
 import re
 
-from fastapi import APIRouter, Cookie, Depends, Form, Header, Request, status
+from fastapi import APIRouter, Cookie, Depends, Form, Request, status
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session

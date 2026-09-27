@@ -27,4 +27,10 @@ jobs:
           cache: pip
           cache-dependency-path: server/requirements-dev.txt
       - run: pip install -r requirements-dev.txt
+      # Before the tests, because it is the cheap half-second check that
+      # catches what they cannot: a name that is never defined fails only
+      # when that line runs, so an endpoint with no test can carry one
+      # indefinitely. That is exactly what reached main as a 500 on the
+      # customer feed map.
+      - run: python -m pyflakes app
       - run: python -m pytest -q

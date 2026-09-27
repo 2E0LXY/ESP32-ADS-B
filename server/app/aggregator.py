@@ -33,6 +33,21 @@ from .cache import (  # re-exported: all of these lived here before the cache mo
     CachedAircraft,
     build_cache,
 )
+
+# The re-exports above are deliberate - callers and tests written before the
+# cache moved into its own module still import them from here - so they are
+# named explicitly rather than left looking like four unused imports. That
+# distinction matters now that the undefined-name check runs in CI: a real
+# unused import should be removed, and this is not one.
+__all__ = [
+    "Aggregator",
+    "MAX_POLL_REGIONS",
+    "SOURCE_ATTRIBUTION_SECONDS",
+    "STALE_AFTER_SECONDS",
+    "AircraftCache",
+    "CachedAircraft",
+    "build_cache",
+]
 from .cache import distance_nm as _distance_nm
 from .models import FeederKey, FeederProvider
 from .opensky import OpenSkyClient
