@@ -12,7 +12,7 @@ Live aircraft from this receiver, shared by its owner. Not the aggregated feed -
 {% else %}
 Only aircraft your own receiver is currently reporting - not the shared aggregated feed.
 {% endif %}
-<span id="count">0</span> aircraft right now. Icons point along the track and are coloured by altitude; click one for everything the feed carries about it.</p>
+<span id="count">0</span> aircraft right now. Icons point along the track and are coloured by altitude; click one for everything the feed carries about it, and for the track it flew to get here.</p>
 <div id="map" style="height:520px;border-radius:4px"></div>
 <div class="sub" style="margin-top:8px">Airline logos provided by <a href="https://logo.dev" target="_blank" rel="noopener">Logo.dev</a></div>
 </div>
@@ -110,6 +110,43 @@ function details(a) {
     + '</table></div>';
 }
 
+// --- Trails ------------------------------------------------------------
+//
+// Fetched only for the aircraft somebody has actually clicked. A trail per
+// aircraft on every three-second poll would be a hundred times the payload
+// for something nobody is looking at, which is why the server keeps them on
+// their own endpoint rather than attaching them to the aircraft list.
+let trailLayer = null;
+let trailHex = null;
+
+function clearTrail() {
+  if (trailLayer) { map.removeLayer(trailLayer); trailLayer = null; }
+  trailHex = null;
+}
+
+async function showTrail(hex) {
+  if (!hex) return;
+  trailHex = hex;
+  try {
+    const res = await fetch('{{ track_url }}?hex=' + encodeURIComponent(hex), {cache: 'no-store'});
+    const data = await res.json();
+    // The click may have moved on while this was in flight.
+    if (trailHex !== hex) return;
+    const points = (data.points || []).filter(p => typeof p[0] === 'number' && typeof p[1] === 'number');
+    if (trailLayer) map.removeLayer(trailLayer);
+    if (points.length < 2) { trailLayer = null; return; }
+    // Coloured by the altitude at each end so a descent reads as one, and
+    // drawn under the icons rather than over them.
+    trailLayer = L.polyline(points.map(p => [p[0], p[1]]), {
+      color: altitudeColour(points[points.length - 1][2]),
+      weight: 3, opacity: 0.85, dashArray: null,
+    }).addTo(map);
+    trailLayer.bringToBack();
+  } catch (e) {
+    console.error(e);
+  }
+}
+
 async function poll() {
   try {
     const res = await fetch('{{ aircraft_url }}', {cache: 'no-store'});
@@ -132,9 +169,12 @@ async function poll() {
       marker.bindTooltip((a.flight || a.hex) + (typeof altitude === 'number' ? ' &middot; ' + altitude + ' ft' : ''),
                          {direction: 'top'});
       marker.bindPopup(details(a));
+      marker.on('popupopen', () => showTrail(a.hex));
+      marker.on('popupclose', () => { if (trailHex === a.hex) clearTrail(); });
       marker.addTo(layer);
       if (a.hex && a.hex === openHex) marker.openPopup();
     });
+    if (trailHex) showTrail(trailHex);
     document.getElementById('count').textContent = points.length;
     if (points.length && !fitted) {
       map.fitBounds(points, {maxZoom: 10});

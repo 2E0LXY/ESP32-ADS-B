@@ -557,6 +557,7 @@ def my_feed_page(
             "device": device,
             "shared": False,
             "aircraft_url": f"/account/my-feed/{device.id}/aircraft",
+            "track_url": f"/account/my-feed/{device.id}/track",
         },
     )
 
@@ -576,10 +577,34 @@ async def my_feed_aircraft(
         return {"ac": []}
     aircraft = await _aggregator(request).cache.query_by_source(f"feeder:{device.id}")
     aircraft = [_reference(request).enrich(entry) for entry in aircraft]
-    # total is what is in range, not what was sent: a device showing 250 of
-    # 347 should be able to say so rather than presenting 250 as the whole
-    # sky. len(ac) is what was sent.
-    return {"ac": aircraft, "total": total_in_range, "returned": len(aircraft)}
+    # Everything this feeder reported, uncapped: unlike /v1/aircraft this is
+    # read by a browser rather than by a device with 320 KB of internal RAM,
+    # and a receiver's own contribution is a few dozen aircraft, not the
+    # whole sky. So total and returned are the same number here - reported
+    # as both anyway, because the page reads the same fields whichever
+    # endpoint it is pointed at.
+    return {"ac": aircraft, "total": len(aircraft), "returned": len(aircraft)}
+
+
+@router.get("/account/my-feed/{device_id}/track")
+async def my_feed_track(
+    device_id: int,
+    hex: str,
+    request: Request,
+    account: models.Account = Depends(get_current_account),
+    db: Session = Depends(get_db),
+):
+    """Where one aircraft has been, for the trail the map draws behind it.
+
+    Gated on owning the device for the same reason its aircraft list is,
+    and fetched only for the aircraft somebody has actually clicked - a
+    trail per aircraft on every three-second poll would be a hundred times
+    the payload for something nobody is looking at.
+    """
+    device = await asyncio.to_thread(_owned_device, db, account, device_id)
+    if not device:
+        return {"points": []}
+    return _track_response(request, hex)
 
 
 # --- Public share links ---------------------------------------------------
@@ -641,6 +666,13 @@ def _shared_device(db: Session, token: str) -> models.Device | None:
 NO_INDEX = {"X-Robots-Tag": "noindex, nofollow, noarchive"}
 
 
+def _track_response(request: Request, hex_id: str) -> dict:
+    store = getattr(request.app.state, "tracks", None)
+    points = store.get(hex_id) if store is not None else []
+    return {"hex": (hex_id or "").strip().lower(), "points": points,
+            "count": len(points)}
+
+
 @router.get("/share/{token}", response_class=HTMLResponse)
 async def shared_feed_page(token: str, request: Request, db: Session = Depends(get_db)):
     device = await asyncio.to_thread(_shared_device, db, token)
@@ -656,6 +688,7 @@ async def shared_feed_page(token: str, request: Request, db: Session = Depends(g
             "device": device,
             "shared": True,
             "aircraft_url": f"/share/{token}/aircraft",
+            "track_url": f"/share/{token}/track",
         },
         headers=NO_INDEX,
     )
@@ -670,6 +703,18 @@ async def shared_feed_aircraft(token: str, request: Request, db: Session = Depen
     aircraft = [_reference(request).enrich(entry)
                 for entry in await _aggregator(request).cache.query_by_source(f"feeder:{device.id}")]
     return JSONResponse({"ac": aircraft, "total": len(aircraft)}, headers=NO_INDEX)
+
+
+@router.get("/share/{token}/track")
+async def shared_feed_track(token: str, hex: str, request: Request,
+                            db: Session = Depends(get_db)):
+    """The same trail, for a shared link. The token is the whole check, as
+    it is for the aircraft list it sits beside."""
+    device = await asyncio.to_thread(_shared_device, db, token)
+    if not device:
+        return JSONResponse({"points": []}, status_code=status.HTTP_404_NOT_FOUND,
+                            headers=NO_INDEX)
+    return JSONResponse(_track_response(request, hex), headers=NO_INDEX)
 
 
 # --- Airline logos --------------------------------------------------------

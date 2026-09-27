@@ -320,6 +320,14 @@ rather than presenting it as the flight. Most airline-and-type pairs have no
 attribution-free photograph; that answer is cached so the search is not
 repeated.
 
+Aircraft trails are drawn on the web map: clicking an aircraft fetches
+`/v1/track/{hex}` (or the session- and share-authenticated equivalents the map
+pages use) and draws the arc it flew in on, coloured by its current altitude.
+Fetched only for the aircraft actually clicked - a trail per aircraft on every
+three-second poll would be roughly a hundred times the payload for something
+nobody is looking at, which is why the points live on their own endpoint rather
+than being attached to the aircraft list. The panel does not draw them yet.
+
 Schedules follow the same pattern as routes: `app/schedules.py` queues an
 AirLabs lookup and attaches the answer as `sched` on a later poll, so a
 device never waits on it. The firmware does not display these fields yet -
