@@ -202,6 +202,10 @@ constexpr char TOKEN_URL[] = "https://auth.opensky-network.org/auth/realms/opens
 constexpr uint32_t REFRESH_MS = 30000;
 constexpr int MAX_AIRCRAFT = 250;
 constexpr int MAX_VESSELS = 250;
+// Balloons are sparse next to aircraft - a few dozen within several hundred
+// miles even on a launch hour - so this is sized for the busy case rather
+// than the crowded one it will never see.
+constexpr int MAX_BALLOONS = 150;
 constexpr uint16_t DEFAULT_MARINE_RADIUS_NM = 25;  // typical VHF AIS coastal range
 constexpr uint32_t MARINE_STALE_MS = 20UL * 60UL * 1000UL;  // AIS position reports are event-driven, not polled
 // REST marine providers are polled, unlike AISstream's push WebSocket.
@@ -836,6 +840,31 @@ struct VesselDisplay {
   char navStatus[24];
 };
 
+// A balloon carries almost nothing an aircraft does: no callsign, no route,
+// no operator, no type designator, and an altitude several times anything
+// with wings. Its own struct rather than borrowing AircraftDisplay, which
+// would be mostly empty fields and a permanent invitation to treat one as
+// the other.
+struct BalloonDisplay {
+  int x;
+  int y;
+  double latitude;
+  double longitude;
+  float altitudeFeet;    // NaN when the report carried none
+  float climbFpm;        // NaN when not reported - a pico balloon rarely does
+  float groundKnots;     // NaN when not reported
+  float heading;         // -1 when not reported
+  float distanceMiles;
+  uint32_t lastUpdateMs;
+  char id[28];           // serial or payload callsign, namespaced by kind
+  char label[20];
+  char detail[12];       // sonde model, or the amateur modulation
+  uint8_t kind;          // BalloonKind
+};
+
+// Which sky it came from, so the page can colour and letter them apart.
+enum BalloonKind : uint8_t { BALLOON_SONDE = 0, BALLOON_AMATEUR = 1, BALLOON_AIRSHIP = 2 };
+
 uint16_t *framebuffer = nullptr;
 uint16_t *baseMap = nullptr;
 
@@ -966,6 +995,17 @@ void initRouteCache() {
 AircraftDisplay *latestAircraft = nullptr;
 VesselDisplay *latestVessels = nullptr;
 int vesselCount = 0;
+BalloonDisplay *latestBalloons = nullptr;
+int balloonCount = 0;
+bool balloonTrackingEnabled = false;
+// Its own slow timer. The server polls SondeHub every two minutes because
+// SondeHub asks not to be polled hard; asking the aggregator faster than it
+// asks upstream would only re-read the same answer.
+uint32_t nextBalloonFetchAt = 0;
+uint32_t nextBalloonRenderAt = 0;
+bool balloonDataDirty = false;
+int balloonFeedHttpCode = 0;
+bool balloonFeedOk = false;
 // The aircraft feed and marine tracking both need a persistent TLS session
 // (AIS) or frequent HTTPS fetches (REST providers), competing for the same
 // tight internal RAM - running both at once was the root of the recurring
@@ -1004,8 +1044,9 @@ bool marineConfigured() {
 }
 // Page order matches the swipe order on the panel: Overview is the first
 // screen, then swipe right advances Table -> Map -> Radar -> Marine and wraps.
-enum class DisplayPage : uint8_t { Overview = 0, Table = 1, Map = 2, Radar = 3, Marine = 4 };
-constexpr uint8_t DISPLAY_PAGE_COUNT = 5;
+enum class DisplayPage : uint8_t { Overview = 0, Table = 1, Map = 2, Radar = 3,
+                                   Marine = 4, Balloon = 5 };
+constexpr uint8_t DISPLAY_PAGE_COUNT = 6;
 DisplayPage displayPage = DisplayPage::Overview;
 float radarSweepDegrees = 0.0f;
 uint32_t nextRadarFrameAt = 0;
@@ -3870,6 +3911,17 @@ void drawRouteLabel(int x, int y, const RouteCacheEntry *route) {
   text5(labelX, labelY, label, rgb(255,255,255));
 }
 
+// The domain each page belongs to, drawn top-left. Three different skies
+// now share one rotation - aircraft, ships and balloons - and a map of dots
+// is not self-explanatory about which one is being shown. Black behind it
+// for the same reason the OpenStreetMap attribution has it: over a map
+// tile, bare text is unreadable half the time.
+void drawPageTitle(const char *title, uint16_t colour) {
+  const int width = static_cast<int>(strlen(title)) * 12 + 8;
+  filledRect(0, 0, width, 22, rgb(0, 0, 0));
+  text5(4, 4, title, colour, 2);
+}
+
 void status(const char *label, uint16_t colour) {
   disc(layout::centreX,18,12,rgb(0,0,0)); disc(layout::centreX,18,8,colour);
   int width=strlen(label)*6;
@@ -4061,6 +4113,7 @@ void renderOverviewPage() {
   text5(panelX, H - 16, footer, rgb(90, 190, 230));
   char count[20];
   snprintf(count, sizeof(count), "%d", lastCount);
+  drawPageTitle("ADS-B", rgb(120, 205, 255));
   status(count, rgb(35, 210, 80));
   present();
 }
@@ -4086,6 +4139,7 @@ void renderMapPage() {
   char count[20];
   if (creditsRemaining >= 0) snprintf(count,sizeof(count),"%d C%ld",lastCount,creditsRemaining);
   else snprintf(count,sizeof(count),"%d",lastCount);
+  drawPageTitle("ADS-B", rgb(120, 205, 255));
   status(count,rgb(35,210,80));
   present();
 }
@@ -4116,7 +4170,53 @@ void renderMarinePage() {
   if (!marineTrackingEnabled) snprintf(count, sizeof(count), "MARINE TRACKING OFF");
   else if (!marineConfigured()) snprintf(count, sizeof(count), "AIS NOT CONFIGURED");
   else snprintf(count, sizeof(count), "%d SHIPS%s", plotted, aisConnected ? "" : " (OFFLINE)");
+  drawPageTitle("MARINE", rgb(70, 200, 255));
   status(count, !marineConfigured() ? rgb(150,150,150) : aisConnected ? rgb(35,210,80) : rgb(220,60,60));
+  present();
+}
+
+// Colour and letter per kind, so a glance separates the three skies this
+// page gathers. A radiosonde on its way down is the common case and gets
+// the plain one; an amateur flight and an airship are rarer and louder.
+uint16_t balloonColour(uint8_t kind) {
+  if (kind == BALLOON_AMATEUR) return rgb(255, 190, 60);
+  if (kind == BALLOON_AIRSHIP) return rgb(190, 130, 255);
+  return rgb(120, 230, 170);
+}
+
+void drawBalloonIcon(int x, int y, uint8_t kind) {
+  const uint16_t colour = balloonColour(kind);
+  // An envelope over a small payload: recognisable at this size in a way a
+  // circle is not, and unmistakably not an aircraft icon.
+  disc(x, y - 2, 5, colour);
+  filledRect(x - 1, y + 3, 3, 3, colour);
+}
+
+void renderBalloonPage() {
+  restoreMap();
+  int plotted = 0;
+  for (int i = 0; i < balloonCount; ++i) {
+    BalloonDisplay &balloon = latestBalloons[i];
+    int x, y;
+    if (!mapPoint(balloon.latitude, balloon.longitude, x, y)) continue;
+    drawBalloonIcon(x, y, balloon.kind);
+    // Altitude beside it, in thousands: the one number that makes a
+    // balloon page worth looking at, since a sonde at 94,000 ft and one at
+    // 900 ft on its parachute are the same dot otherwise.
+    if (!isnan(balloon.altitudeFeet)) {
+      char label[12];
+      snprintf(label, sizeof(label), "%.0fk", balloon.altitudeFeet / 1000.0f);
+      text5(x + 8, y - 4, label, balloonColour(balloon.kind));
+    }
+    ++plotted;
+  }
+  char count[32];
+  if (!balloonTrackingEnabled) snprintf(count, sizeof(count), "BALLOON TRACKING OFF");
+  else if (!balloonFeedOk) snprintf(count, sizeof(count), "NO BALLOON FEED");
+  else snprintf(count, sizeof(count), "%d BALLOONS", plotted);
+  drawPageTitle("BALLOONS", rgb(120, 230, 170));
+  status(count, !balloonTrackingEnabled ? rgb(150, 150, 150)
+                : balloonFeedOk ? rgb(35, 210, 80) : rgb(220, 60, 60));
   present();
 }
 
@@ -4730,11 +4830,39 @@ void renderScreensaverPage() {
   present();
 }
 
+// Whether a page is worth swiping to. Marine and Balloon are each a whole
+// separate sky, and a receiver with neither switched on should not have to
+// swipe through two pages saying so to get from the Radar back to the
+// Overview. Both used to sit in the rotation permanently and print
+// "MARINE TRACKING OFF"; now they are simply not there.
+bool displayPageVisible(DisplayPage page) {
+  if (page == DisplayPage::Marine) return marineTrackingEnabled;
+  if (page == DisplayPage::Balloon) return balloonTrackingEnabled;
+  return true;
+}
+
+// The next page in the given direction that is actually switched on.
+//
+// Bounded by the page count rather than looping until it finds one: if
+// every page were somehow hidden this would spin forever inside the touch
+// handler, and the aircraft pages are never hidden so the fallback of
+// staying put can only be reached by a bug.
+DisplayPage nextVisiblePage(DisplayPage from, int step) {
+  int index = static_cast<int>(from);
+  for (int tried = 0; tried < DISPLAY_PAGE_COUNT; ++tried) {
+    index = (index + step + DISPLAY_PAGE_COUNT) % DISPLAY_PAGE_COUNT;
+    if (displayPageVisible(static_cast<DisplayPage>(index)))
+      return static_cast<DisplayPage>(index);
+  }
+  return from;
+}
+
 const char *displayPageName() {
   if (displayPage == DisplayPage::Overview) return "overview";
   if (displayPage == DisplayPage::Table) return "table";
   if (displayPage == DisplayPage::Radar) return "radar";
   if (displayPage == DisplayPage::Marine) return "marine";
+  if (displayPage == DisplayPage::Balloon) return "balloon";
   return "map";
 }
 
@@ -4752,6 +4880,7 @@ void renderCurrentPage() {
   else if (displayPage == DisplayPage::Table) renderTablePage();
   else if (displayPage == DisplayPage::Radar) renderRadarPage();
   else if (displayPage == DisplayPage::Marine) renderMarinePage();
+  else if (displayPage == DisplayPage::Balloon) renderBalloonPage();
   else renderMapPage();
 }
 
@@ -5877,6 +6006,11 @@ void handleStatusApi() {
   doc["aircraftCapacity"] = MAX_AIRCRAFT;
   doc["aircraftStorage"] = "PSRAM";
   doc["marineTrackingEnabled"] = marineTrackingEnabled;
+  doc["balloonTrackingEnabled"] = balloonTrackingEnabled;
+  doc["balloonCount"] = balloonCount;
+  doc["balloonCapacity"] = MAX_BALLOONS;
+  doc["balloonFeedOk"] = balloonFeedOk;
+  doc["balloonFeedHttpCode"] = balloonFeedHttpCode;
   doc["marineProvider"] = marineProvider;
   doc["aisConfigured"] = marineConfigured();
   doc["hasAisApiKey"] = aisApiKey.length() > 0;
@@ -6118,7 +6252,8 @@ void handlePageControl() {
   displayPage = page == "overview" ? DisplayPage::Overview :
                 page == "table" ? DisplayPage::Table :
                 page == "radar" ? DisplayPage::Radar :
-                page == "marine" ? DisplayPage::Marine : DisplayPage::Map;
+                page == "marine" ? DisplayPage::Marine :
+                page == "balloon" ? DisplayPage::Balloon : DisplayPage::Map;
   settingsStore.putUChar("display-page", static_cast<uint8_t>(displayPage));
   screensaverActive = false;
   lastInteractionAt = millis();
@@ -6127,6 +6262,7 @@ void handlePageControl() {
   else if (displayPage == DisplayPage::Table) sendMessage(200, "Table page selected");
   else if (displayPage == DisplayPage::Radar) sendMessage(200, "Radar page selected");
   else if (displayPage == DisplayPage::Marine) sendMessage(200, "Marine page selected");
+  else if (displayPage == DisplayPage::Balloon) sendMessage(200, "Balloon page selected");
   else sendMessage(200, "Map page selected");
 }
 
@@ -6259,6 +6395,35 @@ void handlePasswordChange() {
   sendMessage(200, "Management password changed");
 }
 
+void handleBalloonSettings() {
+  if (!requireWebAuthentication()) return;
+  if (!requireCsrfToken()) return;
+  if (!webServer.hasArg("enabled")) {
+    sendMessage(400, "Nothing to change");
+    return;
+  }
+  balloonTrackingEnabled = webServer.arg("enabled") == "1";
+  settingsStore.putBool("balloon-enabled", balloonTrackingEnabled);
+  // Switched off, the page leaves the swipe rotation - so a device sitting
+  // on it would be stranded on a page that is no longer reachable. Move it
+  // somewhere that always exists.
+  if (!balloonTrackingEnabled) {
+    balloonCount = 0;
+    balloonFeedOk = false;
+    if (displayPage == DisplayPage::Balloon) {
+      displayPage = DisplayPage::Overview;
+      settingsStore.putUChar("display-page", static_cast<uint8_t>(displayPage));
+      MutexGuard guard(dataMutex);
+      renderCurrentPage();
+    }
+  } else {
+    // Ask now rather than at the end of whatever interval was running, so
+    // switching it on shows something within a few seconds.
+    nextBalloonFetchAt = 0;
+  }
+  sendMessage(200, balloonTrackingEnabled ? "Balloon tracking on" : "Balloon tracking off");
+}
+
 void handleProviderSettings() {
   if (!requireWebAuthentication()) return;
   if (!requireCsrfToken()) return;
@@ -6363,7 +6528,15 @@ void handleMarineCredentials() {
     // stop competing with it for the same TLS/heap budget, and switching it
     // off should let the aircraft feed resume immediately rather than wait
     // out whatever fetch interval was already in flight.
-    if (!marineTrackingEnabled) nextFetchAt = 0;
+    if (!marineTrackingEnabled) {
+      nextFetchAt = 0;
+      // Its page leaves the rotation with it, so a device left sitting on
+      // the Marine page would be stranded somewhere no swipe can reach.
+      if (displayPage == DisplayPage::Marine) {
+        displayPage = DisplayPage::Overview;
+        settingsStore.putUChar("display-page", static_cast<uint8_t>(displayPage));
+      }
+    }
   }
   // Any provider, key, radius, or enabled change needs a clean slate: the
   // old vessels came from a different source/area/state and would
@@ -6526,6 +6699,7 @@ void beginWebControl() {
     webServer.on("/api/wifi/forget", HTTP_POST, handleWifiForgetNetwork);
     webServer.on("/api/password", HTTP_POST, handlePasswordChange);
     webServer.on("/api/provider", HTTP_POST, handleProviderSettings);
+    webServer.on("/api/balloons", HTTP_POST, handleBalloonSettings);
     webServer.on("/api/marine/credentials", HTTP_POST, handleMarineCredentials);
     webServer.on("/api/marine/vessels", HTTP_GET, handleMarineVessels);
     webServer.on("/api/firmware", HTTP_POST, handleFirmwareResult, handleFirmwareUpload);
@@ -6796,6 +6970,91 @@ void fetchDatalasticVessels() {
   http.end();
 }
 
+// Balloons from the aggregator, which does the SondeHub talking for every
+// receiver. Deliberately infrequent: the server only asks SondeHub every
+// two minutes (SondeHub asks not to be polled hard), so asking faster than
+// that would re-read the same answer while spending a TLS handshake - the
+// scarcest thing on this board - to do it.
+constexpr uint32_t BALLOON_REFRESH_MS = 120000UL;
+
+void fetchBalloons() {
+  if (!balloonTrackingEnabled || !aggregatorApiKey.length()) return;
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  WiFiClientSecure client;
+  applyTlsPolicy(client);
+  HTTPClient http;
+  http.setTimeout(12000); http.setConnectTimeout(9000);
+  String url = "https://adsb.2e0lxy.uk/v1/balloons?lat=" + String(homeLatitude, 5) +
+               "&lon=" + String(homeLongitude, 5) +
+               "&radius=" + String(queryRadiusNm);
+  if (!http.begin(client, url)) { balloonFeedOk = false; return; }
+  http.addHeader("Authorization", "Bearer " + aggregatorApiKey);
+  http.addHeader("User-Agent", userAgent());
+  const int code = http.GET();
+  balloonFeedHttpCode = code;
+  if (code != HTTP_CODE_OK) {
+    balloonFeedOk = false;
+    http.end();
+    logLine((String("Balloon feed HTTP ") + code).c_str());
+    return;
+  }
+
+  // Only the fields this page draws. The server sends a little more (the
+  // source, the exact age) and the filter keeps the parse off the parts
+  // that would cost time and PSRAM for nothing.
+  JsonDocument filter;
+  filter["enabled"] = true;
+  JsonObject item = filter["balloons"].add<JsonObject>();
+  item["id"] = true; item["kind"] = true; item["lat"] = true; item["lon"] = true;
+  item["alt"] = true; item["climb"] = true; item["gs"] = true; item["track"] = true;
+  item["name"] = true; item["info"] = true;
+
+  JsonDocument doc;
+  const DeserializationError error =
+      deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
+  http.end();
+  if (error) {
+    balloonFeedOk = false;
+    logLine((String("Balloon JSON error: ") + error.c_str()).c_str());
+    return;
+  }
+
+  // "Switched off on the server" is not "no balloons in range". Saying so
+  // keeps the panel honest instead of showing an empty map that looks like
+  // a quiet sky.
+  if (!doc["enabled"].as<bool>()) {
+    balloonFeedOk = false;
+    balloonCount = 0;
+    return;
+  }
+
+  int count = 0;
+  for (JsonObjectConst entry : doc["balloons"].as<JsonArrayConst>()) {
+    if (count >= MAX_BALLOONS) break;
+    BalloonDisplay &balloon = latestBalloons[count];
+    balloon.latitude = entry["lat"] | 0.0;
+    balloon.longitude = entry["lon"] | 0.0;
+    if (balloon.latitude == 0.0 && balloon.longitude == 0.0) continue;
+    balloon.altitudeFeet = entry["alt"].is<float>() ? entry["alt"].as<float>() : NAN;
+    balloon.climbFpm = entry["climb"].is<float>() ? entry["climb"].as<float>() : NAN;
+    balloon.groundKnots = entry["gs"].is<float>() ? entry["gs"].as<float>() : NAN;
+    balloon.heading = entry["track"].is<float>() ? entry["track"].as<float>() : -1.0f;
+    const char *kind = entry["kind"] | "sonde";
+    balloon.kind = !strcmp(kind, "amateur") ? BALLOON_AMATEUR
+                   : !strcmp(kind, "airship") ? BALLOON_AIRSHIP : BALLOON_SONDE;
+    snprintf(balloon.id, sizeof(balloon.id), "%s", entry["id"] | "");
+    snprintf(balloon.label, sizeof(balloon.label), "%s", entry["name"] | "");
+    snprintf(balloon.detail, sizeof(balloon.detail), "%s", entry["info"] | "");
+    balloon.distanceMiles = distanceMilesFromHome(balloon.latitude, balloon.longitude);
+    balloon.lastUpdateMs = millis();
+    ++count;
+  }
+  balloonCount = count;
+  balloonFeedOk = true;
+  balloonDataDirty = true;
+}
+
 void fetchMarineRest() {
   if (marineProvider == "aishub") fetchAisHubVessels();
   else if (marineProvider == "myshiptracking") fetchMyShipTrackingVessels();
@@ -6905,6 +7164,7 @@ void onAisEvent(WStype_t type, uint8_t *payload, size_t length) {
         }
       }
       if (displayPage == DisplayPage::Marine) marineDataDirty = true;
+      if (displayPage == DisplayPage::Balloon) balloonDataDirty = true;
       break;
     }
     default:
@@ -7074,6 +7334,23 @@ void networkTask(void *) {
       delay(100);
       ESP.restart();
     }
+    // Balloons, on their own slow timer and outside the marine/aircraft
+    // chain below - so it is never a third TLS session open alongside
+    // either of theirs. This task runs its blocks one after another, which
+    // is what keeps that true; two sessions at once is what drove
+    // heapMinimum to a few hundred bytes and broke every request.
+    //
+    // The AIS socket is the one thing that IS persistent, so it is paused
+    // for the duration exactly as the aircraft fetch pauses it.
+    if (balloonTrackingEnabled && aggregatorApiKey.length() &&
+        static_cast<int32_t>(millis() - nextBalloonFetchAt) >= 0) {
+      const bool pauseAis = marineTrackingEnabled && marineProvider == "aisstream" &&
+                            aisWebSocket.isConnected();
+      if (pauseAis) { aisIntentionalDisconnect = true; aisWebSocket.disconnect(); }
+      { MutexGuard guard(dataMutex); fetchBalloons(); }
+      if (pauseAis) connectAisWebSocket();
+      nextBalloonFetchAt = millis() + BALLOON_REFRESH_MS;
+    }
     // Marine tracking and the aircraft feed are mutually exclusive - both
     // need a persistent TLS session or frequent HTTPS fetches, and running
     // both at once was the root of the recurring SSL alloc failures. Only
@@ -7228,6 +7505,7 @@ void setup() {
   myShipTrackingApiKey = storedString("mst-key", "");
   datalasticApiKey = storedString("datalastic-key", "");
   marineTrackingEnabled = settingsStore.getBool("marine-enabled", false);
+  balloonTrackingEnabled = settingsStore.getBool("balloon-enabled", false);
   marineProvider = storedString("marine-provider", "aisstream");
   if (marineProvider != "aisstream" && marineProvider != "aishub" &&
       marineProvider != "myshiptracking" && marineProvider != "datalastic") marineProvider = "aisstream";
@@ -7239,6 +7517,10 @@ void setup() {
   if (!isfinite(homeLongitude) || homeLongitude < -180.0f || homeLongitude > 180.0f) homeLongitude = DEFAULT_HOME_LON;
   physicalMapZoom = constrain(settingsStore.getUChar("map-zoom", zoomForRadius()), 3, 16);
   displayPage = static_cast<DisplayPage>(constrain(settingsStore.getUChar("display-page", 0), 0, DISPLAY_PAGE_COUNT - 1));
+  // Marine and Balloon only appear in the rotation when switched on, so a
+  // saved page whose feature has since been turned off would leave the
+  // panel showing something no swipe could return to.
+  if (!displayPageVisible(displayPage)) displayPage = DisplayPage::Overview;
   screensaverEnabled = settingsStore.getBool("ssaver-on", false);
   screensaverIdleMinutes = constrain(settingsStore.getUShort("ssaver-min", 5), 1, 120);
   brightnessPercent = settingsStore.getUChar("brightness", 100);
@@ -7337,7 +7619,9 @@ void setup() {
       MAX_AIRCRAFT, sizeof(AircraftDisplay), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
   latestVessels = static_cast<VesselDisplay *>(heap_caps_calloc(
       MAX_VESSELS, sizeof(VesselDisplay), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-  if (!framebuffer || !baseMap || !latestAircraft || !latestVessels) {
+  latestBalloons = static_cast<BalloonDisplay *>(heap_caps_calloc(
+      MAX_BALLOONS, sizeof(BalloonDisplay), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (!framebuffer || !baseMap || !latestAircraft || !latestVessels || !latestBalloons) {
     Serial.println("PSRAM display/aircraft buffers unavailable");
     while(true) delay(1000);
   }
@@ -7476,9 +7760,7 @@ void loop() {
     pageStep = 1;
   }
   if (pageStep) {
-    const int pageCount = DISPLAY_PAGE_COUNT;
-    displayPage = static_cast<DisplayPage>(
-        (static_cast<int>(displayPage) + pageStep + pageCount) % pageCount);
+    displayPage = nextVisiblePage(displayPage, pageStep);
     tableScrollOffset = 0;
     pageSavePending = true;
     pageSaveAt = millis() + 5000UL;
@@ -7509,6 +7791,18 @@ void loop() {
     marineDataDirty = false;
     { MutexGuard guard(dataMutex); renderMarinePage(); }
     nextMarineRenderAt = millis() + 2000;
+  }
+  // Same again for the balloons. Without this the page would be painted
+  // once on arrival and never again - the fetch that brings new positions
+  // runs on the other core and has no way to repaint anything itself.
+  // Rate-limited like the marine one: balloons move slowly and a repaint
+  // is a full-frame render.
+  if (displayPage == DisplayPage::Balloon && balloonDataDirty && !screensaverActive &&
+      detailAircraftIndex < 0 &&
+      static_cast<int32_t>(millis() - nextBalloonRenderAt) >= 0) {
+    balloonDataDirty = false;
+    { MutexGuard guard(dataMutex); renderBalloonPage(); }
+    nextBalloonRenderAt = millis() + 2000;
   }
   // Screensaver: activate after the configured idle time (no touch/button/
   // web-driven interaction - see lastInteractionAt's updates elsewhere), then

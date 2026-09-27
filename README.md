@@ -400,6 +400,14 @@ If the board does not enter download mode, hold **BOOT**, tap **RESET**, begin t
 - MLAT aircraft: violet/red symbol
 - AIS vessel positions: event-driven over a persistent WebSocket, not polled - a quiet Marine page in low-traffic water is normal
 - Route lookup: public ADSBDB callsign endpoint, cached for six hours and persisted to SD (or LittleFS without a card) so a reboot doesn't start cold; the Table page shows the fullest name that fits (full name, then city, then a departure-board-style abbreviation, then the raw code), while the Overview and Map pages show the raw code. `NO ROUTE` / `NO RTE` means adsbdb was asked and had nothing on file (typically a private/GA registration), distinct from `---` which means still queued
+- Balloon page: weather balloons (radiosondes), amateur high-altitude flights and
+  airships, from the aggregator's SondeHub feed. Altitude in thousands of feet beside
+  each icon, coloured by kind. Refreshed every two minutes, because the server only
+  asks SondeHub that often
+- Page titles: every page names the sky it is showing - ADS-B, MARINE, BALLOONS - now
+  that three of them share one swipe rotation
+- Marine and Balloon pages appear in the rotation only while their tracking is switched
+  on, rather than sitting there saying they are off
 - OSM failure: falls back to the built-in radar-style map
 
 ## OpenStreetMap usage
