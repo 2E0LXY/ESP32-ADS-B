@@ -58,6 +58,33 @@ def root():
     return RedirectResponse("https://2e0lxy.uk/adsb/7-inch-ESP32-S3-ADSB-MLAT-Receiver-site/index.html")
 
 
+@router.get("/v1/balloons")
+async def get_balloons(
+    lat: float,
+    lon: float,
+    radius: float,
+    request: Request,
+    device: models.Device = Depends(require_device_api_key),
+):
+    """Balloons near a receiver: radiosondes, amateur flights, airships.
+
+    Its own endpoint rather than more entries in /v1/aircraft, because a
+    balloon is not an aircraft in any way the panel treats the same: no
+    callsign, no route, no operator, no type designator, and an altitude
+    three times anything with wings. A device that has the balloon page
+    switched off simply never calls this.
+    """
+    tracker = getattr(request.app.state, "balloons", None)
+    if tracker is None or not tracker.enabled():
+        # Off is not an error, and it is not an empty sky either. Said
+        # plainly so a receiver can show "switched off on the server"
+        # rather than "no balloons in range", which are different things
+        # and would otherwise look identical.
+        return {"enabled": False, "balloons": [], "count": 0}
+    balloons = tracker.query(lat, lon, radius)
+    return {"enabled": True, "balloons": balloons, "count": len(balloons)}
+
+
 @router.get("/v1/track/{hex_id}")
 async def get_track(
     hex_id: str,

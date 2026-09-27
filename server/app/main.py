@@ -17,6 +17,7 @@ from .leader import Leadership
 from .log_buffer import install as install_log_buffer
 from .retention import UsageLogPruner
 from .runtime_settings import SettingsStore
+from .balloons import BalloonTracker
 from .tracks import TrackStore
 from .schedules import ScheduleResolver
 from .routers import admin, public
@@ -113,6 +114,14 @@ async def startup():
                                       tracks=app.state.tracks)
     app.state.aggregator.start()
 
+    # Balloons: a separate sky, on a separate page, polled far more slowly.
+    # It borrows the aggregator's idea of which areas matter so balloons
+    # follow the same device locations the aircraft polling does rather than
+    # keeping a second copy of that logic. See app/balloons.py.
+    app.state.balloons = BalloonTracker(settings=app.state.settings,
+                                        cache=app.state.cache)
+    app.state.balloons.start(regions_provider=app.state.aggregator.poll_regions)
+
     # Resolves callsign -> route on behalf of every device, so the ESP32
     # never opens its own TLS connection to adsbdb. See app/routes.py.
     app.state.routes = RouteResolver()
@@ -187,6 +196,7 @@ async def startup():
 async def shutdown():
     await app.state.leadership.stop()
     await app.state.schedules.stop()
+    await app.state.balloons.stop()
     await app.state.usage_pruner.stop()
     await app.state.photos.stop()
     await app.state.logos.stop()

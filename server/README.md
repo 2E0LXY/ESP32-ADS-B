@@ -130,6 +130,9 @@ raw data being pushed straight into this backend.
 - `app/feed_guard.py` - rejects aircraft a feeder could not really have heard
 - `app/opensky.py` - OpenSky as a fourth source: one OAuth token, SI units converted
 - `app/schedules.py` - AirLabs schedule lookups, cached and resolved in the background
+- `app/balloons.py` - radiosondes, amateur high-altitude flights and airships
+- `app/tracks.py` - recent position history, for the trail behind a selected aircraft
+- `app/units.py` - the SI conversions the two metric upstreams need
 - `app/sbs.py` - SBS/BaseStation protocol decoder for incoming feeder connections
 - `app/feed_ingest.py` - per-device TCP listeners that accept customers' own feeds
 - `app/security.py` - password hashing, session tokens, API key generation/hashing
@@ -284,6 +287,26 @@ One resolution is shared by every customer who can see that flight. Lookups
 are queued and never block a device request: an unresolved callsign simply
 comes back without a route and picks one up on a later poll. See
 `app/routes.py`.
+
+Balloons are a separate sky on their own endpoint (`/v1/balloons`) and their
+own page, off until switched on at `/admin/settings`. Three kinds: weather
+balloons (radiosondes) and amateur high-altitude flights, both from SondeHub,
+plus lighter-than-air aircraft that do carry a transponder, picked out of the
+aircraft already polled by ADS-B emitter category B2 at no extra request.
+
+**No API key is needed or wanted here.** SondeHub's GET endpoints are open.
+The obvious keyed alternative, aprs.fi, cannot do this job: its API is
+callsign-only by design with no geographic search, so it could never answer
+"what is near this receiver", and its terms forbid redistributing its data to
+a service offering the same features. SondeHub already bridges APRS-IS
+itself, so the amateur flights arrive anyway.
+
+Polled far more slowly than aircraft - two minutes by default against
+fifteen seconds - because SondeHub asks that its telemetry endpoints not be
+polled hard, and a balloon climbing at 5 m/s has not gone anywhere in fifteen
+seconds. Altitudes and speeds arrive in SI and are converted on the way in
+(`app/units.py`); left alone, a sonde at 30,000 m would read as a perfectly
+plausible 30,000 ft.
 
 Aircraft photographs are looked up per type, and per operator of that type
 where one exists. One photograph per type meant a Jet2 737-800 and a Ryanair

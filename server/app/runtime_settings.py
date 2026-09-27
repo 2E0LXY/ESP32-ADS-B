@@ -178,6 +178,51 @@ DEFINITIONS: list[Setting] = [
              "again once saved.",
     ),
 
+    # --- Balloons --------------------------------------------------------
+    Setting(
+        "balloon_tracking", "bool", os.environ.get("BALLOON_TRACKING", "0") == "1",
+        label="Track balloons", group="Balloons",
+        help="Weather balloons, amateur high-altitude flights and lighter-than-air "
+             "aircraft, gathered here and served to every receiver on its own page. "
+             "Off by default: it is a separate sky from the aircraft one and not "
+             "everybody wants it.",
+    ),
+    Setting(
+        "balloon_sondes", "bool", True,
+        label="Weather balloons (radiosondes)", group="Balloons",
+        help="From SondeHub, which needs no account. Several thousand are launched "
+             "worldwide every day, mostly at 00Z and 12Z, and climb to around "
+             "100,000 ft before coming down on a parachute.",
+    ),
+    Setting(
+        "balloon_amateur", "bool", True,
+        label="Amateur high-altitude balloons", group="Balloons",
+        help="Radio amateurs' high-altitude and pico flights, also from SondeHub, "
+             "which bridges APRS-IS itself - so no APRS account is needed here.",
+    ),
+    Setting(
+        "balloon_adsb", "bool", True,
+        label="Lighter-than-air on ADS-B", group="Balloons",
+        help="Airships and tethered balloons that do carry a transponder. Picked out "
+             "of the aircraft already polled by their ADS-B emitter category, so this "
+             "costs no extra requests to anyone.",
+    ),
+    Setting(
+        "balloon_radius_nm", "float", 250.0,
+        label="Look for balloons within", unit=" nm", minimum=25.0, maximum=1000.0,
+        group="Balloons",
+        help="Wider than the aircraft radius on purpose: balloons are sparse, and one "
+             "300 nm away crossing towards you is worth seeing coming.",
+    ),
+    Setting(
+        "balloon_poll_seconds", "int", 120,
+        label="Ask SondeHub every", unit=" s", minimum=30, maximum=900,
+        group="Balloons",
+        help="Far slower than the aircraft poll, for two reasons: SondeHub asks that "
+             "its telemetry endpoints not be polled hard, and a balloon climbing at "
+             "5 m/s has not gone anywhere in fifteen seconds.",
+    ),
+
     # --- AirLabs schedules ----------------------------------------------
     Setting(
         "airlabs_schedules", "bool", os.environ.get("AIRLABS_SCHEDULES", "0") == "1",

@@ -404,6 +404,7 @@ async def admin_system(
             "pruner": state.usage_pruner,
             "opensky": opensky_state,
             "schedule_stats": state.schedules.stats(),
+            "balloon_stats": state.balloons.stats(),
         },
     )
 

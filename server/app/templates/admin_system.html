@@ -89,6 +89,14 @@
       {{ schedule_stats.lookups }} looked up, {{ schedule_stats.hits }} served,
       {{ schedule_stats.misses }} with no schedule, {{ schedule_stats.errors }} errors,
       {{ schedule_stats.dropped }} dropped</span></td></tr>
+<tr><td>Balloons<br><span class="sub">SondeHub, no account needed</span></td>
+  <td>{% if balloon_stats.enabled %}<span class="badge ok">On</span>{% else %}Off{% endif %}
+    <span class="sub">{{ balloon_stats.tracked }} flying
+      ({% for kind, count in balloon_stats.kinds.items() %}{{ count }} {{ kind }}{% if not loop.last %}, {% endif %}{% else %}none right now{% endfor %}),
+      {{ balloon_stats.polls }} polls, {{ balloon_stats.errors }} errors,
+      every {{ balloon_stats.interval_seconds | int }}s within
+      {{ balloon_stats.radius_nm | int }} nm
+      {% if balloon_stats.last_error %}<br><b>{{ balloon_stats.last_error }}</b>{% endif %}</span></td></tr>
 <tr><td>OpenSky<br><span class="sub">fourth upstream source</span></td>
   <td>{% if opensky.enabled and opensky.configured %}<span class="badge ok">On</span>
     {% elif opensky.enabled %}<span class="badge bad">No client ID and secret</span>
