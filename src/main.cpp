@@ -1044,9 +1044,28 @@ bool marineConfigured() {
 }
 // Page order matches the swipe order on the panel: Overview is the first
 // screen, then swipe right advances Table -> Map -> Radar -> Marine and wraps.
-enum class DisplayPage : uint8_t { Overview = 0, Table = 1, Map = 2, Radar = 3,
-                                   Marine = 4, Balloon = 5 };
-constexpr uint8_t DISPLAY_PAGE_COUNT = 6;
+// Values are stable on purpose: the current page is saved to NVS as this
+// number, so inserting a page in the middle would silently reinterpret
+// every device's saved page. New pages are appended; the swipe ORDER is a
+// separate list below.
+enum class DisplayPage : uint8_t {
+  Overview = 0, Table = 1, Map = 2, Radar = 3, Marine = 4, Balloon = 5,
+  MarineOverview = 6, MarineTable = 7, BalloonOverview = 8, BalloonTable = 9,
+};
+constexpr uint8_t DISPLAY_PAGE_COUNT = 10;
+
+// The order a swipe walks, grouped by which sky each page shows. Three
+// domains share one rotation now, and interleaving them - map, ships,
+// balloons, table, ships... - would make it unnavigable. Grouped, a swipe
+// moves through one subject and then on to the next, and the page title
+// top-left says which subject you are in.
+constexpr DisplayPage PAGE_ORDER[] = {
+    DisplayPage::Overview, DisplayPage::Table, DisplayPage::Map, DisplayPage::Radar,
+    DisplayPage::Marine, DisplayPage::MarineOverview, DisplayPage::MarineTable,
+    DisplayPage::Balloon, DisplayPage::BalloonOverview, DisplayPage::BalloonTable,
+};
+static_assert(sizeof(PAGE_ORDER) / sizeof(PAGE_ORDER[0]) == DISPLAY_PAGE_COUNT,
+              "every page must appear in the swipe order exactly once");
 DisplayPage displayPage = DisplayPage::Overview;
 float radarSweepDegrees = 0.0f;
 uint32_t nextRadarFrameAt = 0;
@@ -4156,14 +4175,34 @@ void drawVesselIcon(int x, int y, float course, uint16_t colour) {
   line(tx(-3, 0), ty(-3, 0), tx(-6, 4), ty(-6, 4), colour);
 }
 
+// Sorted nearest-first so the panels below read as "what is closest", the
+// same promise the aircraft pages make. Insertion sort on an already
+// near-sorted list of tens of items - the positions barely move between
+// polls - and it runs once per render on the UI core, not per frame.
+template <typename T>
+void sortByDistance(T *items, int count) {
+  for (int i = 1; i < count; ++i) {
+    T key = items[i];
+    int j = i - 1;
+    while (j >= 0 && items[j].distanceMiles > key.distanceMiles) {
+      items[j + 1] = items[j];
+      --j;
+    }
+    items[j + 1] = key;
+  }
+}
+
 void renderMarinePage() {
   restoreMap();
+  iconHitCount = 0;
+  sortByDistance(latestVessels, vesselCount);
   int plotted = 0;
   for (int i = 0; i < vesselCount; ++i) {
     VesselDisplay &vessel = latestVessels[i];
     int x, y;
     if (!mapPoint(vessel.latitude, vessel.longitude, x, y)) continue;
     drawVesselIcon(x, y, vessel.courseOverGround, rgb(70, 200, 255));
+    recordIconHit(x, y, i);
     ++plotted;
   }
   char count[28];
@@ -4194,12 +4233,15 @@ void drawBalloonIcon(int x, int y, uint8_t kind) {
 
 void renderBalloonPage() {
   restoreMap();
+  iconHitCount = 0;
+  sortByDistance(latestBalloons, balloonCount);
   int plotted = 0;
   for (int i = 0; i < balloonCount; ++i) {
     BalloonDisplay &balloon = latestBalloons[i];
     int x, y;
     if (!mapPoint(balloon.latitude, balloon.longitude, x, y)) continue;
     drawBalloonIcon(x, y, balloon.kind);
+    recordIconHit(x, y, i);
     // Altitude beside it, in thousands: the one number that makes a
     // balloon page worth looking at, since a sonde at 94,000 ft and one at
     // 900 ft on its parachute are the same dot otherwise.
@@ -4217,6 +4259,102 @@ void renderBalloonPage() {
   drawPageTitle("BALLOONS", rgb(120, 230, 170));
   status(count, !balloonTrackingEnabled ? rgb(150, 150, 150)
                 : balloonFeedOk ? rgb(35, 210, 80) : rgb(220, 60, 60));
+  present();
+}
+
+// --- Marine and balloon, in the same three shapes the aircraft have ------
+//
+// Map, map-plus-table, and table-only, because the three questions an
+// enthusiast asks are different: where is everything, what is the nearest
+// handful, and what is the whole list. The aircraft pages proved the shape;
+// these follow it rather than inventing a second idiom, down to the column
+// origins scaling off W so the 480x480 board gets the same design smaller
+// rather than a clipped copy.
+
+void renderMarineOverviewPage() {
+  restoreMap();
+  iconHitCount = 0;
+  sortByDistance(latestVessels, vesselCount);
+  for (int i = 0; i < vesselCount; ++i) {
+    VesselDisplay &vessel = latestVessels[i];
+    int x, y;
+    if (!mapPoint(vessel.latitude, vessel.longitude, x, y)) continue;
+    if (x < 0 || x >= OVERVIEW_MAP_WIDTH - 10 || y < 0 || y >= H) continue;
+    drawVesselIcon(x, y, vessel.courseOverGround, rgb(70, 200, 255));
+    recordIconHit(x, y, i);
+  }
+
+  filledRect(OVERVIEW_MAP_WIDTH, 0, W - OVERVIEW_MAP_WIDTH, H, rgb(2, 10, 18));
+  line(OVERVIEW_MAP_WIDTH, 0, OVERVIEW_MAP_WIDTH, H - 1, rgb(30, 90, 120));
+  const int panelX = OVERVIEW_MAP_WIDTH + 8;
+  text5(panelX, 8, "NEAREST", rgb(80, 220, 255));
+  text5(panelX + OVERVIEW_COL_MILES, 8, "MI", rgb(120, 170, 200));
+  text5(panelX + OVERVIEW_COL_ALT, 8, "KTS", rgb(120, 170, 200));
+  line(panelX, 18, W - 6, 18, rgb(30, 90, 120));
+
+  const int rows = min(vesselCount, (H - 46) / 22);
+  for (int i = 0; i < rows; ++i) {
+    VesselDisplay &vessel = latestVessels[i];
+    const int y = 26 + i * 22;
+    char name[18];
+    snprintf(name, sizeof(name), "%s",
+             vessel.name[0] ? vessel.name : String(vessel.mmsi).c_str());
+    text5(panelX, y, name, rgb(235, 245, 255));
+    char miles[6];
+    snprintf(miles, sizeof(miles), "%d", static_cast<int>(lroundf(vessel.distanceMiles)));
+    text5(panelX + OVERVIEW_COL_MILES, y, miles, rgb(150, 205, 235));
+    char speed[7];
+    snprintf(speed, sizeof(speed), "%.0f", vessel.speedKnots);
+    text5(panelX + OVERVIEW_COL_ALT, y, speed, rgb(130, 210, 255));
+  }
+  char footer[24];
+  snprintf(footer, sizeof(footer), "%d SHIPS", vesselCount);
+  text5(panelX, H - 16, footer, rgb(90, 190, 230));
+  drawPageTitle("MARINE", rgb(70, 200, 255));
+  status(footer, aisConnected ? rgb(35, 210, 80) : rgb(220, 60, 60));
+  present();
+}
+
+void renderBalloonOverviewPage() {
+  restoreMap();
+  iconHitCount = 0;
+  sortByDistance(latestBalloons, balloonCount);
+  for (int i = 0; i < balloonCount; ++i) {
+    BalloonDisplay &balloon = latestBalloons[i];
+    int x, y;
+    if (!mapPoint(balloon.latitude, balloon.longitude, x, y)) continue;
+    if (x < 0 || x >= OVERVIEW_MAP_WIDTH - 10 || y < 0 || y >= H) continue;
+    drawBalloonIcon(x, y, balloon.kind);
+    recordIconHit(x, y, i);
+  }
+
+  filledRect(OVERVIEW_MAP_WIDTH, 0, W - OVERVIEW_MAP_WIDTH, H, rgb(2, 10, 18));
+  line(OVERVIEW_MAP_WIDTH, 0, OVERVIEW_MAP_WIDTH, H - 1, rgb(30, 90, 120));
+  const int panelX = OVERVIEW_MAP_WIDTH + 8;
+  text5(panelX, 8, "NEAREST", rgb(80, 220, 255));
+  text5(panelX + OVERVIEW_COL_MILES, 8, "MI", rgb(120, 170, 200));
+  text5(panelX + OVERVIEW_COL_ALT, 8, "ALT", rgb(120, 170, 200));
+  line(panelX, 18, W - 6, 18, rgb(30, 90, 120));
+
+  const int rows = min(balloonCount, (H - 46) / 22);
+  for (int i = 0; i < rows; ++i) {
+    BalloonDisplay &balloon = latestBalloons[i];
+    const int y = 26 + i * 22;
+    text5(panelX, y, balloon.label[0] ? balloon.label : balloon.id,
+          balloonColour(balloon.kind));
+    char miles[6];
+    snprintf(miles, sizeof(miles), "%d", static_cast<int>(lroundf(balloon.distanceMiles)));
+    text5(panelX + OVERVIEW_COL_MILES, y, miles, rgb(150, 205, 235));
+    char altitude[8];
+    if (isnan(balloon.altitudeFeet)) strcpy(altitude, "---");
+    else snprintf(altitude, sizeof(altitude), "%.0fk", balloon.altitudeFeet / 1000.0f);
+    text5(panelX + OVERVIEW_COL_ALT, y, altitude, rgb(130, 210, 255));
+  }
+  char footer[24];
+  snprintf(footer, sizeof(footer), "%d BALLOONS", balloonCount);
+  text5(panelX, H - 16, footer, rgb(90, 190, 230));
+  drawPageTitle("BALLOONS", rgb(120, 230, 170));
+  status(footer, balloonFeedOk ? rgb(35, 210, 80) : rgb(220, 60, 60));
   present();
 }
 
@@ -4421,6 +4559,82 @@ void renderRadarPage() {
 // A tap that hits a plotted aircraft icon (Overview/Map/Radar) shows this
 // instead of advancing the page, giving the touchscreen the same
 // "tap a marker for full detail" behaviour the browser map already has.
+// Table-only, the whole list rather than the nearest handful, scrolled with
+// the same up/down swipes the aircraft table uses.
+void renderMarineTablePage() {
+  filledRect(0, 0, W, H, rgb(2, 10, 18));
+  sortByDistance(latestVessels, vesselCount);
+  text5(layout::centreX - 84, 7, "NEAREST SHIPS", rgb(80, 220, 255), 2);
+  text5(COL_CALLSIGN, 31, "NAME", rgb(170, 190, 205));
+  text5(COL_MILES, 31, "MILES", rgb(170, 190, 205));
+  text5(COL_DIR, 31, "COG", rgb(170, 190, 205));
+  text5(COL_ALT, 31, "KTS", rgb(170, 190, 205));
+  text5(COL_ROUTE, 31, "TYPE / STATUS", rgb(170, 190, 205));
+  line(3, 41, W - 4, 41, rgb(55, 85, 105));
+
+  tableScrollOffset = constrain(tableScrollOffset, 0, max(0, vesselCount - TABLE_VISIBLE_ROWS));
+  const int rows = min(vesselCount - tableScrollOffset, TABLE_VISIBLE_ROWS);
+  for (int i = 0; i < rows; ++i) {
+    VesselDisplay &v = latestVessels[tableScrollOffset + i];
+    const int y = 49 + i * 40;
+    filledRect(0, y - 7, W, 40, (i & 1) ? ROW_BAND_LIGHT : ROW_BAND_DARK);
+    text5(COL_CALLSIGN, y, v.name[0] ? v.name : String(v.mmsi).c_str(), rgb(235, 245, 255), 2);
+    char buf[24];
+    snprintf(buf, sizeof(buf), "%d", static_cast<int>(lroundf(v.distanceMiles)));
+    text5(COL_MILES, y, buf, rgb(150, 205, 235), 2);
+    snprintf(buf, sizeof(buf), "%03d", ((static_cast<int>(v.courseOverGround) % 360) + 360) % 360);
+    text5(COL_DIR, y, buf, rgb(200, 215, 230), 2);
+    snprintf(buf, sizeof(buf), "%.0f", v.speedKnots);
+    text5(COL_ALT, y, buf, rgb(255, 255, 255), 2);
+    snprintf(buf, sizeof(buf), "%s", v.shipType[0] ? v.shipType : (v.navStatus[0] ? v.navStatus : "--"));
+    text5(COL_ROUTE, y, buf, rgb(130, 210, 255), 2);
+  }
+  char footer[40];
+  snprintf(footer, sizeof(footer), "%d SHIPS - SWIPE UP/DOWN TO SCROLL", vesselCount);
+  text5(6, H - 14, footer, rgb(70, 90, 110));
+  drawPageTitle("MARINE", rgb(70, 200, 255));
+  present();
+}
+
+void renderBalloonTablePage() {
+  filledRect(0, 0, W, H, rgb(2, 10, 18));
+  sortByDistance(latestBalloons, balloonCount);
+  text5(layout::centreX - 96, 7, "NEAREST BALLOONS", rgb(120, 230, 170), 2);
+  text5(COL_CALLSIGN, 31, "PAYLOAD", rgb(170, 190, 205));
+  text5(COL_MILES, 31, "MILES", rgb(170, 190, 205));
+  text5(COL_DIR, 31, "V/S", rgb(170, 190, 205));
+  text5(COL_ALT, 31, "ALT FT", rgb(170, 190, 205));
+  text5(COL_ROUTE, 31, "KIND / MODEL", rgb(170, 190, 205));
+  line(3, 41, W - 4, 41, rgb(55, 85, 105));
+
+  tableScrollOffset = constrain(tableScrollOffset, 0, max(0, balloonCount - TABLE_VISIBLE_ROWS));
+  const int rows = min(balloonCount - tableScrollOffset, TABLE_VISIBLE_ROWS);
+  for (int i = 0; i < rows; ++i) {
+    BalloonDisplay &b = latestBalloons[tableScrollOffset + i];
+    const int y = 49 + i * 40;
+    filledRect(0, y - 7, W, 40, (i & 1) ? ROW_BAND_LIGHT : ROW_BAND_DARK);
+    text5(COL_CALLSIGN, y, b.label[0] ? b.label : b.id, balloonColour(b.kind), 2);
+    char buf[24];
+    snprintf(buf, sizeof(buf), "%d", static_cast<int>(lroundf(b.distanceMiles)));
+    text5(COL_MILES, y, buf, rgb(150, 205, 235), 2);
+    if (isnan(b.climbFpm)) strcpy(buf, "--");
+    else snprintf(buf, sizeof(buf), "%+d", static_cast<int>(lroundf(b.climbFpm)));
+    text5(COL_DIR, y, buf, rgb(200, 215, 230), 2);
+    if (isnan(b.altitudeFeet)) strcpy(buf, "--");
+    else snprintf(buf, sizeof(buf), "%d", static_cast<int>(lroundf(b.altitudeFeet)));
+    text5(COL_ALT, y, buf, rgb(255, 255, 255), 2);
+    const char *kindLabel = b.kind == BALLOON_AMATEUR ? "AMATEUR"
+                            : b.kind == BALLOON_AIRSHIP ? "AIRSHIP" : "SONDE";
+    snprintf(buf, sizeof(buf), "%s %s", kindLabel, b.detail);
+    text5(COL_ROUTE, y, buf, rgb(130, 210, 255), 2);
+  }
+  char footer[44];
+  snprintf(footer, sizeof(footer), "%d BALLOONS - SWIPE UP/DOWN TO SCROLL", balloonCount);
+  text5(6, H - 14, footer, rgb(70, 90, 110));
+  drawPageTitle("BALLOONS", rgb(120, 230, 170));
+  present();
+}
+
 void renderAircraftDetailCard(int aircraftIndex) {
   if (aircraftIndex < 0 || aircraftIndex >= lastCount) return;
   AircraftDisplay &a = latestAircraft[aircraftIndex];
@@ -4473,6 +4687,110 @@ void renderAircraftDetailCard(int aircraftIndex) {
     snprintf(buf, sizeof(buf), "EMERGENCY: %s", a.emergency);
     line5(buf, rgb(255, 65, 65));
   }
+  text5(cx + 10, cy + cardH - 13, "TAP ANYWHERE TO CLOSE", rgb(130, 160, 180));
+  present();
+}
+
+// The same card for a ship and for a balloon. One shape for all three
+// subjects, because a tap meaning "tell me about this" should not produce
+// three different-looking answers - and the contents differ enough on
+// their own: a vessel has a destination and a navigational status, a
+// balloon has a climb rate and nothing else at all.
+void drawDetailCardFrame(int &cx, int &cy, int &cardW, int &cardH, uint16_t frame) {
+  cardW = min(360, W - 40);
+  cardH = min(230, H - 16);
+  cx = (W - cardW) / 2;
+  cy = (H - cardH) / 2;
+  filledRect(cx, cy, cardW, cardH, rgb(4, 12, 20));
+  filledRect(cx, cy, cardW, 2, frame);
+  filledRect(cx, cy + cardH - 2, cardW, 2, frame);
+  filledRect(cx, cy, 2, cardH, frame);
+  filledRect(cx + cardW - 2, cy, 2, cardH, frame);
+}
+
+void renderVesselDetailCard(int index) {
+  if (index < 0 || index >= vesselCount) return;
+  VesselDisplay &v = latestVessels[index];
+  int cx, cy, cardW, cardH;
+  const uint16_t frame = rgb(70, 200, 255);
+  drawDetailCardFrame(cx, cy, cardW, cardH, frame);
+
+  text5(cx + 10, cy + 9, v.name[0] ? v.name : String(v.mmsi).c_str(), rgb(255, 220, 60), 2);
+  text5(cx + cardW - 54, cy + 12, "AIS", rgb(60, 220, 130));
+
+  int row = cy + 30;
+  const int lineHeight = 12;
+  auto line5 = [&](const char *text, uint16_t colour) {
+    text5(cx + 10, row, text, colour);
+    row += lineHeight;
+  };
+  char buf[64];
+  line5(v.shipType[0] ? v.shipType : "Type not broadcast", rgb(190, 220, 240));
+  snprintf(buf, sizeof(buf), "MMSI %lu", static_cast<unsigned long>(v.mmsi));
+  line5(buf, rgb(200, 210, 220));
+  snprintf(buf, sizeof(buf), "SPD %.1f KT  COG %03d %s", v.speedKnots,
+           ((static_cast<int>(v.courseOverGround) % 360) + 360) % 360,
+           compassDirection(v.courseOverGround));
+  line5(buf, rgb(255, 255, 255));
+  // AIS reports heading separately from course over ground, and a ship
+  // being set by wind or tide is exactly when the difference is worth
+  // seeing - so it is shown rather than folded into one number.
+  if (v.heading >= 0) {
+    snprintf(buf, sizeof(buf), "HDG %03d", ((static_cast<int>(v.heading) % 360) + 360) % 360);
+    line5(buf, rgb(255, 255, 255));
+  }
+  snprintf(buf, sizeof(buf), "DIST %d MI", static_cast<int>(lroundf(v.distanceMiles)));
+  line5(buf, rgb(255, 255, 255));
+  snprintf(buf, sizeof(buf), "LAT %.4f  LON %.4f", v.latitude, v.longitude);
+  line5(buf, rgb(255, 255, 255));
+  if (v.navStatus[0]) line5(v.navStatus, rgb(130, 210, 255));
+  text5(cx + 10, cy + cardH - 13, "TAP ANYWHERE TO CLOSE", rgb(130, 160, 180));
+  present();
+}
+
+void renderBalloonDetailCard(int index) {
+  if (index < 0 || index >= balloonCount) return;
+  BalloonDisplay &b = latestBalloons[index];
+  int cx, cy, cardW, cardH;
+  const uint16_t frame = balloonColour(b.kind);
+  drawDetailCardFrame(cx, cy, cardW, cardH, frame);
+
+  text5(cx + 10, cy + 9, b.label[0] ? b.label : b.id, rgb(255, 220, 60), 2);
+  const char *kindLabel = b.kind == BALLOON_AMATEUR ? "AMATEUR"
+                          : b.kind == BALLOON_AIRSHIP ? "AIRSHIP" : "SONDE";
+  text5(cx + cardW - 84, cy + 12, kindLabel, frame);
+
+  int row = cy + 30;
+  const int lineHeight = 12;
+  auto line5 = [&](const char *text, uint16_t colour) {
+    text5(cx + 10, row, text, colour);
+    row += lineHeight;
+  };
+  char buf[64];
+  line5(b.detail[0] ? b.detail : "No model reported", rgb(190, 220, 240));
+  if (isnan(b.altitudeFeet)) snprintf(buf, sizeof(buf), "ALT --");
+  else snprintf(buf, sizeof(buf), "ALT %d FT", static_cast<int>(lroundf(b.altitudeFeet)));
+  line5(buf, rgb(255, 255, 255));
+  // Climb rate is the number that says what a balloon is doing: ascending
+  // to burst, or on its way down under a parachute.
+  if (!isnan(b.climbFpm)) {
+    snprintf(buf, sizeof(buf), "V/S %+d FPM  %s", static_cast<int>(lroundf(b.climbFpm)),
+             b.climbFpm > 60 ? "ASCENDING" : b.climbFpm < -60 ? "DESCENDING" : "LEVEL");
+    line5(buf, rgb(255, 255, 255));
+  }
+  if (!isnan(b.groundKnots)) {
+    if (b.heading >= 0)
+      snprintf(buf, sizeof(buf), "SPD %.0f KT  HDG %03d %s", b.groundKnots,
+               ((static_cast<int>(b.heading) % 360) + 360) % 360,
+               compassDirection(b.heading));
+    else
+      snprintf(buf, sizeof(buf), "SPD %.0f KT", b.groundKnots);
+    line5(buf, rgb(255, 255, 255));
+  }
+  snprintf(buf, sizeof(buf), "DIST %d MI", static_cast<int>(lroundf(b.distanceMiles)));
+  line5(buf, rgb(255, 255, 255));
+  snprintf(buf, sizeof(buf), "LAT %.4f  LON %.4f", b.latitude, b.longitude);
+  line5(buf, rgb(255, 255, 255));
   text5(cx + 10, cy + cardH - 13, "TAP ANYWHERE TO CLOSE", rgb(130, 160, 180));
   present();
 }
@@ -4835,9 +5153,36 @@ void renderScreensaverPage() {
 // swipe through two pages saying so to get from the Radar back to the
 // Overview. Both used to sit in the rotation permanently and print
 // "MARINE TRACKING OFF"; now they are simply not there.
+// Which subject a page shows. A tap means "tell me about this" on all
+// three, and the only thing that differs is which array the index is into
+// and which card to draw - so the pages say what they are about rather
+// than every call site listing pages.
+enum class PageSubject : uint8_t { Aircraft, Marine, Balloon };
+
+PageSubject displayPageSubject(DisplayPage page) {
+  if (page == DisplayPage::Marine || page == DisplayPage::MarineOverview ||
+      page == DisplayPage::MarineTable)
+    return PageSubject::Marine;
+  if (page == DisplayPage::Balloon || page == DisplayPage::BalloonOverview ||
+      page == DisplayPage::BalloonTable)
+    return PageSubject::Balloon;
+  return PageSubject::Aircraft;
+}
+
+// Whether a page is a table that scrolls, and how many rows it is scrolling
+// through - so the up/down swipe works the same on all three.
+bool displayPageIsTable(DisplayPage page) {
+  return page == DisplayPage::Table || page == DisplayPage::MarineTable ||
+         page == DisplayPage::BalloonTable;
+}
+
 bool displayPageVisible(DisplayPage page) {
-  if (page == DisplayPage::Marine) return marineTrackingEnabled;
-  if (page == DisplayPage::Balloon) return balloonTrackingEnabled;
+  if (page == DisplayPage::Marine || page == DisplayPage::MarineOverview ||
+      page == DisplayPage::MarineTable)
+    return marineTrackingEnabled;
+  if (page == DisplayPage::Balloon || page == DisplayPage::BalloonOverview ||
+      page == DisplayPage::BalloonTable)
+    return balloonTrackingEnabled;
   return true;
 }
 
@@ -4848,11 +5193,12 @@ bool displayPageVisible(DisplayPage page) {
 // handler, and the aircraft pages are never hidden so the fallback of
 // staying put can only be reached by a bug.
 DisplayPage nextVisiblePage(DisplayPage from, int step) {
-  int index = static_cast<int>(from);
+  int position = 0;
+  for (int i = 0; i < DISPLAY_PAGE_COUNT; ++i)
+    if (PAGE_ORDER[i] == from) { position = i; break; }
   for (int tried = 0; tried < DISPLAY_PAGE_COUNT; ++tried) {
-    index = (index + step + DISPLAY_PAGE_COUNT) % DISPLAY_PAGE_COUNT;
-    if (displayPageVisible(static_cast<DisplayPage>(index)))
-      return static_cast<DisplayPage>(index);
+    position = (position + step + DISPLAY_PAGE_COUNT) % DISPLAY_PAGE_COUNT;
+    if (displayPageVisible(PAGE_ORDER[position])) return PAGE_ORDER[position];
   }
   return from;
 }
@@ -4863,6 +5209,10 @@ const char *displayPageName() {
   if (displayPage == DisplayPage::Radar) return "radar";
   if (displayPage == DisplayPage::Marine) return "marine";
   if (displayPage == DisplayPage::Balloon) return "balloon";
+  if (displayPage == DisplayPage::MarineOverview) return "marine-overview";
+  if (displayPage == DisplayPage::MarineTable) return "marine-table";
+  if (displayPage == DisplayPage::BalloonOverview) return "balloon-overview";
+  if (displayPage == DisplayPage::BalloonTable) return "balloon-table";
   return "map";
 }
 
@@ -4881,6 +5231,10 @@ void renderCurrentPage() {
   else if (displayPage == DisplayPage::Radar) renderRadarPage();
   else if (displayPage == DisplayPage::Marine) renderMarinePage();
   else if (displayPage == DisplayPage::Balloon) renderBalloonPage();
+  else if (displayPage == DisplayPage::MarineOverview) renderMarineOverviewPage();
+  else if (displayPage == DisplayPage::MarineTable) renderMarineTablePage();
+  else if (displayPage == DisplayPage::BalloonOverview) renderBalloonOverviewPage();
+  else if (displayPage == DisplayPage::BalloonTable) renderBalloonTablePage();
   else renderMapPage();
 }
 
@@ -6253,7 +6607,11 @@ void handlePageControl() {
                 page == "table" ? DisplayPage::Table :
                 page == "radar" ? DisplayPage::Radar :
                 page == "marine" ? DisplayPage::Marine :
-                page == "balloon" ? DisplayPage::Balloon : DisplayPage::Map;
+                page == "balloon" ? DisplayPage::Balloon :
+                page == "marine-overview" ? DisplayPage::MarineOverview :
+                page == "marine-table" ? DisplayPage::MarineTable :
+                page == "balloon-overview" ? DisplayPage::BalloonOverview :
+                page == "balloon-table" ? DisplayPage::BalloonTable : DisplayPage::Map;
   settingsStore.putUChar("display-page", static_cast<uint8_t>(displayPage));
   screensaverActive = false;
   lastInteractionAt = millis();
@@ -7732,13 +8090,17 @@ void loop() {
     pageStep = 1;
   } else if (gesture == TouchGesture::SwipeLeft) {
     pageStep = -1;
-  } else if (displayPage == DisplayPage::Table &&
+  } else if (displayPageIsTable(displayPage) &&
              (gesture == TouchGesture::SwipeUp || gesture == TouchGesture::SwipeDown)) {
     // Content follows the finger: dragging up brings later rows into view
     // (scroll forward through the list), dragging down goes back toward the
-    // nearest aircraft.
+    // nearest. The same on all three tables; only the length differs.
+    const PageSubject subject = displayPageSubject(displayPage);
+    const int total = subject == PageSubject::Marine    ? vesselCount
+                      : subject == PageSubject::Balloon ? balloonCount
+                                                        : lastCount;
     tableScrollOffset += gesture == TouchGesture::SwipeUp ? TABLE_VISIBLE_ROWS : -TABLE_VISIBLE_ROWS;
-    tableScrollOffset = constrain(tableScrollOffset, 0, max(0, lastCount - TABLE_VISIBLE_ROWS));
+    tableScrollOffset = constrain(tableScrollOffset, 0, max(0, total - TABLE_VISIBLE_ROWS));
     { MutexGuard guard(dataMutex); renderCurrentPage(); }
   } else if (gesture == TouchGesture::Tap) {
     const int hitIndex = findAircraftIconAt(lastTapX, lastTapY);
@@ -7746,8 +8108,15 @@ void loop() {
       detailAircraftIndex = hitIndex;
       detailShownAt = millis();
       MutexGuard guard(dataMutex);
-      renderAircraftDetailCard(hitIndex);
-    } else if (displayPage != DisplayPage::Table) {
+      // The hit list is rebuilt by whichever page drew last, so the index
+      // is into that page's own array - a vessel on a marine page, a
+      // balloon on a balloon page.
+      switch (displayPageSubject(displayPage)) {
+        case PageSubject::Marine: renderVesselDetailCard(hitIndex); break;
+        case PageSubject::Balloon: renderBalloonDetailCard(hitIndex); break;
+        default: renderAircraftDetailCard(hitIndex); break;
+      }
+    } else if (!displayPageIsTable(displayPage)) {
       pageStep = 1;
     }
     // The Table page plots no icons, so every tap on it missed one and
