@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from .. import models, security
 from ..aggregator import Aggregator
 from ..cache import distance_nm as _distance_nm
+from .. import commands
 from ..database import get_db
 from ..deps import get_current_account, require_device_api_key
 from ..feed_ingest import allocate_port
@@ -78,6 +79,52 @@ async def get_alerts(
         return {"enabled": False, "alerts": [], "count": 0}
     alerts = watcher.recent(max(1, min(limit, 100)))
     return {"enabled": True, "alerts": alerts, "count": len(alerts)}
+
+
+@router.get("/v1/commands")
+async def get_commands(
+    request: Request,
+    device: models.Device = Depends(require_device_api_key),
+    db: Session = Depends(get_db),
+):
+    """What this device's owner has asked it to do.
+
+    The panel has no port open to the internet, so it asks rather than
+    being told: this rides back on the polling it already does. The device
+    is identified by its own API key, so it can only ever collect its own
+    commands.
+    """
+    return {"commands": await asyncio.to_thread(commands.collect, db, device)}
+
+
+@router.post("/devices/{device_id}/command")
+async def queue_command(
+    device_id: int,
+    request: Request,
+    action: str = Form(...),
+    value: str = Form(default=""),
+    account: models.Account = Depends(get_current_account),
+    db: Session = Depends(get_db),
+):
+    """Queue one instruction for a receiver this account owns.
+
+    Ownership is checked here, against the session; what may be asked for
+    at all is checked in app/commands.py, which is the security boundary -
+    a small closed set that can change what the panel shows and how bright
+    it is, and nothing that could change where it sends data, what
+    credentials it holds, or what network it joins.
+    """
+    device = await asyncio.to_thread(_owned_device, db, account, device_id)
+    if not device:
+        return JSONResponse({"error": "Unknown device"},
+                            status_code=status.HTTP_404_NOT_FOUND)
+    try:
+        row = await asyncio.to_thread(commands.queue, db, device, action, value,
+                                      account.email)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)},
+                            status_code=status.HTTP_400_BAD_REQUEST)
+    return {"queued": {"id": row.id, "action": row.action, "value": row.value}}
 
 
 @router.get("/v1/logbook")

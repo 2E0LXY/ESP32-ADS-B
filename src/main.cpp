@@ -7466,6 +7466,122 @@ void fetchAircraftTrail(const char *hex) {
   Serial.printf("Trail %s: %d points\n", hex, count);
 }
 
+// What the owner has asked this receiver to do from their phone.
+//
+// The panel has no port open to the internet, so it asks rather than being
+// told - this rides back on the polling it already does. Everything the
+// aggregator may ask for is a small closed set decided server-side (see
+// server/app/commands.py), and every value is checked AGAIN here: a device
+// on somebody's home network should not do as it is told just because the
+// instruction arrived over TLS from the right host.
+constexpr uint32_t COMMAND_POLL_MS = 20000UL;
+uint32_t nextCommandPollAt = 0;
+
+void applyRemoteCommand(const char *action, const char *value) {
+  if (!action || !action[0]) return;
+
+  if (!strcmp(action, "page")) {
+    const DisplayPage requested =
+        !strcmp(value, "overview")         ? DisplayPage::Overview
+        : !strcmp(value, "table")          ? DisplayPage::Table
+        : !strcmp(value, "map")            ? DisplayPage::Map
+        : !strcmp(value, "radar")          ? DisplayPage::Radar
+        : !strcmp(value, "marine")         ? DisplayPage::Marine
+        : !strcmp(value, "marine-overview") ? DisplayPage::MarineOverview
+        : !strcmp(value, "marine-table")   ? DisplayPage::MarineTable
+        : !strcmp(value, "balloon")        ? DisplayPage::Balloon
+        : !strcmp(value, "balloon-overview") ? DisplayPage::BalloonOverview
+        : !strcmp(value, "balloon-table")  ? DisplayPage::BalloonTable
+                                           : displayPage;
+    // A page whose feature is switched off is not reachable by swiping, so
+    // it must not be reachable from a phone either - the panel would be
+    // stranded somewhere no gesture could leave.
+    if (!displayPageVisible(requested)) {
+      logLine("Command: page is switched off on this device");
+      return;
+    }
+    displayPage = requested;
+    settingsStore.putUChar("display-page", static_cast<uint8_t>(displayPage));
+    renderCurrentPage();
+    logLine((String("Command: page ") + value).c_str());
+    return;
+  }
+
+  if (!strcmp(action, "brightness")) {
+    const long level = strtol(value, nullptr, 10);
+    if (level < 10 || level > 100) return;   // checked server-side too
+    brightnessPercent = static_cast<uint8_t>(level);
+    settingsStore.putUChar("brightness", brightnessPercent);
+    applyBrightness(brightnessPercent);
+    logLine((String("Command: brightness ") + level).c_str());
+    return;
+  }
+
+  if (!strcmp(action, "screensaver")) {
+    screensaverEnabled = !strcmp(value, "1");
+    settingsStore.putBool("ssaver-on", screensaverEnabled);
+    if (!screensaverEnabled && screensaverActive) {
+      screensaverActive = false;
+      renderCurrentPage();
+    }
+    lastInteractionAt = millis();
+    logLine(screensaverEnabled ? "Command: screensaver on" : "Command: screensaver off");
+    return;
+  }
+
+  if (!strcmp(action, "radius")) {
+    const long radius = strtol(value, nullptr, 10);
+    if (radius < 5 || radius > 250) return;
+    queryRadiusNm = static_cast<uint16_t>(radius);
+    physicalMapZoom = zoomForRadius();
+    settingsStore.putUShort("radius-nm", queryRadiusNm);
+    settingsStore.putUChar("map-zoom", physicalMapZoom);
+    // Same work the Location page does: the map is rebuilt for the new
+    // area, which is the minute-long job the range presets warn about.
+    physicalMapReady = false;
+    physicalMapRefreshPending = true;
+    invalidateWholeFrame();
+    clearTileCache();
+    nextFetchAt = 0;
+    logLine((String("Command: radius ") + radius + " nm").c_str());
+    return;
+  }
+
+  if (!strcmp(action, "refresh")) {
+    nextFetchAt = 0;
+    logLine("Command: refresh");
+    return;
+  }
+
+  logLine((String("Command ignored: ") + action).c_str());
+}
+
+void fetchRemoteCommands() {
+  if (apiProvider != "aggregator" || !aggregatorApiKey.length()) return;
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  WiFiClientSecure client;
+  applyTlsPolicy(client);
+  HTTPClient http;
+  http.setTimeout(10000); http.setConnectTimeout(9000);
+  if (!http.begin(client, "https://adsb.2e0lxy.uk/v1/commands")) return;
+  http.addHeader("Authorization", "Bearer " + aggregatorApiKey);
+  http.addHeader("User-Agent", userAgent());
+  const int code = http.GET();
+  if (code != HTTP_CODE_OK) { http.end(); return; }
+
+  JsonDocument doc;
+  const DeserializationError error = deserializeJson(doc, http.getStream());
+  http.end();
+  if (error) return;
+
+  for (JsonObjectConst entry : doc["commands"].as<JsonArrayConst>()) {
+    const char *action = entry["action"] | "";
+    const char *value = entry["value"] | "";
+    applyRemoteCommand(action, value);
+  }
+}
+
 void fetchBalloons() {
   if (!balloonTrackingEnabled || !aggregatorApiKey.length()) return;
   if (WiFi.status() != WL_CONNECTED) return;
@@ -7846,6 +7962,20 @@ void networkTask(void *) {
     //
     // The AIS socket is the one thing that IS persistent, so it is paused
     // for the duration exactly as the aircraft fetch pauses it.
+    // Anything the owner has queued from their phone. Cheap when there is
+    // nothing waiting - one small request - and on its own slow timer
+    // rather than the aircraft interval, because a command is a thing a
+    // person just did and twenty seconds is soon enough to feel immediate.
+    if (aggregatorApiKey.length() &&
+        static_cast<int32_t>(millis() - nextCommandPollAt) >= 0) {
+      const bool pauseAis = marineTrackingEnabled && marineProvider == "aisstream" &&
+                            aisWebSocket.isConnected();
+      if (pauseAis) { aisIntentionalDisconnect = true; aisWebSocket.disconnect(); }
+      { MutexGuard guard(dataMutex); fetchRemoteCommands(); }
+      if (pauseAis) connectAisWebSocket();
+      nextCommandPollAt = millis() + COMMAND_POLL_MS;
+    }
+
     // A tapped aircraft's trail, on demand. Same rule as every other fetch
     // here: one TLS session at a time, and the persistent AIS socket paused
     // for the duration.

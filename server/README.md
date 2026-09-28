@@ -132,6 +132,7 @@ raw data being pushed straight into this backend.
 - `app/schedules.py` - AirLabs schedule lookups, cached and resolved in the background
 - `app/alerts.py` - the aircraft worth looking up for, out of the ones already polled
 - `app/logbook.py` - every airframe seen before, so a first sighting is recognisable
+- `app/commands.py` - what an owner may ask their own receiver to do, and nothing else
 - `app/balloons.py` - radiosondes, amateur high-altitude flights and airships
 - `app/tracks.py` - recent position history, for the trail behind a selected aircraft
 - `app/units.py` - the SI conversions the two metric upstreams need
@@ -289,6 +290,26 @@ One resolution is shared by every customer who can see that flight. Lookups
 are queued and never block a device request: an unresolved callsign simply
 comes back without a route and picks one up on a later poll. See
 `app/routes.py`.
+
+Remote control works without opening a port on anybody's router. A receiver
+sits on a home network the internet cannot reach, so rather than being told
+what to do it **asks**: `/v1/commands` rides back on the polling it already
+does, and an owner queues instructions with `POST /devices/{id}/command`.
+
+That inverts the trust relationship - a server handing instructions to a
+device on somebody's home network - so `app/commands.py` is written as a
+security boundary rather than a convenience. Only the account that owns a
+device may queue for it (checked against the session); the action must be one
+of a small closed set with its value validated server-side; the queue is
+capped; and the firmware checks every value again on receipt, because a
+device should not do as it is told merely because the instruction arrived
+over TLS from the right host.
+
+What is absent from that list matters as much as what is on it. A command can
+change what the panel shows, how bright it is, its range, and whether the
+screensaver runs - what somebody standing in front of it could change by
+touching it. Nothing can change where it sends data, what credentials it
+holds, what network it joins, or what firmware it runs.
 
 Alerts (`/v1/alerts`) pick the notable aircraft out of the ones already being
 polled, so a display need not present an airliner and an aircraft squawking

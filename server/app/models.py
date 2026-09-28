@@ -229,6 +229,44 @@ class Setting(Base):
     updated_by = Column(String(255), nullable=True)
 
 
+class DeviceCommand(Base):
+    """One instruction queued for a receiver by its owner.
+
+    The panel is on a home network with no port open to the internet, so an
+    app cannot reach it from outside. Rather than asking anyone to forward a
+    port, the device asks US what to do next: it already polls this service
+    every fifteen seconds, and a pending command rides back on that.
+
+    That inverts the trust relationship, which is the thing to be careful
+    about - this table is a list of instructions a server hands to a device
+    on someone's home network. Three rules follow, enforced in
+    app/commands.py rather than trusted to the caller:
+
+      * only the account that owns the device may queue anything for it;
+      * the action must be one of a small closed set, with its value
+        validated here - never a passthrough of arbitrary settings, and
+        nothing that could change where the device sends its data or what
+        credentials it uses;
+      * the queue is capped, so a runaway client cannot fill the table.
+    """
+
+    __tablename__ = "device_commands"
+
+    id = Column(Integer, primary_key=True)
+    device_id = Column(Integer, ForeignKey("devices.id"), nullable=False, index=True)
+    action = Column(String(32), nullable=False)
+    value = Column(String(64), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False, index=True)
+    # Set when the device collects it. A command is handed out once: a
+    # receiver that collects one and then reboots loses it, which is the
+    # right trade for "change to the radar page" and avoids the panel
+    # replaying stale instructions after an outage.
+    delivered_at = Column(DateTime(timezone=True), nullable=True)
+    # Who asked, so the audit trail survives even though the command does
+    # not.
+    requested_by = Column(String(255), nullable=True)
+
+
 class Sighting(Base):
     """Every aircraft this deployment has ever seen, and when it first was.
 
