@@ -363,7 +363,7 @@ repeated.
 Aircraft trails are drawn on the web map: clicking an aircraft fetches
 `/v1/track/{hex}` (or the session- and share-authenticated equivalents the map
 pages use) and draws the arc it flew in on, coloured by its current altitude.
-Fetched only for the aircraft actually clicked - a trail per aircraft on every
+The panel draws them too, on a tap. Fetched only for the aircraft actually clicked - a trail per aircraft on every
 three-second poll would be roughly a hundred times the payload for something
 nobody is looking at, which is why the points live on their own endpoint rather
 than being attached to the aircraft list. The panel does not draw them yet.

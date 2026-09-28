@@ -1005,6 +1005,23 @@ void initRouteCache() {
 AircraftDisplay *latestAircraft = nullptr;
 VesselDisplay *latestVessels = nullptr;
 int vesselCount = 0;
+// The path a selected aircraft flew to get here, from the aggregator's
+// /v1/track. Every other thing this panel shows answers "where is it now";
+// this is the one that answers "where has it been" - the hold it is stuck
+// in, the turn onto final, the 8,000 ft it has come down in four minutes.
+//
+// Held for one aircraft at a time on purpose. A trail per aircraft would be
+// a hundred times the payload and a hundred times the PSRAM for something
+// nobody is looking at, which is the same reason the server keeps them on
+// their own endpoint rather than attaching them to the aircraft list.
+constexpr int MAX_TRAIL_POINTS = 120;   // matches the server's own cap
+double *trailLatitudes = nullptr;
+double *trailLongitudes = nullptr;
+int trailPointCount = 0;
+char trailHex[8] = {0};          // whose trail is held
+char trailFetchHex[8] = {0};     // whose trail the network task should get
+bool trailFetchPending = false;
+
 BalloonDisplay *latestBalloons = nullptr;
 int balloonCount = 0;
 bool balloonTrackingEnabled = false;
@@ -4094,8 +4111,43 @@ constexpr int OVERVIEW_COL_MILES = W * 66 / 480;
 constexpr int OVERVIEW_COL_ALT = W * 108 / 480;
 constexpr int OVERVIEW_COL_ROUTE = W * 144 / 480;
 
+// The selected aircraft's path, drawn under the icons so it reads as
+// something it came along rather than something laid over the map.
+//
+// Older points are dimmer, which is the whole reason this is worth drawing:
+// it says which end is now without needing an arrowhead, and a hold reads
+// as a hold rather than as a knot of overlapping lines.
+void drawSelectedTrail() {
+  if (trailPointCount < 2 || !trailLatitudes || !trailLongitudes) return;
+  int previousX = 0, previousY = 0;
+  bool havePrevious = false;
+  for (int i = 0; i < trailPointCount; ++i) {
+    int x, y;
+    if (!mapPoint(trailLatitudes[i], trailLongitudes[i], x, y)) {
+      // Off the map. The line is broken here rather than drawn to a point
+      // that is not there, which does mean a segment with one end off
+      // screen is dropped even where it crosses the visible part. That is
+      // the cheap half of the trade: pixel() would clip such a line safely,
+      // but at this zoom an endpoint a hundred miles away is a Bresenham
+      // loop of a hundred thousand iterations for a few visible pixels.
+      havePrevious = false;
+      continue;
+    }
+    if (havePrevious) {
+      // Oldest point dimmest, newest brightest.
+      const float age = 1.0f - static_cast<float>(i) / trailPointCount;
+      const uint8_t fade = static_cast<uint8_t>(60 + (1.0f - age) * 150);
+      line(previousX, previousY, x, y, rgb(fade / 3, fade, fade));
+    }
+    previousX = x;
+    previousY = y;
+    havePrevious = true;
+  }
+}
+
 void renderOverviewPage() {
   restoreMap();
+  drawSelectedTrail();
   iconHitCount = 0;
   for (int i = 0; i < lastCount; ++i) {
     AircraftDisplay &display = latestAircraft[i];
@@ -4149,6 +4201,7 @@ void renderOverviewPage() {
 
 void renderMapPage() {
   restoreMap();
+  drawSelectedTrail();
   iconHitCount = 0;
   for (int i=0; i<lastCount; ++i) {
     AircraftDisplay &display = latestAircraft[i];
@@ -7363,6 +7416,56 @@ void fetchDatalasticVessels() {
 // scarcest thing on this board - to do it.
 constexpr uint32_t BALLOON_REFRESH_MS = 120000UL;
 
+// The path one aircraft flew to get here. Fetched on demand - when
+// somebody taps it - rather than on a timer, because it is only ever wanted
+// for the one that has been selected.
+void fetchAircraftTrail(const char *hex) {
+  if (!hex || !hex[0] || !trailLatitudes || !trailLongitudes) return;
+  // The endpoint is this deployment's own, so it is only there when the
+  // aggregator is the provider in use.
+  if (apiProvider != "aggregator" || !aggregatorApiKey.length()) return;
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  WiFiClientSecure client;
+  applyTlsPolicy(client);
+  HTTPClient http;
+  http.setTimeout(10000); http.setConnectTimeout(9000);
+  const String url = String("https://adsb.2e0lxy.uk/v1/track/") + hex;
+  if (!http.begin(client, url)) return;
+  http.addHeader("Authorization", "Bearer " + aggregatorApiKey);
+  http.addHeader("User-Agent", userAgent());
+  const int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    http.end();
+    logLine((String("Trail HTTP ") + code).c_str());
+    return;
+  }
+
+  // Each point is [lat, lon, altitude, seconds ago] and only the first two
+  // are drawn. Parsed whole rather than through a filter: the response is
+  // one aircraft's 120 points, a few kilobytes, and a filter over an array
+  // of arrays would be more machinery than it saves.
+  JsonDocument doc;
+  const DeserializationError error = deserializeJson(doc, http.getStream());
+  http.end();
+  if (error) {
+    logLine((String("Trail JSON error: ") + error.c_str()).c_str());
+    return;
+  }
+
+  int count = 0;
+  for (JsonArrayConst point : doc["points"].as<JsonArrayConst>()) {
+    if (count >= MAX_TRAIL_POINTS) break;
+    if (point.size() < 2) continue;
+    trailLatitudes[count] = point[0].as<double>();
+    trailLongitudes[count] = point[1].as<double>();
+    ++count;
+  }
+  trailPointCount = count;
+  snprintf(trailHex, sizeof(trailHex), "%s", hex);
+  Serial.printf("Trail %s: %d points\n", hex, count);
+}
+
 void fetchBalloons() {
   if (!balloonTrackingEnabled || !aggregatorApiKey.length()) return;
   if (WiFi.status() != WL_CONNECTED) return;
@@ -7743,6 +7846,23 @@ void networkTask(void *) {
     //
     // The AIS socket is the one thing that IS persistent, so it is paused
     // for the duration exactly as the aircraft fetch pauses it.
+    // A tapped aircraft's trail, on demand. Same rule as every other fetch
+    // here: one TLS session at a time, and the persistent AIS socket paused
+    // for the duration.
+    if (trailFetchPending) {
+      char hex[8];
+      { MutexGuard guard(dataMutex); memcpy(hex, trailFetchHex, sizeof(hex)); }
+      const bool pauseAis = marineTrackingEnabled && marineProvider == "aisstream" &&
+                            aisWebSocket.isConnected();
+      if (pauseAis) { aisIntentionalDisconnect = true; aisWebSocket.disconnect(); }
+      { MutexGuard guard(dataMutex); fetchAircraftTrail(hex); }
+      if (pauseAis) connectAisWebSocket();
+      MutexGuard guard(dataMutex);
+      trailFetchPending = false;
+      // Repaint so the trail appears without waiting for the next poll.
+      if (displayPage == DisplayPage::Map || displayPage == DisplayPage::Overview)
+        renderCurrentPage();
+    }
     if (balloonTrackingEnabled && aggregatorApiKey.length() &&
         static_cast<int32_t>(millis() - nextBalloonFetchAt) >= 0) {
       const bool pauseAis = marineTrackingEnabled && marineProvider == "aisstream" &&
@@ -8022,6 +8142,13 @@ void setup() {
       MAX_VESSELS, sizeof(VesselDisplay), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
   latestBalloons = static_cast<BalloonDisplay *>(heap_caps_calloc(
       MAX_BALLOONS, sizeof(BalloonDisplay), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  // Under 2 KB for both, but PSRAM rather than internal: internal RAM is
+  // the scarce resource here and a trail has no reason to compete with the
+  // TLS handshakes for it.
+  trailLatitudes = static_cast<double *>(heap_caps_calloc(
+      MAX_TRAIL_POINTS, sizeof(double), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  trailLongitudes = static_cast<double *>(heap_caps_calloc(
+      MAX_TRAIL_POINTS, sizeof(double), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
   if (!framebuffer || !baseMap || !latestAircraft || !latestVessels || !latestBalloons) {
     Serial.println("PSRAM display/aircraft buffers unavailable");
     while(true) delay(1000);
@@ -8157,7 +8284,19 @@ void loop() {
       switch (displayPageSubject(displayPage)) {
         case PageSubject::Marine: renderVesselDetailCard(hitIndex); break;
         case PageSubject::Balloon: renderBalloonDetailCard(hitIndex); break;
-        default: renderAircraftDetailCard(hitIndex); break;
+        default:
+          renderAircraftDetailCard(hitIndex);
+          // And ask for its trail, so dismissing the card leaves the path
+          // it flew in on drawn behind it. Queued rather than fetched here:
+          // this runs on the UI core, and a TLS handshake on it would
+          // freeze the panel for the duration.
+          if (hitIndex < lastCount && latestAircraft[hitIndex].hex[0] &&
+              strcmp(trailHex, latestAircraft[hitIndex].hex)) {
+            snprintf(trailFetchHex, sizeof(trailFetchHex), "%s",
+                     latestAircraft[hitIndex].hex);
+            trailFetchPending = true;
+          }
+          break;
       }
     } else if (!displayPageIsTable(displayPage)) {
       pageStep = 1;
@@ -8172,6 +8311,10 @@ void loop() {
     pageStep = 1;
   }
   if (pageStep) {
+    // A trail belongs to the map it was drawn on; carrying it to another
+    // page would leave a path behind an aircraft that is no longer shown.
+    trailPointCount = 0;
+    trailHex[0] = 0;
     displayPage = nextVisiblePage(displayPage, pageStep);
     tableScrollOffset = 0;
     pageSavePending = true;
