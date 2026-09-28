@@ -146,18 +146,33 @@ function altitudeColour(ft){
 }
 
 // --- map ----------------------------------------------------------------
-const map = L.map('map', {zoomControl:false, attributionControl:true})
-  .setView([{{ device.lat }}, {{ device.lon }}], 9);
-L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
-  maxZoom:17, attribution:'&copy; OpenStreetMap',
-}).addTo(map);
-L.control.zoom({position:'topright'}).addTo(map);
-const aircraftLayer = L.layerGroup().addTo(map);
-const balloonLayer = L.layerGroup().addTo(map);
-let trailLine = null;
-L.circleMarker([{{ device.lat }}, {{ device.lon }}],
-  {radius:5, color:'#4fd2ff', fillColor:'#4fd2ff', fillOpacity:1, weight:1}
-).addTo(map).bindTooltip('{{ device.name|e }}');
+//
+// Leaflet comes from a CDN, and everything below is written so that its not
+// arriving costs the map tab and nothing else. The first version referenced
+// L at the top level, so one failed script tag threw before anything else
+// ran and ALL FIVE tabs came up blank - including the alerts and the panel
+// controls, which need no map at all. A phone on a flaky connection is
+// exactly when somebody wants to check what is overhead.
+const hasMap = typeof L !== 'undefined';
+let map = null, aircraftLayer = null, balloonLayer = null, trailLine = null;
+
+if (hasMap) {
+  map = L.map('map', {zoomControl:false, attributionControl:true})
+    .setView([{{ device.lat }}, {{ device.lon }}], 9);
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom:17, attribution:'&copy; OpenStreetMap',
+  }).addTo(map);
+  L.control.zoom({position:'topright'}).addTo(map);
+  aircraftLayer = L.layerGroup().addTo(map);
+  balloonLayer = L.layerGroup().addTo(map);
+  L.circleMarker([{{ device.lat }}, {{ device.lon }}],
+    {radius:5, color:'#4fd2ff', fillColor:'#4fd2ff', fillOpacity:1, weight:1}
+  ).addTo(map).bindTooltip('{{ device.name|e }}');
+} else {
+  $('map').innerHTML = '<div class="empty">The map could not load.<br>' +
+    '<span style="font-size:12.5px">Every other tab still works - they need ' +
+    'no map. Pull down to reload once you have a connection.</span></div>';
+}
 
 function planeIcon(track, colour){
   return L.divIcon({
@@ -170,6 +185,7 @@ function planeIcon(track, colour){
 }
 
 async function showTrail(hex){
+  if (!hasMap) return;
   state.trailHex = hex;
   try {
     const res = await fetch(`${TRACK_URL}?hex=${encodeURIComponent(hex)}`, {cache:'no-store'});
@@ -187,6 +203,7 @@ async function showTrail(hex){
 }
 
 function drawMap(data){
+  if (!hasMap) return;
   aircraftLayer.clearLayers();
   balloonLayer.clearLayers();
   const points = [];
@@ -380,7 +397,8 @@ document.querySelectorAll('nav button').forEach(button => {
     $('view-' + button.dataset.view).classList.add('active');
     // Leaflet renders nothing into a hidden container, so the map needs
     // telling its size once it is visible again.
-    if (button.dataset.view === 'map') setTimeout(() => map.invalidateSize(), 60);
+    if (button.dataset.view === 'map' && hasMap)
+      setTimeout(() => map.invalidateSize(), 60);
   };
 });
 
