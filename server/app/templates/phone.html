@@ -1,0 +1,391 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- viewport-fit=cover plus the safe-area insets below: on a phone with a
+     notch or a home bar, a bottom tab bar sits under the gesture strip
+     without them and the last tab cannot be tapped. -->
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#07121e">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>{{ device.name }} - ADS-B</title>
+<link rel="manifest" href="/app/manifest.webmanifest">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="anonymous">
+<style>
+:root{
+  --bg:#07121e; --surface:#0d1b2a; --line:#1d3448; --text:#e8f1f8;
+  --dim:#9fb3c4; --cyan:#4fd2ff; --green:#38d278; --amber:#ffbe3c;
+  --red:#ff4d4d; --violet:#b482ff;
+  --top:env(safe-area-inset-top); --bottom:env(safe-area-inset-bottom);
+}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;overscroll-behavior:none}
+body{
+  background:var(--bg);color:var(--text);
+  font:15px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+  display:flex;flex-direction:column;
+}
+header{
+  padding:calc(10px + var(--top)) 16px 10px;background:#07121e;
+  border-bottom:1px solid var(--line);display:flex;align-items:center;gap:10px;
+}
+header b{font:700 16px/1 ui-monospace,monospace;letter-spacing:.04em}
+header .sub{color:var(--dim);font-size:12px;margin-left:auto;text-align:right}
+main{flex:1;overflow:hidden;position:relative}
+.view{position:absolute;inset:0;overflow-y:auto;-webkit-overflow-scrolling:touch;display:none}
+.view.active{display:block}
+#map{position:absolute;inset:0}
+nav{
+  display:grid;grid-template-columns:repeat(5,1fr);
+  background:#07121e;border-top:1px solid var(--line);
+  padding-bottom:var(--bottom);
+}
+nav button{
+  background:none;border:0;color:var(--dim);font:600 11px/1.3 inherit;
+  padding:9px 2px;display:flex;flex-direction:column;align-items:center;gap:3px;
+  /* 48px is the smallest reliable thumb target; below that people miss. */
+  min-height:48px;cursor:pointer;
+}
+nav button.active{color:var(--cyan)}
+nav svg{width:20px;height:20px;stroke:currentColor;fill:none;stroke-width:1.8}
+.rows{padding:8px 12px calc(12px + var(--bottom))}
+.row{
+  background:var(--surface);border:1px solid var(--line);border-radius:10px;
+  padding:10px 12px;margin-bottom:8px;display:flex;gap:10px;align-items:center;
+}
+.row .grow{flex:1;min-width:0}
+.row .name{font-weight:650;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.row .meta{color:var(--dim);font-size:12.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.row .num{font-variant-numeric:tabular-nums;text-align:right;white-space:nowrap}
+.pill{
+  display:inline-block;padding:1px 7px;border-radius:999px;font-size:11px;
+  font-weight:700;letter-spacing:.03em;
+}
+.pill.red{background:#4a1414;color:var(--red)}
+.pill.violet{background:#2b1f4a;color:var(--violet)}
+.pill.green{background:#123020;color:var(--green)}
+.pill.amber{background:#3a2c0c;color:var(--amber)}
+.empty{color:var(--dim);text-align:center;padding:36px 20px}
+.control{padding:12px 12px calc(20px + var(--bottom))}
+.group{background:var(--surface);border:1px solid var(--line);border-radius:10px;
+  padding:12px;margin-bottom:10px}
+.group h3{margin:0 0 4px;font:700 12px/1.2 ui-monospace,monospace;
+  letter-spacing:.08em;color:var(--cyan);text-transform:uppercase}
+.group p{margin:0 0 10px;color:var(--dim);font-size:12.5px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(88px,1fr));gap:8px}
+.grid button,.wide{
+  background:#12263a;border:1px solid var(--line);color:var(--text);
+  border-radius:8px;padding:11px 8px;font:600 13px inherit;min-height:44px;cursor:pointer;
+}
+.grid button:active,.wide:active{background:#1b3a52}
+.grid button.on{background:#123a4d;border-color:var(--cyan);color:var(--cyan)}
+input[type=range]{width:100%;accent-color:var(--cyan)}
+#toast{
+  position:fixed;left:50%;transform:translateX(-50%);
+  bottom:calc(74px + var(--bottom));background:#12263a;border:1px solid var(--line);
+  color:var(--text);padding:9px 15px;border-radius:999px;font-size:13px;
+  opacity:0;transition:opacity .2s;pointer-events:none;z-index:900;max-width:88vw;
+}
+#toast.show{opacity:1}
+.leaflet-container{background:#0b1725}
+</style>
+</head>
+<body>
+<header>
+  <b>{{ device.name }}</b>
+  <span class="sub"><span id="count">--</span> aircraft &middot; <span id="age">--</span></span>
+</header>
+
+<main>
+  <section id="view-map" class="view active"><div id="map"></div></section>
+  <section id="view-list" class="view"><div class="rows" id="list"></div></section>
+  <section id="view-alerts" class="view"><div class="rows" id="alerts"></div></section>
+  <section id="view-balloons" class="view"><div class="rows" id="balloons"></div></section>
+  <section id="view-control" class="view"><div class="control" id="control"></div></section>
+</main>
+
+<nav>
+  <button data-view="map" class="active"><svg viewBox="0 0 24 24"><path d="M3 6l6-3 6 3 6-3v15l-6 3-6-3-6 3z"/><path d="M9 3v15M15 6v15"/></svg>Map</button>
+  <button data-view="list"><svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></svg>Nearest</button>
+  <button data-view="alerts"><svg viewBox="0 0 24 24"><path d="M12 3a6 6 0 0 0-6 6v4l-2 3h16l-2-3V9a6 6 0 0 0-6-6z"/><path d="M10 19a2 2 0 0 0 4 0"/></svg>Alerts</button>
+  <button data-view="balloons"><svg viewBox="0 0 24 24"><ellipse cx="12" cy="9" rx="6" ry="7"/><path d="M11 16h2v3h-2z"/></svg>Balloons</button>
+  <button data-view="control"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8"/></svg>Panel</button>
+</nav>
+
+<div id="toast"></div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin="anonymous"></script>
+<script>
+const DEVICE = {{ device.id }};
+const VIEW_URL = `/account/devices/${DEVICE}/view`;
+const TRACK_URL = `/account/devices/${DEVICE}/view/track`;
+const COMMAND_URL = `/devices/${DEVICE}/command`;
+const $ = id => document.getElementById(id);
+let state = {data:null, trailHex:null, fitted:false};
+
+function toast(message){
+  const el = $('toast');
+  el.textContent = message;
+  el.classList.add('show');
+  clearTimeout(el._timer);
+  el._timer = setTimeout(() => el.classList.remove('show'), 2600);
+}
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c =>
+  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+// Altitude colouring, the same bands the panel and the web map use - the
+// point is that one aircraft looks the same colour wherever you see it.
+function altitudeColour(ft){
+  if (ft === 'ground' || ft == null) return '#9fb3c4';
+  if (ft < 3000) return '#ff4d4d';
+  if (ft < 10000) return '#ffbe3c';
+  if (ft < 20000) return '#38d278';
+  if (ft < 30000) return '#4fd2ff';
+  return '#b482ff';
+}
+
+// --- map ----------------------------------------------------------------
+const map = L.map('map', {zoomControl:false, attributionControl:true})
+  .setView([{{ device.lat }}, {{ device.lon }}], 9);
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  maxZoom:17, attribution:'&copy; OpenStreetMap',
+}).addTo(map);
+L.control.zoom({position:'topright'}).addTo(map);
+const aircraftLayer = L.layerGroup().addTo(map);
+const balloonLayer = L.layerGroup().addTo(map);
+let trailLine = null;
+L.circleMarker([{{ device.lat }}, {{ device.lon }}],
+  {radius:5, color:'#4fd2ff', fillColor:'#4fd2ff', fillOpacity:1, weight:1}
+).addTo(map).bindTooltip('{{ device.name|e }}');
+
+function planeIcon(track, colour){
+  return L.divIcon({
+    className:'', iconSize:[22,22], iconAnchor:[11,11],
+    html:`<svg viewBox="0 0 24 24" width="22" height="22"
+      style="transform:rotate(${Number(track)||0}deg)">
+      <path d="M12 2l2 7 7 3v2l-7-1.5V19l2.5 1.5V22L12 20.8 7.5 22v-1.5L10 19v-6.5L3 14v-2l7-3z"
+        fill="${colour}" stroke="#04101b" stroke-width=".8"/></svg>`,
+  });
+}
+
+async function showTrail(hex){
+  state.trailHex = hex;
+  try {
+    const res = await fetch(`${TRACK_URL}?hex=${encodeURIComponent(hex)}`, {cache:'no-store'});
+    const body = await res.json();
+    if (state.trailHex !== hex) return;   // another tap won the race
+    const points = (body.points || []).filter(p => typeof p[0] === 'number');
+    if (trailLine) map.removeLayer(trailLine);
+    trailLine = null;
+    if (points.length < 2) return;
+    trailLine = L.polyline(points.map(p => [p[0], p[1]]),
+      {color:altitudeColour(points[points.length-1][2]), weight:3, opacity:.85}
+    ).addTo(map);
+    trailLine.bringToBack();
+  } catch (e) { console.error(e); }
+}
+
+function drawMap(data){
+  aircraftLayer.clearLayers();
+  balloonLayer.clearLayers();
+  const points = [];
+  (data.aircraft || []).forEach(a => {
+    if (typeof a.lat !== 'number' || typeof a.lon !== 'number') return;
+    points.push([a.lat, a.lon]);
+    const altitude = typeof a.alt_baro === 'number' ? a.alt_baro : a.alt_geom;
+    const marker = L.marker([a.lat, a.lon], {
+      icon: planeIcon(a.track ?? a.true_heading, altitudeColour(a.alt_baro)),
+    });
+    marker.bindTooltip(`${esc(a.flight || a.hex)}${
+      typeof altitude === 'number' ? ' &middot; ' + altitude.toLocaleString() + ' ft' : ''}`);
+    marker.on('click', () => showTrail(a.hex));
+    marker.addTo(aircraftLayer);
+  });
+  (data.balloons || []).forEach(b => {
+    L.circleMarker([b.lat, b.lon], {
+      radius:5, color:'#78e6aa', fillColor:'#78e6aa', fillOpacity:.9, weight:1,
+    }).bindTooltip(`${esc(b.name || b.id)}${b.alt ? ' &middot; ' + b.alt.toLocaleString() + ' ft' : ''}`)
+      .addTo(balloonLayer);
+  });
+  if (points.length && !state.fitted){
+    map.fitBounds(points, {maxZoom:10, padding:[30,30]});
+    state.fitted = true;
+  }
+  if (state.trailHex) showTrail(state.trailHex);
+}
+
+// --- lists --------------------------------------------------------------
+function drawList(data){
+  const aircraft = data.aircraft || [];
+  $('list').innerHTML = aircraft.length ? aircraft.slice(0, 60).map(a => {
+    const altitude = a.alt_baro === 'ground' ? 'GND'
+      : typeof a.alt_baro === 'number' ? a.alt_baro.toLocaleString() + ' ft' : '--';
+    const route = a.route ? `${esc(a.route.from || '?')} &rarr; ${esc(a.route.to || '?')}`
+                          : esc(a.type_name || a.t || '');
+    return `<div class="row">
+      <div class="grow">
+        <div class="name">${esc(a.flight || a.hex)}${
+          a.mlat && a.mlat.length ? ' <span class="pill red">MLAT</span>' : ''}</div>
+        <div class="meta">${esc(a.ownOp || '')}${a.ownOp && route ? ' &middot; ' : ''}${route}</div>
+      </div>
+      <div class="num">
+        <div style="color:${altitudeColour(a.alt_baro)}">${altitude}</div>
+        <div class="meta">${a.distance_nm != null ? a.distance_nm.toFixed(0) + ' nm' : ''}</div>
+      </div>
+    </div>`;
+  }).join('') : '<div class="empty">No aircraft in range.</div>';
+}
+
+function drawAlerts(data){
+  const alerts = data.alerts || [];
+  const pill = kind => kind === 'emergency' ? 'red' : kind === 'military' ? 'violet' : 'green';
+  const word = kind => kind === 'emergency' ? 'EMERGENCY'
+    : kind === 'military' ? 'MILITARY' : 'FIRST SEEN';
+  $('alerts').innerHTML = alerts.length ? alerts.map(a => `<div class="row">
+      <div class="grow">
+        <div class="name"><span class="pill ${pill(a.kind)}">${word(a.kind)}</span>
+          ${esc(a.label)}</div>
+        <div class="meta">${esc(a.flight || a.hex)}${a.detail ? ' &middot; ' + esc(a.detail) : ''}</div>
+      </div>
+      <div class="num meta">${Math.round(a.age / 60)} min</div>
+    </div>`).join('')
+    : `<div class="empty">Nothing unusual right now.<br>
+       <span style="font-size:12.5px">Emergency squawks, military aircraft and
+       airframes never seen here before show up on this tab.<br>
+       ${data.known_airframes ? data.known_airframes.toLocaleString() + ' airframes logged so far.' : ''}
+       </span></div>`;
+}
+
+function drawBalloons(data){
+  const balloons = data.balloons || [];
+  $('balloons').innerHTML = balloons.length ? balloons.map(b => {
+    const lands = b.land && b.land.in != null
+      ? `lands in ${Math.max(0, Math.round(b.land.in / 60))} min` : '';
+    return `<div class="row">
+      <div class="grow">
+        <div class="name">${esc(b.name || b.id)}
+          <span class="pill ${b.kind === 'sonde' ? 'green' : b.kind === 'amateur' ? 'amber' : 'violet'}">${
+            esc(String(b.kind).toUpperCase())}</span></div>
+        <div class="meta">${esc(b.info || '')}${b.info && lands ? ' &middot; ' : ''}${lands}</div>
+      </div>
+      <div class="num">
+        <div>${b.alt != null ? b.alt.toLocaleString() + ' ft' : '--'}</div>
+        <div class="meta">${b.climb != null ? (b.climb > 0 ? '&uarr; ' : '&darr; ') + Math.abs(b.climb) : ''}</div>
+      </div>
+    </div>`;
+  }).join('')
+    : `<div class="empty">No balloons in range.<br>
+       <span style="font-size:12.5px">Weather balloons, amateur high-altitude
+       flights and airships. Switched on at the server.</span></div>`;
+}
+
+// --- the panel ----------------------------------------------------------
+const PAGES = [
+  ['overview','Overview'], ['table','Table'], ['map','Map'], ['radar','Radar'],
+  ['marine','Marine'], ['marine-table','Marine list'],
+  ['balloon','Balloons'], ['balloon-table','Balloon list'],
+];
+
+async function send(action, value){
+  try {
+    const body = new URLSearchParams({action, value:String(value ?? '')});
+    const res = await fetch(COMMAND_URL, {method:'POST', body});
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Refused');
+    // Honest about the delay: the panel asks for commands rather than being
+    // told, so there is up to twenty seconds before anything happens.
+    toast('Sent - the panel picks it up within 20s');
+  } catch (e) { toast(e.message); }
+}
+
+function drawControl(data){
+  const device = data.device || {};
+  $('control').innerHTML = `
+    <div class="group">
+      <h3>Page</h3>
+      <p>Change what the panel is showing. Marine and balloon pages only work
+         while those are switched on at the device.</p>
+      <div class="grid">${PAGES.map(([id, label]) =>
+        `<button data-cmd="page" data-value="${id}">${label}</button>`).join('')}</div>
+    </div>
+    <div class="group">
+      <h3>Brightness</h3>
+      <p>10 to 100. It cannot be taken to zero from here.</p>
+      <input type="range" min="10" max="100" step="10" value="100" id="bright">
+    </div>
+    <div class="group">
+      <h3>Range</h3>
+      <p>Changing this rebuilds the panel's map, which takes about a minute.</p>
+      <div class="grid">${[10,25,50,100].map(r =>
+        `<button data-cmd="radius" data-value="${r}">${r} NM</button>`).join('')}</div>
+    </div>
+    <div class="group">
+      <h3>Screensaver</h3>
+      <div class="grid">
+        <button data-cmd="screensaver" data-value="1">On</button>
+        <button data-cmd="screensaver" data-value="0">Off</button>
+      </div>
+    </div>
+    <div class="group">
+      <h3>This receiver</h3>
+      <p>${esc(device.name || '')}<br>
+        Position ${esc(device.location_source || 'unknown')}<br>
+        ${device.firmware ? 'Firmware ' + esc(device.firmware) + '<br>' : ''}
+        ${data.known_airframes ? data.known_airframes.toLocaleString() + ' airframes logged' : ''}</p>
+      <button class="wide" data-cmd="refresh" data-value="" style="width:100%">Refresh now</button>
+    </div>`;
+  $('control').querySelectorAll('[data-cmd]').forEach(button =>
+    button.onclick = () => send(button.dataset.cmd, button.dataset.value));
+  const bright = $('bright');
+  if (bright) bright.onchange = () => send('brightness', bright.value);
+}
+
+// --- polling ------------------------------------------------------------
+let lastAt = 0;
+async function refresh(){
+  try {
+    const res = await fetch(VIEW_URL, {cache:'no-store'});
+    if (res.status === 401 || res.status === 403){ location.href = '/login'; return; }
+    const data = await res.json();
+    state.data = data;
+    lastAt = Date.now();
+    $('count').textContent = data.total ?? 0;
+    drawMap(data); drawList(data); drawAlerts(data); drawBalloons(data);
+    if (!$('control').innerHTML) drawControl(data);
+  } catch (e) { console.error(e); }
+}
+setInterval(() => {
+  $('age').textContent = lastAt ? Math.round((Date.now() - lastAt) / 1000) + 's ago' : '--';
+}, 1000);
+
+// Polling stops while the app is in the background. A phone in a pocket
+// re-fetching every ten seconds is somebody's battery and somebody's data
+// allowance, for a screen nobody is looking at.
+let timer = null;
+function startPolling(){
+  if (timer) return;
+  refresh();
+  timer = setInterval(refresh, 10000);
+}
+function stopPolling(){ clearInterval(timer); timer = null; }
+document.addEventListener('visibilitychange', () =>
+  document.hidden ? stopPolling() : startPolling());
+
+document.querySelectorAll('nav button').forEach(button => {
+  button.onclick = () => {
+    document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+    button.classList.add('active');
+    $('view-' + button.dataset.view).classList.add('active');
+    // Leaflet renders nothing into a hidden container, so the map needs
+    // telling its size once it is visible again.
+    if (button.dataset.view === 'map') setTimeout(() => map.invalidateSize(), 60);
+  };
+});
+
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('/app/sw.js');
+startPolling();
+</script>
+</body>
+</html>

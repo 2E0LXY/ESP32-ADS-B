@@ -291,6 +291,22 @@ are queued and never block a device request: an unresolved callsign simply
 comes back without a route and picks one up on a later poll. See
 `app/routes.py`.
 
+The phone and tablet app lives at `/app`, session-authenticated, installable
+to a home screen. It is a page rather than a native app and it is served from
+here rather than from the receiver, for one concrete reason: a page served
+over HTTPS cannot talk to a device at `http://192.168.1.228`, because
+browsers block that as mixed content. Coming from this side it works
+identically at home and away, and it drives the panel through the command
+relay below rather than by addressing it directly - a test pins that, because
+the day a LAN address appears in that page is the day the app quietly stops
+working away from home.
+
+One request per refresh returns everything it shows - aircraft, alerts,
+balloons, the logbook - because a phone on mobile data should not make one
+request per panel of the screen. It never carries a device API key: a browser
+must not be given one, since anything in a page can be read by anything else
+that ends up in that page. Polling stops while the app is in the background.
+
 Remote control works without opening a port on anybody's router. A receiver
 sits on a home network the internet cannot reach, so rather than being told
 what to do it **asks**: `/v1/commands` rides back on the polling it already

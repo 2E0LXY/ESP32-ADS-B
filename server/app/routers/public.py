@@ -81,6 +81,170 @@ async def get_alerts(
     return {"enabled": True, "alerts": alerts, "count": len(alerts)}
 
 
+# --- The phone app -------------------------------------------------------
+#
+# Session-authenticated, never device-key: a browser must not be given a
+# receiver's API key, because anything in a page can be read by anything
+# else that ends up in that page.
+#
+# One endpoint rather than five. A phone refreshing on mobile data should
+# make one request, not one per panel of the screen, and everything below
+# comes from memory on this side anyway.
+
+
+# These three come BEFORE /app/{device_id}: FastAPI matches in declaration
+# order, so with the parameterised route first, /app/manifest.webmanifest
+# was matched as a device id and answered 422. The app then had no manifest
+# and silently stopped being installable - a failure with no error anywhere
+# to notice it by.
+@router.get("/app/manifest.webmanifest")
+def phone_manifest():
+    """What makes it installable to a home screen. Served from /app so its
+    scope covers the app and nothing else on this domain."""
+    return JSONResponse({
+        "name": "2E0LXY ADS-B", "short_name": "ADS-B",
+        "start_url": "/app", "scope": "/app",
+        "display": "standalone", "orientation": "any",
+        "background_color": "#07121e", "theme_color": "#07121e",
+        "icons": [{"src": "/app/icon.svg", "sizes": "any", "type": "image/svg+xml",
+                   "purpose": "any maskable"}],
+    }, media_type="application/manifest+json")
+
+
+@router.get("/app/icon.svg")
+def phone_icon():
+    """An SVG rather than a set of PNGs: one file, every size, and nothing
+    to regenerate when it changes."""
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 192 192">'
+        '<rect width="192" height="192" rx="42" fill="#07121e"/>'
+        '<path d="M96 30l14 50 50 21v14l-50-11v46l18 11v11l-32-9-32 9v-11l18-11v-46'
+        'l-50 11v-14l50-21z" fill="#4fd2ff"/></svg>'
+    )
+    return Response(content=svg, media_type="image/svg+xml",
+                    headers={"Cache-Control": "public, max-age=86400"})
+
+
+@router.get("/app/sw.js")
+def phone_service_worker():
+    """Deliberately minimal.
+
+    It exists so the app can be installed to a home screen, not to cache
+    anything: this is a live view of the sky, and a service worker that
+    served yesterday's aircraft from a cache would be worse than no app.
+    The shell is fetched normally and every data request goes to the
+    network.
+    """
+    js = (
+        "self.addEventListener('install', () => self.skipWaiting());\n"
+        "self.addEventListener('activate', event =>"
+        " event.waitUntil(self.clients.claim()));\n"
+        "// No fetch handler on purpose - see the note on the Python side.\n"
+    )
+    return Response(content=js, media_type="application/javascript",
+                    headers={"Cache-Control": "no-cache"})
+
+
+@router.get("/app", response_class=HTMLResponse)
+@router.get("/app/{device_id}", response_class=HTMLResponse)
+def phone_app(
+    request: Request,
+    device_id: int | None = None,
+    account: models.Account = Depends(get_current_account),
+    db: Session = Depends(get_db),
+):
+    """The phone and tablet app.
+
+    A page rather than a native app, served from here rather than from the
+    receiver, for one concrete reason: a page served over HTTPS cannot talk
+    to a device at http://192.168.1.228 - browsers block that as mixed
+    content. Coming from this side instead, it works identically at home
+    and away, and the panel is driven through the command relay rather than
+    by being reached directly.
+    """
+    devices = (db.query(models.Device)
+               .filter(models.Device.account_id == account.id)
+               .order_by(models.Device.id).all())
+    if not devices:
+        return RedirectResponse("/account", status_code=status.HTTP_303_SEE_OTHER)
+    device = next((d for d in devices if d.id == device_id), devices[0])
+    where = device.independent_location()
+    lat, lon = where if where else (request.app.state.aggregator.home_lat,
+                                    request.app.state.aggregator.home_lon)
+    return templates.TemplateResponse(
+        request, "phone.html",
+        {"device": {"id": device.id, "name": device.name, "lat": lat, "lon": lon},
+         "devices": devices},
+    )
+
+
+@router.get("/account/devices/{device_id}/view")
+async def phone_view(
+    device_id: int,
+    request: Request,
+    account: models.Account = Depends(get_current_account),
+    db: Session = Depends(get_db),
+    radius: float = 0.0,
+):
+    """Everything the app shows, for one of this account's receivers."""
+    device = await asyncio.to_thread(_owned_device, db, account, device_id)
+    if not device:
+        return JSONResponse({"error": "Unknown device"},
+                            status_code=status.HTTP_404_NOT_FOUND)
+
+    state = request.app.state
+    where = device.independent_location()
+    lat, lon = where if where else (state.aggregator.home_lat, state.aggregator.home_lon)
+    # The app may ask for a different range than the panel is set to, so it
+    # can zoom out without changing what the panel shows.
+    span = radius if radius and 1 <= radius <= 250 else float(
+        state.settings.get("max_poll_radius_nm") or 250)
+
+    aircraft = await state.aggregator.cache.query(lat, lon, span)
+    aircraft = [_reference(request).enrich(entry) for entry in aircraft]
+    aircraft.sort(key=lambda entry: _distance_nm(lat, lon, entry["lat"], entry["lon"]))
+    total = len(aircraft)
+    if len(aircraft) > MAX_AIRCRAFT_PER_RESPONSE:
+        aircraft = aircraft[:MAX_AIRCRAFT_PER_RESPONSE]
+
+    alerts = state.alerts.recent(10) if state.alerts.enabled() else []
+    balloons = (state.balloons.query(lat, lon, span)
+                if state.balloons.enabled() else [])
+    logbook = state.logbook.recent_firsts(10) if state.logbook.enabled() else []
+
+    return {
+        "device": {
+            "id": device.id, "name": device.name,
+            "lat": lat, "lon": lon,
+            "location_source": device.location_source(),
+            "last_seen": device.last_seen_at.isoformat() if device.last_seen_at else None,
+            "firmware": device.firmware_version,
+        },
+        "radius": span,
+        "aircraft": aircraft, "total": total, "returned": len(aircraft),
+        "alerts": alerts,
+        "balloons": balloons,
+        "logbook": logbook,
+        "known_airframes": state.logbook.stats()["known"],
+    }
+
+
+@router.get("/account/devices/{device_id}/view/track")
+async def phone_track(
+    device_id: int,
+    hex: str,
+    request: Request,
+    account: models.Account = Depends(get_current_account),
+    db: Session = Depends(get_db),
+):
+    """One aircraft's trail, for the app's map. Gated on owning a device for
+    the same reason the feed map's is."""
+    device = await asyncio.to_thread(_owned_device, db, account, device_id)
+    if not device:
+        return JSONResponse({"points": []}, status_code=status.HTTP_404_NOT_FOUND)
+    return _track_response(request, hex)
+
+
 @router.get("/v1/commands")
 async def get_commands(
     request: Request,
