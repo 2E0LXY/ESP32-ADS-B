@@ -178,6 +178,38 @@ DEFINITIONS: list[Setting] = [
              "again once saved.",
     ),
 
+    # --- Alerts ----------------------------------------------------------
+    Setting(
+        "alerts_enabled", "bool", os.environ.get("ALERTS", "1") != "0",
+        label="Raise alerts", group="Alerts",
+        help="Picks the aircraft worth looking up for out of the ones already "
+             "polled, so a display does not present an airliner and an aircraft "
+             "squawking 7700 identically. Costs no extra request to anyone: every "
+             "check reads data the cache already holds.",
+    ),
+    Setting(
+        "alert_emergency", "bool", True,
+        label="Emergency squawks", group="Alerts",
+        help="7500 hijack, 7600 radio failure, 7700 general emergency - the three "
+             "codes that mean something has gone wrong aboard - plus the explicit "
+             "emergency field some feeds carry.",
+    ),
+    Setting(
+        "alert_military", "bool", True,
+        label="Military aircraft", group="Alerts",
+        help="Matched against the reference list of military callsign prefixes "
+             "already used to name operators on the display.",
+    ),
+    Setting(
+        "alert_retention_minutes", "int", 60,
+        label="Keep alerts for", unit=" min", minimum=5, maximum=1440,
+        group="Alerts",
+        help="How long a raised alert stays readable. Held in memory only and "
+             "lost on restart - an alert is interesting while it is happening and "
+             "for a while after, and persisting them would add the one table that "
+             "grows with events.",
+    ),
+
     # --- Balloons --------------------------------------------------------
     Setting(
         "balloon_tracking", "bool", os.environ.get("BALLOON_TRACKING", "0") == "1",

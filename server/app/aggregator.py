@@ -113,6 +113,11 @@ class Aggregator:
         # selected one. Optional: None simply means no trails, which is what
         # the tests that do not care about them get - see app/tracks.py.
         self.tracks = tracks
+        # Assigned after construction rather than passed in: the watcher
+        # needs the reference data, which is loaded later in startup than
+        # this. None means no alerts, which is what the tests that do not
+        # care about them get.
+        self.alerts = None
         # Only the leader polls upstream. Without this, running N workers
         # would ask each community API for the same sky N times every
         # cycle. None means "always the leader", which is what a
@@ -220,9 +225,16 @@ class Aggregator:
                         # the prune, so each aircraft contributes one point
                         # per cycle from the best position available rather
                         # than one per source reporting it.
-                        if self.tracks is not None:
-                            self.tracks.observe(await self.cache.snapshot())
-                            self.tracks.prune()
+                        if self.tracks is not None or self.alerts is not None:
+                            # One snapshot for both: it is the same merged
+                            # picture, and taking it twice would double the
+                            # cost of the largest read in the cycle.
+                            snapshot = await self.cache.snapshot()
+                            if self.tracks is not None:
+                                self.tracks.observe(snapshot)
+                                self.tracks.prune()
+                            if self.alerts is not None:
+                                self.alerts.observe(snapshot)
                         await self.cache.prune()
                     # Every worker keeps its own copy of the count the admin
                     # dashboard reads, leader or not; it is one cheap read

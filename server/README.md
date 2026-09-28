@@ -130,6 +130,7 @@ raw data being pushed straight into this backend.
 - `app/feed_guard.py` - rejects aircraft a feeder could not really have heard
 - `app/opensky.py` - OpenSky as a fourth source: one OAuth token, SI units converted
 - `app/schedules.py` - AirLabs schedule lookups, cached and resolved in the background
+- `app/alerts.py` - the aircraft worth looking up for, out of the ones already polled
 - `app/balloons.py` - radiosondes, amateur high-altitude flights and airships
 - `app/tracks.py` - recent position history, for the trail behind a selected aircraft
 - `app/units.py` - the SI conversions the two metric upstreams need
@@ -287,6 +288,21 @@ One resolution is shared by every customer who can see that flight. Lookups
 are queued and never block a device request: an unresolved callsign simply
 comes back without a route and picks one up on a later poll. See
 `app/routes.py`.
+
+Alerts (`/v1/alerts`) pick the notable aircraft out of the ones already being
+polled, so a display need not present an airliner and an aircraft squawking
+7700 identically. Two kinds to begin with, both free because the data is
+already in the cache: emergency squawks (7500 hijack, 7600 radio failure,
+7700 general emergency, plus the explicit emergency field some feeds carry)
+and military aircraft, matched against the same callsign-prefix table the
+display uses to name their operators.
+
+The restraint is the point: an aircraft squawking 7700 for twenty minutes is
+one event, not eighty, so the same aircraft and kind is quiet for half an
+hour after firing. Held in memory and lost on restart - an alert matters
+while it is happening and for a while after, and persisting them would add
+the one table that grows with events, which is the mistake `usage_log` had to
+be taught out of.
 
 Balloons are a separate sky on their own endpoint (`/v1/balloons`) and their
 own page, off until switched on at `/admin/settings`. Three kinds: weather

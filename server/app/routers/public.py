@@ -58,6 +58,28 @@ def root():
     return RedirectResponse("https://2e0lxy.uk/adsb/7-inch-ESP32-S3-ADSB-MLAT-Receiver-site/index.html")
 
 
+@router.get("/v1/alerts")
+async def get_alerts(
+    request: Request,
+    device: models.Device = Depends(require_device_api_key),
+    limit: int = 20,
+):
+    """The aircraft worth looking up for, newest first.
+
+    Its own endpoint rather than a field on each aircraft: an alert is about
+    the handful that matter, and marking every aircraft "not notable" would
+    cost every receiver parsing time on every poll to say nothing.
+    """
+    watcher = getattr(request.app.state, "alerts", None)
+    if watcher is None or not watcher.enabled():
+        # Off is not "nothing happening" - a receiver showing an alert strip
+        # should be able to tell the difference rather than implying a quiet
+        # sky.
+        return {"enabled": False, "alerts": [], "count": 0}
+    alerts = watcher.recent(max(1, min(limit, 100)))
+    return {"enabled": True, "alerts": alerts, "count": len(alerts)}
+
+
 @router.get("/v1/balloons")
 async def get_balloons(
     lat: float,

@@ -89,6 +89,15 @@
       {{ schedule_stats.lookups }} looked up, {{ schedule_stats.hits }} served,
       {{ schedule_stats.misses }} with no schedule, {{ schedule_stats.errors }} errors,
       {{ schedule_stats.dropped }} dropped</span></td></tr>
+<tr><td>Alerts<br><span class="sub">from aircraft already polled</span></td>
+  <td>{% if alert_stats.enabled %}<span class="badge ok">On</span>{% else %}Off{% endif %}
+    <span class="sub">{{ alert_stats.held }} held
+      ({% for kind, count in alert_stats.kinds.items() %}{{ count }} {{ kind }}{% if not loop.last %}, {% endif %}{% else %}nothing right now{% endfor %}),
+      {{ alert_stats.raised }} raised since restart, kept
+      {{ alert_stats.retention_minutes | int }} min
+      {% for alert in recent_alerts %}<br><b>{{ alert.label }}</b>
+        {{ alert.flight or alert.hex }}{% if alert.detail %} - {{ alert.detail }}{% endif %}
+        <span class="sub">{{ (alert.age / 60) | round | int }} min ago</span>{% endfor %}</span></td></tr>
 <tr><td>Balloons<br><span class="sub">SondeHub, no account needed</span></td>
   <td>{% if balloon_stats.enabled %}<span class="badge ok">On</span>{% else %}Off{% endif %}
     <span class="sub">{{ balloon_stats.tracked }} flying

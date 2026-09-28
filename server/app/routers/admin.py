@@ -405,6 +405,8 @@ async def admin_system(
             "opensky": opensky_state,
             "schedule_stats": state.schedules.stats(),
             "balloon_stats": state.balloons.stats(),
+            "alert_stats": state.alerts.stats(),
+            "recent_alerts": state.alerts.recent(10),
         },
     )
 

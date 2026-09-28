@@ -17,6 +17,7 @@ from .leader import Leadership
 from .log_buffer import install as install_log_buffer
 from .retention import UsageLogPruner
 from .runtime_settings import SettingsStore
+from .alerts import AlertWatcher
 from .balloons import BalloonTracker
 from .tracks import TrackStore
 from .schedules import ScheduleResolver
@@ -140,6 +141,16 @@ async def startup():
     # request pays for reading a CSV. See app/reference.py.
     app.state.reference = ReferenceData()
     app.state.reference.load()
+
+    # The aircraft worth looking up for, picked out of the ones already
+    # polled. After the reference data, because it identifies military
+    # aircraft from the same callsign-prefix table the display uses to name
+    # their operators. See app/alerts.py.
+    app.state.alerts = AlertWatcher(settings=app.state.settings,
+                                    reference=app.state.reference)
+    # The poll loop is what feeds it, and the aggregator was built above -
+    # before the reference data this needs existed.
+    app.state.aggregator.alerts = app.state.alerts
 
     # Airline logos, fetched once each and then served off this deployment's
     # own disk. See app/logos.py for why lookup is by domain, not by name.
