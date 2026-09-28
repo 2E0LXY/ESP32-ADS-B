@@ -45,10 +45,9 @@ GEO_ALTITUDE, SQUAWK = 13, 14
 CATEGORY = 17
 STATE_VECTOR_LENGTH = 17  # the shortest response worth trusting
 
-METRES_TO_FEET = 3.280839895
-MPS_TO_KNOTS = 1.943844
-# Feet per minute, which is what baro_rate means everywhere else here.
-MPS_TO_FEET_PER_MINUTE = 196.8503937
+# Shared with the balloon telemetry, which is SI for the same reason - see
+# app/units.py.
+from .units import METRES_TO_FEET, MPS_TO_FEET_PER_MINUTE, MPS_TO_KNOTS  # noqa: E402
 
 
 class OpenSkyClient:

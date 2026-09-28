@@ -404,6 +404,11 @@ async def admin_system(
             "pruner": state.usage_pruner,
             "opensky": opensky_state,
             "schedule_stats": state.schedules.stats(),
+            "balloon_stats": state.balloons.stats(),
+            "alert_stats": state.alerts.stats(),
+            "logbook_stats": state.logbook.stats(),
+            "recent_firsts": state.logbook.recent_firsts(8),
+            "recent_alerts": state.alerts.recent(10),
         },
     )
 

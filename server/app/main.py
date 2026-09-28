@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import sys
@@ -17,6 +18,10 @@ from .leader import Leadership
 from .log_buffer import install as install_log_buffer
 from .retention import UsageLogPruner
 from .runtime_settings import SettingsStore
+from .alerts import AlertWatcher
+from .balloons import BalloonTracker
+from .logbook import Logbook
+from .tracks import TrackStore
 from .schedules import ScheduleResolver
 from .routers import admin, public
 
@@ -101,11 +106,24 @@ async def startup():
     home_lat = float(os.environ.get("HOME_LAT", "53.73"))
     home_lon = float(os.environ.get("HOME_LON", "-1.57"))
     home_radius_nm = float(os.environ.get("HOME_RADIUS_NM", "50"))
+    # Recent positions per aircraft, so a selected one can be drawn with the
+    # arc it flew to get here. Filled by the poll loop from the merged cache
+    # - see app/tracks.py.
+    app.state.tracks = TrackStore()
     app.state.aggregator = Aggregator(home_lat, home_lon, home_radius_nm, SessionLocal,
                                       cache=app.state.cache,
                                       leadership=app.state.leadership,
-                                      settings=app.state.settings)
+                                      settings=app.state.settings,
+                                      tracks=app.state.tracks)
     app.state.aggregator.start()
+
+    # Balloons: a separate sky, on a separate page, polled far more slowly.
+    # It borrows the aggregator's idea of which areas matter so balloons
+    # follow the same device locations the aircraft polling does rather than
+    # keeping a second copy of that logic. See app/balloons.py.
+    app.state.balloons = BalloonTracker(settings=app.state.settings,
+                                        cache=app.state.cache)
+    app.state.balloons.start(regions_provider=app.state.aggregator.poll_regions)
 
     # Resolves callsign -> route on behalf of every device, so the ESP32
     # never opens its own TLS connection to adsbdb. See app/routes.py.
@@ -125,6 +143,25 @@ async def startup():
     # request pays for reading a CSV. See app/reference.py.
     app.state.reference = ReferenceData()
     app.state.reference.load()
+
+    # The aircraft worth looking up for, picked out of the ones already
+    # polled. After the reference data, because it identifies military
+    # aircraft from the same callsign-prefix table the display uses to name
+    # their operators. See app/alerts.py.
+    app.state.alerts = AlertWatcher(settings=app.state.settings,
+                                    reference=app.state.reference)
+    # The poll loop is what feeds it, and the aggregator was built above -
+    # before the reference data this needs existed.
+    app.state.aggregator.alerts = app.state.alerts
+
+    # What has been seen before. Loaded once here - every hex ever recorded,
+    # so deciding whether an aircraft is new is a set lookup rather than a
+    # query per aircraft per poll. In a thread because it is blocking
+    # SQLAlchemy on the loop the feeder listeners share.
+    app.state.logbook = Logbook(session_factory=SessionLocal,
+                                settings=app.state.settings)
+    await asyncio.to_thread(app.state.logbook.load)
+    app.state.aggregator.logbook = app.state.logbook
 
     # Airline logos, fetched once each and then served off this deployment's
     # own disk. See app/logos.py for why lookup is by domain, not by name.
@@ -181,6 +218,10 @@ async def startup():
 async def shutdown():
     await app.state.leadership.stop()
     await app.state.schedules.stop()
+    await app.state.balloons.stop()
+    # Anything seen since the last sweep would otherwise be lost, which for
+    # a first sighting means it is announced again after the restart.
+    await app.state.logbook.flush()
     await app.state.usage_pruner.stop()
     await app.state.photos.stop()
     await app.state.logos.stop()

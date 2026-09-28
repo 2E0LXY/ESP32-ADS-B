@@ -139,6 +139,15 @@ class AircraftCache:
                 if entry.sources.get(source, 0) >= cutoff
             ]
 
+    async def snapshot(self) -> list[dict]:
+        """Every aircraft held, regardless of where it is.
+
+        For the track store, which samples the merged picture once a cycle
+        rather than once per source.
+        """
+        async with self._lock:
+            return [entry.data for entry in self._by_hex.values()]
+
     def size(self) -> int:
         return len(self._by_hex)
 
@@ -293,6 +302,10 @@ class RedisAircraftCache:
     async def query_by_source(self, source: str) -> list[dict]:
         cutoff = time.time() - SOURCE_ATTRIBUTION_SECONDS
         hexes = await self._redis.zrangebyscore(self._source_key(source), cutoff, "+inf")
+        return await self._records(list(hexes))
+
+    async def snapshot(self) -> list[dict]:
+        hexes = await self._redis.zrange(self._written, 0, -1)
         return await self._records(list(hexes))
 
     def size(self) -> int:

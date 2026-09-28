@@ -2,7 +2,7 @@ import asyncio
 import datetime
 import re
 
-from fastapi import APIRouter, Cookie, Depends, Form, Header, Request, status
+from fastapi import APIRouter, Cookie, Depends, Form, Request, status
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from .. import models, security
 from ..aggregator import Aggregator
 from ..cache import distance_nm as _distance_nm
+from .. import commands
 from ..database import get_db
 from ..deps import get_current_account, require_device_api_key
 from ..feed_ingest import allocate_port
@@ -56,6 +57,308 @@ def root():
     # The device's own admin page links customers to their product's site,
     # not here - this backend has no reason to be a public landing page.
     return RedirectResponse("https://2e0lxy.uk/adsb/7-inch-ESP32-S3-ADSB-MLAT-Receiver-site/index.html")
+
+
+@router.get("/v1/alerts")
+async def get_alerts(
+    request: Request,
+    device: models.Device = Depends(require_device_api_key),
+    limit: int = 20,
+):
+    """The aircraft worth looking up for, newest first.
+
+    Its own endpoint rather than a field on each aircraft: an alert is about
+    the handful that matter, and marking every aircraft "not notable" would
+    cost every receiver parsing time on every poll to say nothing.
+    """
+    watcher = getattr(request.app.state, "alerts", None)
+    if watcher is None or not watcher.enabled():
+        # Off is not "nothing happening" - a receiver showing an alert strip
+        # should be able to tell the difference rather than implying a quiet
+        # sky.
+        return {"enabled": False, "alerts": [], "count": 0}
+    alerts = watcher.recent(max(1, min(limit, 100)))
+    return {"enabled": True, "alerts": alerts, "count": len(alerts)}
+
+
+# --- The phone app -------------------------------------------------------
+#
+# Session-authenticated, never device-key: a browser must not be given a
+# receiver's API key, because anything in a page can be read by anything
+# else that ends up in that page.
+#
+# One endpoint rather than five. A phone refreshing on mobile data should
+# make one request, not one per panel of the screen, and everything below
+# comes from memory on this side anyway.
+
+
+# These three come BEFORE /app/{device_id}: FastAPI matches in declaration
+# order, so with the parameterised route first, /app/manifest.webmanifest
+# was matched as a device id and answered 422. The app then had no manifest
+# and silently stopped being installable - a failure with no error anywhere
+# to notice it by.
+@router.get("/app/manifest.webmanifest")
+def phone_manifest():
+    """What makes it installable to a home screen. Served from /app so its
+    scope covers the app and nothing else on this domain."""
+    return JSONResponse({
+        "name": "2E0LXY ADS-B", "short_name": "ADS-B",
+        "start_url": "/app", "scope": "/app",
+        "display": "standalone", "orientation": "any",
+        "background_color": "#07121e", "theme_color": "#07121e",
+        "icons": [{"src": "/app/icon.svg", "sizes": "any", "type": "image/svg+xml",
+                   "purpose": "any maskable"}],
+    }, media_type="application/manifest+json")
+
+
+@router.get("/app/icon.svg")
+def phone_icon():
+    """An SVG rather than a set of PNGs: one file, every size, and nothing
+    to regenerate when it changes."""
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 192 192">'
+        '<rect width="192" height="192" rx="42" fill="#07121e"/>'
+        '<path d="M96 30l14 50 50 21v14l-50-11v46l18 11v11l-32-9-32 9v-11l18-11v-46'
+        'l-50 11v-14l50-21z" fill="#4fd2ff"/></svg>'
+    )
+    return Response(content=svg, media_type="image/svg+xml",
+                    headers={"Cache-Control": "public, max-age=86400"})
+
+
+@router.get("/app/sw.js")
+def phone_service_worker():
+    """Deliberately minimal.
+
+    It exists so the app can be installed to a home screen, not to cache
+    anything: this is a live view of the sky, and a service worker that
+    served yesterday's aircraft from a cache would be worse than no app.
+    The shell is fetched normally and every data request goes to the
+    network.
+    """
+    js = (
+        "self.addEventListener('install', () => self.skipWaiting());\n"
+        "self.addEventListener('activate', event =>"
+        " event.waitUntil(self.clients.claim()));\n"
+        "// No fetch handler on purpose - see the note on the Python side.\n"
+    )
+    return Response(content=js, media_type="application/javascript",
+                    headers={"Cache-Control": "no-cache"})
+
+
+@router.get("/app", response_class=HTMLResponse)
+@router.get("/app/{device_id}", response_class=HTMLResponse)
+def phone_app(
+    request: Request,
+    device_id: int | None = None,
+    account: models.Account = Depends(get_current_account),
+    db: Session = Depends(get_db),
+):
+    """The phone and tablet app.
+
+    A page rather than a native app, served from here rather than from the
+    receiver, for one concrete reason: a page served over HTTPS cannot talk
+    to a device at http://192.168.1.228 - browsers block that as mixed
+    content. Coming from this side instead, it works identically at home
+    and away, and the panel is driven through the command relay rather than
+    by being reached directly.
+    """
+    devices = (db.query(models.Device)
+               .filter(models.Device.account_id == account.id)
+               .order_by(models.Device.id).all())
+    if not devices:
+        return RedirectResponse("/account", status_code=status.HTTP_303_SEE_OTHER)
+    device = next((d for d in devices if d.id == device_id), devices[0])
+    where = device.independent_location()
+    lat, lon = where if where else (request.app.state.aggregator.home_lat,
+                                    request.app.state.aggregator.home_lon)
+    return templates.TemplateResponse(
+        request, "phone.html",
+        {"device": {"id": device.id, "name": device.name, "lat": lat, "lon": lon},
+         "devices": devices},
+    )
+
+
+@router.get("/account/devices/{device_id}/view")
+async def phone_view(
+    device_id: int,
+    request: Request,
+    account: models.Account = Depends(get_current_account),
+    db: Session = Depends(get_db),
+    radius: float = 0.0,
+):
+    """Everything the app shows, for one of this account's receivers."""
+    device = await asyncio.to_thread(_owned_device, db, account, device_id)
+    if not device:
+        return JSONResponse({"error": "Unknown device"},
+                            status_code=status.HTTP_404_NOT_FOUND)
+
+    state = request.app.state
+    where = device.independent_location()
+    lat, lon = where if where else (state.aggregator.home_lat, state.aggregator.home_lon)
+    # The app may ask for a different range than the panel is set to, so it
+    # can zoom out without changing what the panel shows.
+    span = radius if radius and 1 <= radius <= 250 else float(
+        state.settings.get("max_poll_radius_nm") or 250)
+
+    aircraft = await state.aggregator.cache.query(lat, lon, span)
+    aircraft = [_reference(request).enrich(entry) for entry in aircraft]
+    aircraft.sort(key=lambda entry: _distance_nm(lat, lon, entry["lat"], entry["lon"]))
+    total = len(aircraft)
+    if len(aircraft) > MAX_AIRCRAFT_PER_RESPONSE:
+        aircraft = aircraft[:MAX_AIRCRAFT_PER_RESPONSE]
+
+    alerts = state.alerts.recent(10) if state.alerts.enabled() else []
+    balloons = (state.balloons.query(lat, lon, span)
+                if state.balloons.enabled() else [])
+    logbook = state.logbook.recent_firsts(10) if state.logbook.enabled() else []
+
+    return {
+        "device": {
+            "id": device.id, "name": device.name,
+            "lat": lat, "lon": lon,
+            "location_source": device.location_source(),
+            "last_seen": device.last_seen_at.isoformat() if device.last_seen_at else None,
+            "firmware": device.firmware_version,
+        },
+        "radius": span,
+        "aircraft": aircraft, "total": total, "returned": len(aircraft),
+        "alerts": alerts,
+        "balloons": balloons,
+        "logbook": logbook,
+        "known_airframes": state.logbook.stats()["known"],
+    }
+
+
+@router.get("/account/devices/{device_id}/view/track")
+async def phone_track(
+    device_id: int,
+    hex: str,
+    request: Request,
+    account: models.Account = Depends(get_current_account),
+    db: Session = Depends(get_db),
+):
+    """One aircraft's trail, for the app's map. Gated on owning a device for
+    the same reason the feed map's is."""
+    device = await asyncio.to_thread(_owned_device, db, account, device_id)
+    if not device:
+        return JSONResponse({"points": []}, status_code=status.HTTP_404_NOT_FOUND)
+    return _track_response(request, hex)
+
+
+@router.get("/v1/commands")
+async def get_commands(
+    request: Request,
+    device: models.Device = Depends(require_device_api_key),
+    db: Session = Depends(get_db),
+):
+    """What this device's owner has asked it to do.
+
+    The panel has no port open to the internet, so it asks rather than
+    being told: this rides back on the polling it already does. The device
+    is identified by its own API key, so it can only ever collect its own
+    commands.
+    """
+    return {"commands": await asyncio.to_thread(commands.collect, db, device)}
+
+
+@router.post("/devices/{device_id}/command")
+async def queue_command(
+    device_id: int,
+    request: Request,
+    action: str = Form(...),
+    value: str = Form(default=""),
+    account: models.Account = Depends(get_current_account),
+    db: Session = Depends(get_db),
+):
+    """Queue one instruction for a receiver this account owns.
+
+    Ownership is checked here, against the session; what may be asked for
+    at all is checked in app/commands.py, which is the security boundary -
+    a small closed set that can change what the panel shows and how bright
+    it is, and nothing that could change where it sends data, what
+    credentials it holds, or what network it joins.
+    """
+    device = await asyncio.to_thread(_owned_device, db, account, device_id)
+    if not device:
+        return JSONResponse({"error": "Unknown device"},
+                            status_code=status.HTTP_404_NOT_FOUND)
+    try:
+        row = await asyncio.to_thread(commands.queue, db, device, action, value,
+                                      account.email)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)},
+                            status_code=status.HTTP_400_BAD_REQUEST)
+    return {"queued": {"id": row.id, "action": row.action, "value": row.value}}
+
+
+@router.get("/v1/logbook")
+async def get_logbook(
+    request: Request,
+    device: models.Device = Depends(require_device_api_key),
+    limit: int = 20,
+):
+    """Aircraft this deployment has never recorded before, newest first.
+
+    Spotting is collecting, and this is the part that remembers. The counts
+    come with it so a display can say "3,412 airframes seen" as well as
+    what the latest new one was.
+    """
+    book = getattr(request.app.state, "logbook", None)
+    if book is None or not book.enabled():
+        return {"enabled": False, "firsts": [], "known": 0}
+    stats = book.stats()
+    return {
+        "enabled": True,
+        "known": stats["known"],
+        "firsts": book.recent_firsts(max(1, min(limit, 50))),
+    }
+
+
+@router.get("/v1/balloons")
+async def get_balloons(
+    lat: float,
+    lon: float,
+    radius: float,
+    request: Request,
+    device: models.Device = Depends(require_device_api_key),
+):
+    """Balloons near a receiver: radiosondes, amateur flights, airships.
+
+    Its own endpoint rather than more entries in /v1/aircraft, because a
+    balloon is not an aircraft in any way the panel treats the same: no
+    callsign, no route, no operator, no type designator, and an altitude
+    three times anything with wings. A device that has the balloon page
+    switched off simply never calls this.
+    """
+    tracker = getattr(request.app.state, "balloons", None)
+    if tracker is None or not tracker.enabled():
+        # Off is not an error, and it is not an empty sky either. Said
+        # plainly so a receiver can show "switched off on the server"
+        # rather than "no balloons in range", which are different things
+        # and would otherwise look identical.
+        return {"enabled": False, "balloons": [], "count": 0}
+    balloons = tracker.query(lat, lon, radius)
+    return {"enabled": True, "balloons": balloons, "count": len(balloons)}
+
+
+@router.get("/v1/track/{hex_id}")
+async def get_track(
+    hex_id: str,
+    request: Request,
+    device: models.Device = Depends(require_device_api_key),
+):
+    """Where one aircraft has been recently, oldest point first.
+
+    Separate from /v1/aircraft rather than folded into it: a trail is only
+    wanted for the one aircraft somebody has selected, and attaching a
+    hundred points to every aircraft in a response would multiply a 40 KB
+    payload by something like twenty for data nobody asked to see.
+
+    Points are [latitude, longitude, altitude ft or null, seconds ago].
+    """
+    store = getattr(request.app.state, "tracks", None)
+    points = store.get(hex_id) if store is not None else []
+    return {"hex": hex_id.strip().lower(), "points": points, "count": len(points)}
 
 
 @router.get("/v1/aircraft")
@@ -510,6 +813,7 @@ def my_feed_page(
             "device": device,
             "shared": False,
             "aircraft_url": f"/account/my-feed/{device.id}/aircraft",
+            "track_url": f"/account/my-feed/{device.id}/track",
         },
     )
 
@@ -529,10 +833,34 @@ async def my_feed_aircraft(
         return {"ac": []}
     aircraft = await _aggregator(request).cache.query_by_source(f"feeder:{device.id}")
     aircraft = [_reference(request).enrich(entry) for entry in aircraft]
-    # total is what is in range, not what was sent: a device showing 250 of
-    # 347 should be able to say so rather than presenting 250 as the whole
-    # sky. len(ac) is what was sent.
-    return {"ac": aircraft, "total": total_in_range, "returned": len(aircraft)}
+    # Everything this feeder reported, uncapped: unlike /v1/aircraft this is
+    # read by a browser rather than by a device with 320 KB of internal RAM,
+    # and a receiver's own contribution is a few dozen aircraft, not the
+    # whole sky. So total and returned are the same number here - reported
+    # as both anyway, because the page reads the same fields whichever
+    # endpoint it is pointed at.
+    return {"ac": aircraft, "total": len(aircraft), "returned": len(aircraft)}
+
+
+@router.get("/account/my-feed/{device_id}/track")
+async def my_feed_track(
+    device_id: int,
+    hex: str,
+    request: Request,
+    account: models.Account = Depends(get_current_account),
+    db: Session = Depends(get_db),
+):
+    """Where one aircraft has been, for the trail the map draws behind it.
+
+    Gated on owning the device for the same reason its aircraft list is,
+    and fetched only for the aircraft somebody has actually clicked - a
+    trail per aircraft on every three-second poll would be a hundred times
+    the payload for something nobody is looking at.
+    """
+    device = await asyncio.to_thread(_owned_device, db, account, device_id)
+    if not device:
+        return {"points": []}
+    return _track_response(request, hex)
 
 
 # --- Public share links ---------------------------------------------------
@@ -594,6 +922,13 @@ def _shared_device(db: Session, token: str) -> models.Device | None:
 NO_INDEX = {"X-Robots-Tag": "noindex, nofollow, noarchive"}
 
 
+def _track_response(request: Request, hex_id: str) -> dict:
+    store = getattr(request.app.state, "tracks", None)
+    points = store.get(hex_id) if store is not None else []
+    return {"hex": (hex_id or "").strip().lower(), "points": points,
+            "count": len(points)}
+
+
 @router.get("/share/{token}", response_class=HTMLResponse)
 async def shared_feed_page(token: str, request: Request, db: Session = Depends(get_db)):
     device = await asyncio.to_thread(_shared_device, db, token)
@@ -609,6 +944,7 @@ async def shared_feed_page(token: str, request: Request, db: Session = Depends(g
             "device": device,
             "shared": True,
             "aircraft_url": f"/share/{token}/aircraft",
+            "track_url": f"/share/{token}/track",
         },
         headers=NO_INDEX,
     )
@@ -623,6 +959,18 @@ async def shared_feed_aircraft(token: str, request: Request, db: Session = Depen
     aircraft = [_reference(request).enrich(entry)
                 for entry in await _aggregator(request).cache.query_by_source(f"feeder:{device.id}")]
     return JSONResponse({"ac": aircraft, "total": len(aircraft)}, headers=NO_INDEX)
+
+
+@router.get("/share/{token}/track")
+async def shared_feed_track(token: str, hex: str, request: Request,
+                            db: Session = Depends(get_db)):
+    """The same trail, for a shared link. The token is the whole check, as
+    it is for the aircraft list it sits beside."""
+    device = await asyncio.to_thread(_shared_device, db, token)
+    if not device:
+        return JSONResponse({"points": []}, status_code=status.HTTP_404_NOT_FOUND,
+                            headers=NO_INDEX)
+    return JSONResponse(_track_response(request, hex), headers=NO_INDEX)
 
 
 # --- Airline logos --------------------------------------------------------

@@ -178,6 +178,110 @@ DEFINITIONS: list[Setting] = [
              "again once saved.",
     ),
 
+    # --- Alerts ----------------------------------------------------------
+    Setting(
+        "alerts_enabled", "bool", os.environ.get("ALERTS", "1") != "0",
+        label="Raise alerts", group="Alerts",
+        help="Picks the aircraft worth looking up for out of the ones already "
+             "polled, so a display does not present an airliner and an aircraft "
+             "squawking 7700 identically. Costs no extra request to anyone: every "
+             "check reads data the cache already holds.",
+    ),
+    Setting(
+        "alert_emergency", "bool", True,
+        label="Emergency squawks", group="Alerts",
+        help="7500 hijack, 7600 radio failure, 7700 general emergency - the three "
+             "codes that mean something has gone wrong aboard - plus the explicit "
+             "emergency field some feeds carry.",
+    ),
+    Setting(
+        "alert_military", "bool", True,
+        label="Military aircraft", group="Alerts",
+        help="Matched against the reference list of military callsign prefixes "
+             "already used to name operators on the display.",
+    ),
+    Setting(
+        "alert_first_sighting", "bool", True,
+        label="First sighting of an airframe", group="Alerts",
+        help="An aircraft this deployment has never recorded before. Needs the "
+             "logbook below, which is what remembers. Noisy for the first few "
+             "days and then rare, which is exactly when it becomes interesting.",
+    ),
+    Setting(
+        "alert_retention_minutes", "int", 60,
+        label="Keep alerts for", unit=" min", minimum=5, maximum=1440,
+        group="Alerts",
+        help="How long a raised alert stays readable. Held in memory only and "
+             "lost on restart - an alert is interesting while it is happening and "
+             "for a while after, and persisting them would add the one table that "
+             "grows with events.",
+    ),
+
+    # --- Logbook ---------------------------------------------------------
+    Setting(
+        "logbook_enabled", "bool", os.environ.get("LOGBOOK", "1") != "0",
+        label="Keep a logbook", group="Logbook",
+        help="Records every aircraft this deployment has ever seen, so a first "
+             "sighting can be recognised as one. The only table here meant to be "
+             "kept rather than pruned: it grows with distinct airframes, not with "
+             "traffic. Known aircraft are held in memory and last-seen times are "
+             "written in batches, so a poll costs no database work.",
+    ),
+
+    # --- Balloons --------------------------------------------------------
+    Setting(
+        "balloon_tracking", "bool", os.environ.get("BALLOON_TRACKING", "0") == "1",
+        label="Track balloons", group="Balloons",
+        help="Weather balloons, amateur high-altitude flights and lighter-than-air "
+             "aircraft, gathered here and served to every receiver on its own page. "
+             "Off by default: it is a separate sky from the aircraft one and not "
+             "everybody wants it.",
+    ),
+    Setting(
+        "balloon_sondes", "bool", True,
+        label="Weather balloons (radiosondes)", group="Balloons",
+        help="From SondeHub, which needs no account. Several thousand are launched "
+             "worldwide every day, mostly at 00Z and 12Z, and climb to around "
+             "100,000 ft before coming down on a parachute.",
+    ),
+    Setting(
+        "balloon_amateur", "bool", True,
+        label="Amateur high-altitude balloons", group="Balloons",
+        help="Radio amateurs' high-altitude and pico flights, also from SondeHub, "
+             "which bridges APRS-IS itself - so no APRS account is needed here.",
+    ),
+    Setting(
+        "balloon_adsb", "bool", True,
+        label="Lighter-than-air on ADS-B", group="Balloons",
+        help="Airships and tethered balloons that do carry a transponder. Picked out "
+             "of the aircraft already polled by their ADS-B emitter category, so this "
+             "costs no extra requests to anyone.",
+    ),
+    Setting(
+        "balloon_predictions", "bool", True,
+        label="Landing predictions", group="Balloons",
+        help="Where SondeHub forecasts each radiosonde will come down, and when. "
+             "A sonde is free to recover and there is a whole hobby in collecting "
+             "them, so this is the one genuinely actionable thing the balloon page "
+             "shows. The endpoint only covers 100 km, so a balloon further out "
+             "simply has no prediction.",
+    ),
+    Setting(
+        "balloon_radius_nm", "float", 250.0,
+        label="Look for balloons within", unit=" nm", minimum=25.0, maximum=1000.0,
+        group="Balloons",
+        help="Wider than the aircraft radius on purpose: balloons are sparse, and one "
+             "300 nm away crossing towards you is worth seeing coming.",
+    ),
+    Setting(
+        "balloon_poll_seconds", "int", 120,
+        label="Ask SondeHub every", unit=" s", minimum=30, maximum=900,
+        group="Balloons",
+        help="Far slower than the aircraft poll, for two reasons: SondeHub asks that "
+             "its telemetry endpoints not be polled hard, and a balloon climbing at "
+             "5 m/s has not gone anywhere in fifteen seconds.",
+    ),
+
     # --- AirLabs schedules ----------------------------------------------
     Setting(
         "airlabs_schedules", "bool", os.environ.get("AIRLABS_SCHEDULES", "0") == "1",

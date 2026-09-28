@@ -2,6 +2,11 @@
 -r requirements.txt
 pytest
 pytest-asyncio
+# Static undefined-name checking, run in CI before the tests. A NameError
+# only fires when its line runs, so a route with no test can carry one to
+# production - which is how a 500 reached the customer feed map. This costs
+# half a second and would have caught it at the commit.
+pyflakes
 # The Redis-backed cache and the single-instance lease are tested against an
 # in-process Redis rather than a real server, so the suite needs nothing
 # running. lupa is what lets fakeredis execute the Lua scripts both of them

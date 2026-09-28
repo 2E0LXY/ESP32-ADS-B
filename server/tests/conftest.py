@@ -15,6 +15,16 @@ _handle, _DB_PATH = tempfile.mkstemp(suffix=".db")
 os.close(_handle)
 
 os.environ["DATABASE_URL"] = f"sqlite:///{_DB_PATH}"
+# The image caches are read at import time too, and default to /data/logos
+# and /data/photos - a path that exists inside the container and nowhere
+# else. The suite passed on any machine that happened to be able to create
+# it and failed with PermissionError on any that could not, which is what a
+# GitHub runner is. Pointed at a throwaway directory for the same reason
+# the database is: a test run should not depend on, or leave anything in,
+# a deployment path.
+_CACHE_ROOT = tempfile.mkdtemp(prefix="adsb-test-cache-")
+os.environ["LOGO_CACHE_DIR"] = os.path.join(_CACHE_ROOT, "logos")
+os.environ["PHOTO_CACHE_DIR"] = os.path.join(_CACHE_ROOT, "photos")
 os.environ["SESSION_SECRET"] = "test-secret-not-a-real-one"
 # Startup refuses to run without these, and a real bootstrap admin is
 # irrelevant to what these tests cover.

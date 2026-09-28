@@ -130,6 +130,12 @@ raw data being pushed straight into this backend.
 - `app/feed_guard.py` - rejects aircraft a feeder could not really have heard
 - `app/opensky.py` - OpenSky as a fourth source: one OAuth token, SI units converted
 - `app/schedules.py` - AirLabs schedule lookups, cached and resolved in the background
+- `app/alerts.py` - the aircraft worth looking up for, out of the ones already polled
+- `app/logbook.py` - every airframe seen before, so a first sighting is recognisable
+- `app/commands.py` - what an owner may ask their own receiver to do, and nothing else
+- `app/balloons.py` - radiosondes, amateur high-altitude flights and airships
+- `app/tracks.py` - recent position history, for the trail behind a selected aircraft
+- `app/units.py` - the SI conversions the two metric upstreams need
 - `app/sbs.py` - SBS/BaseStation protocol decoder for incoming feeder connections
 - `app/feed_ingest.py` - per-device TCP listeners that accept customers' own feeds
 - `app/security.py` - password hashing, session tokens, API key generation/hashing
@@ -285,6 +291,100 @@ are queued and never block a device request: an unresolved callsign simply
 comes back without a route and picks one up on a later poll. See
 `app/routes.py`.
 
+The phone and tablet app lives at `/app`, session-authenticated, installable
+to a home screen. It is a page rather than a native app and it is served from
+here rather than from the receiver, for one concrete reason: a page served
+over HTTPS cannot talk to a device at `http://192.168.1.228`, because
+browsers block that as mixed content. Coming from this side it works
+identically at home and away, and it drives the panel through the command
+relay below rather than by addressing it directly - a test pins that, because
+the day a LAN address appears in that page is the day the app quietly stops
+working away from home.
+
+One request per refresh returns everything it shows - aircraft, alerts,
+balloons, the logbook - because a phone on mobile data should not make one
+request per panel of the screen. It never carries a device API key: a browser
+must not be given one, since anything in a page can be read by anything else
+that ends up in that page. Polling stops while the app is in the background.
+
+Remote control works without opening a port on anybody's router. A receiver
+sits on a home network the internet cannot reach, so rather than being told
+what to do it **asks**: `/v1/commands` rides back on the polling it already
+does, and an owner queues instructions with `POST /devices/{id}/command`.
+
+That inverts the trust relationship - a server handing instructions to a
+device on somebody's home network - so `app/commands.py` is written as a
+security boundary rather than a convenience. Only the account that owns a
+device may queue for it (checked against the session); the action must be one
+of a small closed set with its value validated server-side; the queue is
+capped; and the firmware checks every value again on receipt, because a
+device should not do as it is told merely because the instruction arrived
+over TLS from the right host.
+
+What is absent from that list matters as much as what is on it. A command can
+change what the panel shows, how bright it is, its range, and whether the
+screensaver runs - what somebody standing in front of it could change by
+touching it. Nothing can change where it sends data, what credentials it
+holds, what network it joins, or what firmware it runs.
+
+Alerts (`/v1/alerts`) pick the notable aircraft out of the ones already being
+polled, so a display need not present an airliner and an aircraft squawking
+7700 identically. Two kinds to begin with, both free because the data is
+already in the cache: emergency squawks (7500 hijack, 7600 radio failure,
+7700 general emergency, plus the explicit emergency field some feeds carry)
+and military aircraft, matched against the same callsign-prefix table the
+display uses to name their operators.
+
+The restraint is the point: an aircraft squawking 7700 for twenty minutes is
+one event, not eighty, so the same aircraft and kind is quiet for half an
+hour after firing. Held in memory and lost on restart - an alert matters
+while it is happening and for a while after, and persisting them would add
+the one table that grows with events, which is the mistake `usage_log` had to
+be taught out of.
+
+A logbook (`/v1/logbook`) records every aircraft this deployment has ever
+seen, so a first sighting can be announced as one - spotting is collecting,
+and this is the only part of the service that remembers anything across a
+restart. It feeds a third kind of alert.
+
+Its table is bounded by distinct airframes rather than by traffic, so unlike
+`usage_log` it is meant to be kept rather than pruned. The write rate is what
+it is designed around: two hundred aircraft on a fifteen-second poll would be
+576,000 row touches a day on the same SQLite file the feeder listeners and
+every device poll share. Every known hex is therefore held in memory and
+loaded once at startup, so deciding whether an aircraft is new is a set
+lookup; only a genuinely new airframe writes immediately, and last-seen times
+are swept in batches every few minutes.
+
+Radiosondes also carry SondeHub's landing forecast where there is one - where
+it comes down and how long until it does. That is the one genuinely
+actionable thing on the balloon page: a sonde is free to recover and there is
+a whole hobby in collecting them. Only the end of the forecast path is kept;
+SondeHub sends the whole path as a JSON string inside each record, and
+passing that on would multiply the response a receiver parses by a hundred
+for a line nothing draws. The predictions endpoint only covers 100 km, so a
+balloon further out simply has none.
+
+Balloons are a separate sky on their own endpoint (`/v1/balloons`) and their
+own page, off until switched on at `/admin/settings`. Three kinds: weather
+balloons (radiosondes) and amateur high-altitude flights, both from SondeHub,
+plus lighter-than-air aircraft that do carry a transponder, picked out of the
+aircraft already polled by ADS-B emitter category B2 at no extra request.
+
+**No API key is needed or wanted here.** SondeHub's GET endpoints are open.
+The obvious keyed alternative, aprs.fi, cannot do this job: its API is
+callsign-only by design with no geographic search, so it could never answer
+"what is near this receiver", and its terms forbid redistributing its data to
+a service offering the same features. SondeHub already bridges APRS-IS
+itself, so the amateur flights arrive anyway.
+
+Polled far more slowly than aircraft - two minutes by default against
+fifteen seconds - because SondeHub asks that its telemetry endpoints not be
+polled hard, and a balloon climbing at 5 m/s has not gone anywhere in fifteen
+seconds. Altitudes and speeds arrive in SI and are converted on the way in
+(`app/units.py`); left alone, a sonde at 30,000 m would read as a perfectly
+plausible 30,000 ft.
+
 Aircraft photographs are looked up per type, and per operator of that type
 where one exists. One photograph per type meant a Jet2 737-800 and a Ryanair
 737-800 shared a picture, so a Jet2 flight was shown a Ryanair aeroplane -
@@ -296,6 +396,14 @@ the response says which was served, so the panel labels a stand-in livery
 rather than presenting it as the flight. Most airline-and-type pairs have no
 attribution-free photograph; that answer is cached so the search is not
 repeated.
+
+Aircraft trails are drawn on the web map: clicking an aircraft fetches
+`/v1/track/{hex}` (or the session- and share-authenticated equivalents the map
+pages use) and draws the arc it flew in on, coloured by its current altitude.
+The panel draws them too, on a tap. Fetched only for the aircraft actually clicked - a trail per aircraft on every
+three-second poll would be roughly a hundred times the payload for something
+nobody is looking at, which is why the points live on their own endpoint rather
+than being attached to the aircraft list. The panel does not draw them yet.
 
 Schedules follow the same pattern as routes: `app/schedules.py` queues an
 AirLabs lookup and attaches the answer as `sched` on a later poll, so a

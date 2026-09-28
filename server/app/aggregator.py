@@ -33,6 +33,21 @@ from .cache import (  # re-exported: all of these lived here before the cache mo
     CachedAircraft,
     build_cache,
 )
+
+# The re-exports above are deliberate - callers and tests written before the
+# cache moved into its own module still import them from here - so they are
+# named explicitly rather than left looking like four unused imports. That
+# distinction matters now that the undefined-name check runs in CI: a real
+# unused import should be removed, and this is not one.
+__all__ = [
+    "Aggregator",
+    "MAX_POLL_REGIONS",
+    "SOURCE_ATTRIBUTION_SECONDS",
+    "STALE_AFTER_SECONDS",
+    "AircraftCache",
+    "CachedAircraft",
+    "build_cache",
+]
 from .cache import distance_nm as _distance_nm
 from .models import FeederKey, FeederProvider
 from .opensky import OpenSkyClient
@@ -92,8 +107,20 @@ class SourceHealth:
 
 class Aggregator:
     def __init__(self, home_lat: float, home_lon: float, home_radius_nm: float, session_factory,
-                 cache=None, leadership=None, settings=None):
+                 cache=None, leadership=None, settings=None, tracks=None):
         self.cache = cache if cache is not None else build_cache()
+        # Where each aircraft has been, for the trail the map draws behind a
+        # selected one. Optional: None simply means no trails, which is what
+        # the tests that do not care about them get - see app/tracks.py.
+        self.tracks = tracks
+        # Assigned after construction rather than passed in: the watcher
+        # needs the reference data, which is loaded later in startup than
+        # this. None means no alerts, which is what the tests that do not
+        # care about them get.
+        self.alerts = None
+        # What this deployment has seen before - see app/logbook.py.
+        # Assigned after construction for the same reason as the alerts.
+        self.logbook = None
         # Only the leader polls upstream. Without this, running N workers
         # would ask each community API for the same sky N times every
         # cycle. None means "always the leader", which is what a
@@ -197,6 +224,29 @@ class Aggregator:
                 try:
                     if self._leadership is None or self._leadership.is_leader:
                         await self._poll_all(client)
+                        # Sampled after every source has merged and before
+                        # the prune, so each aircraft contributes one point
+                        # per cycle from the best position available rather
+                        # than one per source reporting it.
+                        if (self.tracks is not None or self.alerts is not None
+                                or self.logbook is not None):
+                            # One snapshot for both: it is the same merged
+                            # picture, and taking it twice would double the
+                            # cost of the largest read in the cycle.
+                            snapshot = await self.cache.snapshot()
+                            if self.tracks is not None:
+                                self.tracks.observe(snapshot)
+                                self.tracks.prune()
+                            if self.alerts is not None:
+                                self.alerts.observe(snapshot)
+                            if self.logbook is not None:
+                                # The logbook decides what is new, the
+                                # watcher decides what to say about it.
+                                firsts = self.logbook.observe(snapshot)
+                                if firsts and self.alerts is not None:
+                                    self.alerts.note_first_sightings(firsts)
+                                if self.logbook.due_for_flush():
+                                    await self.logbook.flush()
                         await self.cache.prune()
                     # Every worker keeps its own copy of the count the admin
                     # dashboard reads, leader or not; it is one cheap read
