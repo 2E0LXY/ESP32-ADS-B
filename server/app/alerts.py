@@ -139,6 +139,25 @@ class AlertWatcher:
         if len(self._alerts) > MAX_ALERTS:
             del self._alerts[:len(self._alerts) - MAX_ALERTS]
 
+    def note_first_sightings(self, firsts, now: float | None = None):
+        """Aircraft the logbook has never seen before.
+
+        Fed in rather than detected here: whether an airframe is new is a
+        question about what has been recorded over months, which is the
+        logbook's job, and duplicating that judgement in two places would
+        be the way to have them disagree.
+        """
+        if not self.enabled() or not self._kind_on("alert_first_sighting"):
+            return
+        now = time.time() if now is None else now
+        for first in firsts:
+            label = first.operator or first.type_code or "New to this receiver"
+            detail = " ".join(part for part in (first.type_code, first.registration)
+                              if part) or None
+            self._raise("first", first.hex,
+                        {"flight": first.flight, "lat": None, "lon": None},
+                        label, detail, now)
+
     # --- reading back ----------------------------------------------------
     def recent(self, limit: int = 20, now: float | None = None) -> list[dict]:
         now = time.time() if now is None else now

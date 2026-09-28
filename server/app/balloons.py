@@ -33,6 +33,7 @@ setting.
 """
 
 import asyncio
+import json
 import logging
 import time
 
@@ -44,6 +45,7 @@ logger = logging.getLogger("balloons")
 
 SONDEHUB_SONDES_URL = "https://api.v2.sondehub.org/sondes"
 SONDEHUB_AMATEUR_URL = "https://api.v2.sondehub.org/amateur"
+SONDEHUB_PREDICTIONS_URL = "https://api.v2.sondehub.org/predictions"
 REQUEST_TIMEOUT_SECONDS = 20.0
 # How far back a report may be and still count as "now". A radiosonde
 # uploads every few seconds while it is being received, but coverage is
@@ -59,11 +61,19 @@ MAX_RADIUS_NM = 1000.0
 # The ADS-B emitter category for "any lighter than air (airship or
 # balloon) regardless of weight" - DO-260B 2.2.3.2.5.2.
 LIGHTER_THAN_AIR_CATEGORY = "B2"
+# The predictions endpoint refuses anything wider, so a balloon further out
+# than this simply has no prediction - which is the right trade anyway,
+# since a sonde 300 km away is not one anybody is going to go and collect.
+MAX_PREDICTION_RADIUS_METRES = 100_000
 
 
 class Balloon:
     __slots__ = ("id", "kind", "lat", "lon", "altitude_ft", "climb_fpm", "ground_kt",
-                 "heading", "label", "detail", "source", "reported_at")
+                 "heading", "label", "detail", "source", "reported_at",
+                 # Where SondeHub thinks it comes down, and when. The reason
+                 # anyone drives out to a field: a radiosonde is free to
+                 # recover and there is a whole hobby in doing it.
+                 "land_lat", "land_lon", "land_at", "burst_ft", "descending")
 
     def __init__(self, **fields):
         for slot in self.__slots__:
@@ -84,9 +94,19 @@ class Balloon:
         # fields it cannot show anyway.
         for key, value in (("alt", self.altitude_ft), ("climb", self.climb_fpm),
                            ("gs", self.ground_kt), ("track", self.heading),
-                           ("name", self.label), ("info", self.detail)):
+                           ("name", self.label), ("info", self.detail),
+                           ("burst", self.burst_ft)):
             if value is not None:
                 out[key] = value
+        if self.land_lat is not None and self.land_lon is not None:
+            # Seconds from now rather than an absolute time: the receiver has
+            # no clock it trusts, and "lands in 34 minutes" is the useful
+            # form anyway.
+            out["land"] = {"lat": round(self.land_lat, 5), "lon": round(self.land_lon, 5)}
+            if self.land_at is not None:
+                out["land"]["in"] = round(self.land_at - now)
+        if self.descending is not None:
+            out["descending"] = self.descending
         return out
 
 
@@ -179,6 +199,9 @@ class BalloonTracker:
                 found += await self._fetch(SONDEHUB_AMATEUR_URL, lat, lon, "amateur")
         if self._source_on("balloon_adsb") and self._cache is not None:
             found += await self._lighter_than_air()
+        if self._source_on("balloon_predictions") and found and regions:
+            lat, lon, _radius = regions[0]
+            await self._apply_predictions(lat, lon, found)
         for balloon in found:
             self._balloons[balloon.id] = balloon
         self.polls += 1
@@ -206,6 +229,47 @@ class BalloonTracker:
             logger.warning("SondeHub %s query failed: %s", kind, self.last_error)
             return []
         return parse_sondehub(payload, kind)
+
+    async def _apply_predictions(self, lat: float, lon: float, balloons: list[Balloon]):
+        """Attach SondeHub's landing forecast to the sondes it knows about.
+
+        A radiosonde is free to recover and there is a whole hobby in doing
+        it, so "lands 12 miles away in 40 minutes" is the one thing this
+        page can say that is genuinely actionable rather than decorative.
+        """
+        if self._client is None:
+            # Lighter-than-air aircraft come from the cache rather than from
+            # SondeHub, so a poll can reach here with nothing ever having
+            # opened a client. Asking one for a prediction would then raise
+            # and take the whole cycle with it.
+            return
+        try:
+            response = await self._client.get(SONDEHUB_PREDICTIONS_URL, params={
+                "lat": lat, "lon": lon,
+                # The endpoint refuses more, so this is clamped rather than
+                # passed through and rejected.
+                "distance": min(int(self._radius_nm() * NM_TO_METRES),
+                                MAX_PREDICTION_RADIUS_METRES),
+            })
+            response.raise_for_status()
+            payload = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            # A missing prediction costs a nicety, not the balloon, so this
+            # is noted and not counted as a failure of the poll itself.
+            logger.info("SondeHub predictions unavailable: %s: %s",
+                        type(exc).__name__, exc)
+            return
+        landings = parse_predictions(payload)
+        for balloon in balloons:
+            landing = landings.get(balloon.label) or landings.get(
+                balloon.id.split(":", 1)[-1])
+            if not landing:
+                continue
+            balloon.land_lat = landing.get("lat")
+            balloon.land_lon = landing.get("lon")
+            balloon.land_at = landing.get("at")
+            balloon.burst_ft = landing.get("burst_ft")
+            balloon.descending = landing.get("descending")
 
     async def _lighter_than_air(self) -> list[Balloon]:
         now = time.time()
@@ -305,6 +369,66 @@ def parse_sondehub(payload, kind: str) -> list[Balloon]:
             reported_at=reported_at,
         ))
     return out
+
+
+def parse_predictions(payload) -> dict[str, dict]:
+    """Each sonde's forecast landing, keyed by its serial.
+
+    The interesting part of a prediction is its last point: SondeHub sends
+    the whole forecast path as a JSON string inside the record, and only the
+    end of it - where and when it comes down - is worth passing on. Sending
+    the path too would multiply the response a receiver parses by a hundred
+    for a line nothing draws.
+
+    Altitudes are metres here as everywhere else in this API.
+    """
+    if not isinstance(payload, list):
+        return {}
+    out: dict[str, dict] = {}
+    for record in payload:
+        if not isinstance(record, dict):
+            continue
+        serial = str(record.get("vehicle") or "").strip()
+        if not serial:
+            continue
+        landing = _last_path_point(record.get("data"))
+        if landing is None:
+            continue
+        burst = record.get("burst_altitude")
+        out[serial] = {
+            "lat": landing[0], "lon": landing[1], "at": landing[2],
+            "burst_ft": (None if burst is None
+                         else round(float(burst) * METRES_TO_FEET)),
+            # Reported as 0/1 by the API; a bool is what a caller wants.
+            "descending": bool(record.get("descending")),
+        }
+    return out
+
+
+def _last_path_point(data):
+    """(lat, lon, epoch seconds) of the end of a forecast path.
+
+    The path arrives as a JSON string rather than as nested JSON, which is
+    unusual enough to be worth saying out loud - json.loads on a field that
+    is already a list would throw.
+    """
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except ValueError:
+            return None
+    if not isinstance(data, list) or not data:
+        return None
+    last = data[-1]
+    if not isinstance(last, dict):
+        return None
+    lat, lon, at = last.get("lat"), last.get("lon"), last.get("time")
+    if lat is None or lon is None:
+        return None
+    try:
+        return float(lat), float(lon), (None if at is None else float(at))
+    except (TypeError, ValueError):
+        return None
 
 
 def _timestamp(value) -> float:

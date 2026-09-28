@@ -191,7 +191,7 @@ def test_the_settings_page_offers_the_alert_controls():
     names = {d.name for d in DEFINITIONS if d.group == "Alerts"}
 
     assert names == {"alerts_enabled", "alert_emergency", "alert_military",
-                     "alert_retention_minutes"}
+                     "alert_first_sighting", "alert_retention_minutes"}
 
 
 # --- the endpoint -------------------------------------------------------

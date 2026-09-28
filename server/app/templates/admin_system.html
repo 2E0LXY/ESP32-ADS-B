@@ -89,6 +89,15 @@
       {{ schedule_stats.lookups }} looked up, {{ schedule_stats.hits }} served,
       {{ schedule_stats.misses }} with no schedule, {{ schedule_stats.errors }} errors,
       {{ schedule_stats.dropped }} dropped</span></td></tr>
+<tr><td>Logbook<br><span class="sub">what has been seen before</span></td>
+  <td>{% if logbook_stats.enabled %}<span class="badge ok">On</span>{% else %}Off{% endif %}
+    <span class="sub">{{ "{:,}".format(logbook_stats.known) }} airframes ever,
+      {{ logbook_stats.firsts_since_restart }} new since restart,
+      {{ logbook_stats.pending }} waiting to be written,
+      {{ logbook_stats.rows_written }} written in {{ logbook_stats.flushes }} sweeps
+      {% for first in recent_firsts %}<br><b>{{ first.reg or first.hex }}</b>
+        {{ first.type or "" }} {{ first.operator or "" }}
+        <span class="sub">{{ (first.age / 60) | round | int }} min ago</span>{% endfor %}</span></td></tr>
 <tr><td>Alerts<br><span class="sub">from aircraft already polled</span></td>
   <td>{% if alert_stats.enabled %}<span class="badge ok">On</span>{% else %}Off{% endif %}
     <span class="sub">{{ alert_stats.held }} held

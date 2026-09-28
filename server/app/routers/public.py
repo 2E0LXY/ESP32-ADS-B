@@ -80,6 +80,29 @@ async def get_alerts(
     return {"enabled": True, "alerts": alerts, "count": len(alerts)}
 
 
+@router.get("/v1/logbook")
+async def get_logbook(
+    request: Request,
+    device: models.Device = Depends(require_device_api_key),
+    limit: int = 20,
+):
+    """Aircraft this deployment has never recorded before, newest first.
+
+    Spotting is collecting, and this is the part that remembers. The counts
+    come with it so a display can say "3,412 airframes seen" as well as
+    what the latest new one was.
+    """
+    book = getattr(request.app.state, "logbook", None)
+    if book is None or not book.enabled():
+        return {"enabled": False, "firsts": [], "known": 0}
+    stats = book.stats()
+    return {
+        "enabled": True,
+        "known": stats["known"],
+        "firsts": book.recent_firsts(max(1, min(limit, 50))),
+    }
+
+
 @router.get("/v1/balloons")
 async def get_balloons(
     lat: float,

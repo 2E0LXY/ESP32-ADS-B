@@ -229,6 +229,42 @@ class Setting(Base):
     updated_by = Column(String(255), nullable=True)
 
 
+class Sighting(Base):
+    """Every aircraft this deployment has ever seen, and when it first was.
+
+    Plane spotting is fundamentally collecting, and "you have never seen a
+    Beluga before" is the moment that makes a display feel alive rather than
+    decorative. Nothing else here remembers anything across a restart, so
+    this is the one table that exists to.
+
+    Bounded by the number of distinct aircraft rather than by traffic -
+    unlike usage_log, which grows by 2,880 rows per device per day and had
+    to be taught to prune itself. A busy receiver sees a few thousand
+    distinct airframes a year, so this is a table that grows slowly and is
+    meant to be kept.
+
+    The write rate is the thing to be careful about, not the size: a row per
+    aircraft per fifteen-second poll would be far heavier than the traffic
+    itself. See app/logbook.py, which keeps the known hexes in memory and
+    only touches the database for a genuinely new one, plus a batched
+    last-seen sweep."""
+
+    __tablename__ = "sightings"
+
+    hex = Column(String(8), primary_key=True)
+    first_seen = Column(DateTime(timezone=True), default=utcnow, nullable=False, index=True)
+    last_seen = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    # Separate visits, not polls: an aircraft overhead for ten minutes is
+    # one visit, and coming back next week is a second.
+    visits = Column(Integer, default=1, nullable=False)
+    # Whatever it was called the last time it was seen. Nullable because a
+    # position-only report carries none of it.
+    flight = Column(String(16), nullable=True)
+    registration = Column(String(16), nullable=True)
+    type_code = Column(String(8), nullable=True)
+    operator = Column(String(128), nullable=True)
+
+
 class UsageLog(Base):
     """One row per /v1/aircraft request, for quotas, abuse detection, and
     per-device activity in the admin panel.

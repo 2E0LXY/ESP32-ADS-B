@@ -131,6 +131,7 @@ raw data being pushed straight into this backend.
 - `app/opensky.py` - OpenSky as a fourth source: one OAuth token, SI units converted
 - `app/schedules.py` - AirLabs schedule lookups, cached and resolved in the background
 - `app/alerts.py` - the aircraft worth looking up for, out of the ones already polled
+- `app/logbook.py` - every airframe seen before, so a first sighting is recognisable
 - `app/balloons.py` - radiosondes, amateur high-altitude flights and airships
 - `app/tracks.py` - recent position history, for the trail behind a selected aircraft
 - `app/units.py` - the SI conversions the two metric upstreams need
@@ -303,6 +304,29 @@ hour after firing. Held in memory and lost on restart - an alert matters
 while it is happening and for a while after, and persisting them would add
 the one table that grows with events, which is the mistake `usage_log` had to
 be taught out of.
+
+A logbook (`/v1/logbook`) records every aircraft this deployment has ever
+seen, so a first sighting can be announced as one - spotting is collecting,
+and this is the only part of the service that remembers anything across a
+restart. It feeds a third kind of alert.
+
+Its table is bounded by distinct airframes rather than by traffic, so unlike
+`usage_log` it is meant to be kept rather than pruned. The write rate is what
+it is designed around: two hundred aircraft on a fifteen-second poll would be
+576,000 row touches a day on the same SQLite file the feeder listeners and
+every device poll share. Every known hex is therefore held in memory and
+loaded once at startup, so deciding whether an aircraft is new is a set
+lookup; only a genuinely new airframe writes immediately, and last-seen times
+are swept in batches every few minutes.
+
+Radiosondes also carry SondeHub's landing forecast where there is one - where
+it comes down and how long until it does. That is the one genuinely
+actionable thing on the balloon page: a sonde is free to recover and there is
+a whole hobby in collecting them. Only the end of the forecast path is kept;
+SondeHub sends the whole path as a JSON string inside each record, and
+passing that on would multiply the response a receiver parses by a hundred
+for a line nothing draws. The predictions endpoint only covers 100 km, so a
+balloon further out simply has none.
 
 Balloons are a separate sky on their own endpoint (`/v1/balloons`) and their
 own page, off until switched on at `/admin/settings`. Three kinds: weather

@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import sys
@@ -19,6 +20,7 @@ from .retention import UsageLogPruner
 from .runtime_settings import SettingsStore
 from .alerts import AlertWatcher
 from .balloons import BalloonTracker
+from .logbook import Logbook
 from .tracks import TrackStore
 from .schedules import ScheduleResolver
 from .routers import admin, public
@@ -152,6 +154,15 @@ async def startup():
     # before the reference data this needs existed.
     app.state.aggregator.alerts = app.state.alerts
 
+    # What has been seen before. Loaded once here - every hex ever recorded,
+    # so deciding whether an aircraft is new is a set lookup rather than a
+    # query per aircraft per poll. In a thread because it is blocking
+    # SQLAlchemy on the loop the feeder listeners share.
+    app.state.logbook = Logbook(session_factory=SessionLocal,
+                                settings=app.state.settings)
+    await asyncio.to_thread(app.state.logbook.load)
+    app.state.aggregator.logbook = app.state.logbook
+
     # Airline logos, fetched once each and then served off this deployment's
     # own disk. See app/logos.py for why lookup is by domain, not by name.
     app.state.logos = LogoStore()
@@ -208,6 +219,9 @@ async def shutdown():
     await app.state.leadership.stop()
     await app.state.schedules.stop()
     await app.state.balloons.stop()
+    # Anything seen since the last sweep would otherwise be lost, which for
+    # a first sighting means it is announced again after the restart.
+    await app.state.logbook.flush()
     await app.state.usage_pruner.stop()
     await app.state.photos.stop()
     await app.state.logos.stop()

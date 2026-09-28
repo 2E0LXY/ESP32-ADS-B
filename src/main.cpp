@@ -860,6 +860,16 @@ struct BalloonDisplay {
   char label[20];
   char detail[12];       // sonde model, or the amateur modulation
   uint8_t kind;          // BalloonKind
+  // Where the aggregator's SondeHub forecast says it comes down, and how
+  // long until it does. A radiosonde is free to recover and there is a
+  // whole hobby in collecting them, so this is the one genuinely
+  // actionable thing on the page. NaN / negative when there is no forecast,
+  // which is most of them: the prediction API only covers 100 km.
+  double landLatitude;
+  double landLongitude;
+  long landsInSeconds;   // -1 when unknown
+  float burstFeet;       // NaN when unknown
+  bool descending;
 };
 
 // Which sky it came from, so the page can colour and letter them apart.
@@ -4791,6 +4801,24 @@ void renderBalloonDetailCard(int index) {
   line5(buf, rgb(255, 255, 255));
   snprintf(buf, sizeof(buf), "LAT %.4f  LON %.4f", b.latitude, b.longitude);
   line5(buf, rgb(255, 255, 255));
+  if (!isnan(b.burstFeet)) {
+    snprintf(buf, sizeof(buf), "BURST %d FT", static_cast<int>(lroundf(b.burstFeet)));
+    line5(buf, rgb(200, 210, 220));
+  }
+  // The reason to get in the car. Distance from here rather than the raw
+  // coordinates, because "9 miles away in 34 min" is the decision and a
+  // latitude is not.
+  if (b.landLatitude != 0.0 || b.landLongitude != 0.0) {
+    const float miles = distanceMilesFromHome(b.landLatitude, b.landLongitude);
+    if (b.landsInSeconds >= 0)
+      snprintf(buf, sizeof(buf), "LANDS %d MI AWAY IN %ld MIN",
+               static_cast<int>(lroundf(miles)), b.landsInSeconds / 60);
+    else
+      snprintf(buf, sizeof(buf), "LANDS %d MI AWAY", static_cast<int>(lroundf(miles)));
+    line5(buf, rgb(255, 220, 60));
+    snprintf(buf, sizeof(buf), "  %.4f, %.4f", b.landLatitude, b.landLongitude);
+    line5(buf, rgb(190, 205, 218));
+  }
   text5(cx + 10, cy + cardH - 13, "TAP ANYWHERE TO CLOSE", rgb(130, 160, 180));
   present();
 }
@@ -7367,6 +7395,9 @@ void fetchBalloons() {
   item["id"] = true; item["kind"] = true; item["lat"] = true; item["lon"] = true;
   item["alt"] = true; item["climb"] = true; item["gs"] = true; item["track"] = true;
   item["name"] = true; item["info"] = true;
+  item["burst"] = true; item["descending"] = true;
+  JsonObject landing = item["land"].to<JsonObject>();
+  landing["lat"] = true; landing["lon"] = true; landing["in"] = true;
 
   JsonDocument doc;
   const DeserializationError error =
@@ -7401,6 +7432,18 @@ void fetchBalloons() {
     const char *kind = entry["kind"] | "sonde";
     balloon.kind = !strcmp(kind, "amateur") ? BALLOON_AMATEUR
                    : !strcmp(kind, "airship") ? BALLOON_AIRSHIP : BALLOON_SONDE;
+    JsonObjectConst landing = entry["land"];
+    if (!landing.isNull()) {
+      balloon.landLatitude = landing["lat"] | 0.0;
+      balloon.landLongitude = landing["lon"] | 0.0;
+      balloon.landsInSeconds = landing["in"] | -1L;
+    } else {
+      balloon.landLatitude = 0.0;
+      balloon.landLongitude = 0.0;
+      balloon.landsInSeconds = -1;
+    }
+    balloon.burstFeet = entry["burst"].is<float>() ? entry["burst"].as<float>() : NAN;
+    balloon.descending = entry["descending"] | false;
     snprintf(balloon.id, sizeof(balloon.id), "%s", entry["id"] | "");
     snprintf(balloon.label, sizeof(balloon.label), "%s", entry["name"] | "");
     snprintf(balloon.detail, sizeof(balloon.detail), "%s", entry["info"] | "");

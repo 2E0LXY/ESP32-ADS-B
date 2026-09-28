@@ -164,7 +164,7 @@ async def test_both_sondehub_endpoints_are_asked_with_a_metre_radius():
         body = _fresh(SONDE_REPLY if "amateur" not in str(request.url) else AMATEUR_REPLY)
         return httpx.Response(200, json=body)
 
-    tracker = _tracker(balloon_radius_nm=100.0)
+    tracker = _tracker(balloon_radius_nm=100.0, balloon_predictions=False)
     tracker._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     tracker._regions = lambda: [(53.73, -1.57, 50.0)]
 
@@ -248,7 +248,8 @@ def test_the_settings_page_offers_the_balloon_controls():
     names = {d.name for d in DEFINITIONS if d.group == "Balloons"}
 
     assert names == {"balloon_tracking", "balloon_sondes", "balloon_amateur",
-                     "balloon_adsb", "balloon_radius_nm", "balloon_poll_seconds"}
+                     "balloon_adsb", "balloon_predictions", "balloon_radius_nm",
+                     "balloon_poll_seconds"}
     # No API key among them: SondeHub's GET endpoints are open, and the one
     # obvious keyed alternative cannot do geographic queries at all.
     assert not any(d.secret for d in DEFINITIONS if d.group == "Balloons")
@@ -304,3 +305,133 @@ def _issue_key(client) -> str:
         db.close()
     client.post(f"/devices/{device_id}/reissue-key", follow_redirects=False)
     return security.read_flash_token(client.cookies.get("flash_key"))["key"]
+
+
+# --- landing predictions -------------------------------------------------
+#
+# The point of the whole balloon page for a sonde chaser: a radiosonde is
+# free to recover, and "lands 12 miles away in 40 minutes" is actionable in
+# a way that a dot on a map is not.
+
+# One real record, as api.v2.sondehub.org/predictions returned it, with the
+# forecast path cut to three points. Note `data` is a JSON STRING, not
+# nested JSON - unusual enough that the parser is tested against it.
+PREDICTION_REPLY = [{
+    "vehicle": "Y1952527",
+    "time": "2026-09-08T23:36:00Z",
+    "latitude": 52.89886997547001, "longitude": -1.0164800193160772,
+    "altitude": 5516.22, "ascent_rate": 4.51, "descent_rate": 3.7,
+    "burst_altitude": 28700.0, "descending": 0, "landed": 0,
+    "data": ('[{"time": 1788910560, "lat": 52.8988, "lon": -1.0164, "alt": 5516.22},'
+             ' {"time": 1788910620, "lat": 52.8924, "lon": -0.9993, "alt": 5786.82},'
+             ' {"time": 1788913000, "lat": 52.7100, "lon": -0.8100, "alt": 120.0}]'),
+}]
+
+
+def test_a_prediction_yields_the_end_of_the_forecast_path():
+    from app.balloons import parse_predictions
+
+    landings = parse_predictions(PREDICTION_REPLY)
+
+    assert set(landings) == {"Y1952527"}
+    landing = landings["Y1952527"]
+    # The LAST point of the path - where it comes down - not the first.
+    assert (landing["lat"], landing["lon"]) == (52.71, -0.81)
+    assert landing["at"] == 1788913000
+    # Burst altitude is metres here like everything else in this API.
+    assert landing["burst_ft"] == 94160          # 28,700 m
+    assert landing["descending"] is False
+
+
+def test_a_malformed_prediction_is_skipped_not_raised_on():
+    from app.balloons import parse_predictions
+
+    assert parse_predictions("not a list") == {}
+    assert parse_predictions([{"vehicle": "X", "data": "not json"}]) == {}
+    assert parse_predictions([{"vehicle": "X", "data": "[]"}]) == {}
+    assert parse_predictions([{"data": PREDICTION_REPLY[0]["data"]}]) == {}
+    # A path whose last point has no position is no landing.
+    assert parse_predictions([{"vehicle": "X", "data": '[{"time": 1}]'}]) == {}
+
+
+async def test_a_landing_is_attached_to_its_sonde_and_sent_on():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "predictions" in str(request.url):
+            return httpx.Response(200, json=PREDICTION_REPLY)
+        if "amateur" in str(request.url):
+            return httpx.Response(200, json={})
+        return httpx.Response(200, json=_fresh(
+            {"Y1952527": dict(SONDE_REPLY["310-2-03744"], serial="Y1952527")}))
+
+    tracker = _tracker(balloon_predictions=True)
+    tracker._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    tracker._regions = lambda: [(53.73, -1.57, 50.0)]
+
+    await tracker.poll_once()
+
+    balloon, = tracker.query(49.5, -2.9, 500)
+    assert balloon["land"]["lat"] == 52.71
+    assert balloon["burst"] == 94160
+    assert balloon["descending"] is False
+    # Seconds from now, not an absolute time: the receiver has no clock it
+    # trusts, and "lands in 34 minutes" is the useful form.
+    assert "in" in balloon["land"]
+
+
+async def test_the_prediction_radius_is_clamped_to_what_the_api_accepts():
+    """It refuses anything over 100 km, and the balloon radius defaults to
+    250 nm - so passing it straight through would get every request
+    rejected."""
+    asked = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        asked.append(request.url)
+        if "predictions" in str(request.url):
+            return httpx.Response(200, json=[])
+        return httpx.Response(200, json=_fresh(SONDE_REPLY))
+
+    tracker = _tracker(balloon_predictions=True, balloon_amateur=False,
+                       balloon_radius_nm=250.0)
+    tracker._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    tracker._regions = lambda: [(53.73, -1.57, 50.0)]
+
+    await tracker.poll_once()
+
+    prediction_call = [u for u in asked if "predictions" in str(u)][0]
+    assert prediction_call.params["distance"] == "100000"
+
+
+async def test_predictions_failing_does_not_lose_the_balloons():
+    """A missing forecast costs a nicety, not the sonde."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "predictions" in str(request.url):
+            return httpx.Response(500)
+        if "amateur" in str(request.url):
+            return httpx.Response(200, json={})
+        return httpx.Response(200, json=_fresh(SONDE_REPLY))
+
+    tracker = _tracker(balloon_predictions=True)
+    tracker._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    tracker._regions = lambda: [(53.73, -1.57, 50.0)]
+
+    await tracker.poll_once()
+
+    assert tracker.stats()["tracked"] == 1
+    # Not counted against the poll: the sondes arrived fine.
+    assert tracker.stats()["errors"] == 0
+
+
+async def test_predictions_can_be_switched_off():
+    asked = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        asked.append(str(request.url))
+        return httpx.Response(200, json=_fresh(SONDE_REPLY))
+
+    tracker = _tracker(balloon_predictions=False, balloon_amateur=False)
+    tracker._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    tracker._regions = lambda: [(53.73, -1.57, 50.0)]
+
+    await tracker.poll_once()
+
+    assert not any("predictions" in url for url in asked)

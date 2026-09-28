@@ -201,6 +201,13 @@ DEFINITIONS: list[Setting] = [
              "already used to name operators on the display.",
     ),
     Setting(
+        "alert_first_sighting", "bool", True,
+        label="First sighting of an airframe", group="Alerts",
+        help="An aircraft this deployment has never recorded before. Needs the "
+             "logbook below, which is what remembers. Noisy for the first few "
+             "days and then rare, which is exactly when it becomes interesting.",
+    ),
+    Setting(
         "alert_retention_minutes", "int", 60,
         label="Keep alerts for", unit=" min", minimum=5, maximum=1440,
         group="Alerts",
@@ -208,6 +215,17 @@ DEFINITIONS: list[Setting] = [
              "lost on restart - an alert is interesting while it is happening and "
              "for a while after, and persisting them would add the one table that "
              "grows with events.",
+    ),
+
+    # --- Logbook ---------------------------------------------------------
+    Setting(
+        "logbook_enabled", "bool", os.environ.get("LOGBOOK", "1") != "0",
+        label="Keep a logbook", group="Logbook",
+        help="Records every aircraft this deployment has ever seen, so a first "
+             "sighting can be recognised as one. The only table here meant to be "
+             "kept rather than pruned: it grows with distinct airframes, not with "
+             "traffic. Known aircraft are held in memory and last-seen times are "
+             "written in batches, so a poll costs no database work.",
     ),
 
     # --- Balloons --------------------------------------------------------
@@ -238,6 +256,15 @@ DEFINITIONS: list[Setting] = [
         help="Airships and tethered balloons that do carry a transponder. Picked out "
              "of the aircraft already polled by their ADS-B emitter category, so this "
              "costs no extra requests to anyone.",
+    ),
+    Setting(
+        "balloon_predictions", "bool", True,
+        label="Landing predictions", group="Balloons",
+        help="Where SondeHub forecasts each radiosonde will come down, and when. "
+             "A sonde is free to recover and there is a whole hobby in collecting "
+             "them, so this is the one genuinely actionable thing the balloon page "
+             "shows. The endpoint only covers 100 km, so a balloon further out "
+             "simply has no prediction.",
     ),
     Setting(
         "balloon_radius_nm", "float", 250.0,
