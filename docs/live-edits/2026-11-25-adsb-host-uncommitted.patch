@@ -1,0 +1,68 @@
+diff --git a/server/app/routers/admin.py b/server/app/routers/admin.py
+index 23b3b20..8cf86d6 100644
+--- a/server/app/routers/admin.py
++++ b/server/app/routers/admin.py
+@@ -45,6 +45,7 @@ def admin_login(
+     token = security.create_session_token(email, "admin")
+     response = RedirectResponse("/admin", status_code=status.HTTP_303_SEE_OTHER)
+     response.set_cookie("admin_session", token, httponly=True, samesite="lax", secure=True)
++    response.delete_cookie("account_session")
+     return response
+ 
+ 
+@@ -162,7 +163,10 @@ def admin_create_account(
+     db: Session = Depends(get_db),
+ ):
+     email = email.strip().lower()
+-    if not db.query(models.Account).filter(models.Account.email == email).first():
++    if (
++        not db.query(models.Account).filter(models.Account.email == email).first()
++        and not db.query(models.AdminUser).filter(models.AdminUser.email == email).first()
++    ):
+         db.add(models.Account(email=email, password_hash=security.hash_password(password)))
+         db.commit()
+         _log(db, admin.email, "create_account", email)
+diff --git a/server/app/routers/public.py b/server/app/routers/public.py
+index c6fb249..c14da34 100644
+--- a/server/app/routers/public.py
++++ b/server/app/routers/public.py
+@@ -178,7 +178,10 @@ def signup(
+         return templates.TemplateResponse(
+             request, "signup.html", {"flash": "Password must be at least 8 characters", "flash_error": True}
+         )
+-    if db.query(models.Account).filter(models.Account.email == email).first():
++    if (
++        db.query(models.Account).filter(models.Account.email == email).first()
++        or db.query(models.AdminUser).filter(models.AdminUser.email == email).first()
++    ):
+         return templates.TemplateResponse(
+             request, "signup.html", {"flash": "An account with that email already exists", "flash_error": True}
+         )
+@@ -188,6 +191,7 @@ def signup(
+     token = security.create_session_token(email, "account")
+     response = RedirectResponse("/account", status_code=status.HTTP_303_SEE_OTHER)
+     response.set_cookie("account_session", token, httponly=True, samesite="lax", secure=True)
++    response.delete_cookie("admin_session")
+     return response
+ 
+ 
+@@ -212,6 +216,7 @@ def login(
+     token = security.create_session_token(email, "account")
+     response = RedirectResponse("/account", status_code=status.HTTP_303_SEE_OTHER)
+     response.set_cookie("account_session", token, httponly=True, samesite="lax", secure=True)
++    response.delete_cookie("admin_session")
+     return response
+ 
+ 
+@@ -529,10 +534,7 @@ async def my_feed_aircraft(
+         return {"ac": []}
+     aircraft = await _aggregator(request).cache.query_by_source(f"feeder:{device.id}")
+     aircraft = [_reference(request).enrich(entry) for entry in aircraft]
+-    # total is what is in range, not what was sent: a device showing 250 of
+-    # 347 should be able to say so rather than presenting 250 as the whole
+-    # sky. len(ac) is what was sent.
+-    return {"ac": aircraft, "total": total_in_range, "returned": len(aircraft)}
++    return {"ac": aircraft, "total": len(aircraft), "returned": len(aircraft)}
+ 
+ 
+ # --- Public share links ---------------------------------------------------
